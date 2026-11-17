@@ -129,3 +129,36 @@ fn tampered_segment_fails_indexing() {
     let mut ix = Index::open(&t.path().join("index.db")).unwrap();
     assert!(ix.catch_up(&dir).is_err());
 }
+
+#[test]
+fn punctuation_in_search_text_is_literal() {
+    let (t, dir) = setup(60);
+    let mut ix = Index::open(&t.path().join("index.db")).unwrap();
+    ix.catch_up(&dir).unwrap();
+    // These would be FTS5 syntax errors or operators if passed through raw.
+    for q in [
+        "host-42",
+        "http://host42.example",
+        "\"host42",
+        "NOT host42",
+        "host42 AND",
+        "a:b",
+        "(",
+        "*",
+    ] {
+        ix.query(&Filter {
+            text: Some(q.into()),
+            limit: 5,
+            ..Default::default()
+        })
+        .unwrap_or_else(|e| panic!("query {q:?} failed: {e}"));
+    }
+    let hit = ix
+        .query(&Filter {
+            text: Some("host4*".into()),
+            limit: 100,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(hit.len() >= 10, "prefix search finds host4, host40..host49");
+}

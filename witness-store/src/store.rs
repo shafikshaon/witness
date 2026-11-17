@@ -956,3 +956,15 @@ fn lock_exclusive(path: &Path) -> Result<File> {
         Err(e) => Err(StoreError::Io(e.into())),
     }
 }
+
+/// Up to the last two records of the store, oldest first, as JSON. Used at startup to tell
+/// a clean shutdown from a crash. Never modifies anything.
+pub fn read_recent_records(seg_dir: &Path) -> Result<Vec<Value>> {
+    recent_lines(seg_dir)?
+        .iter()
+        .map(|l| {
+            let (body, _) = chain::decode_line(l)?;
+            Ok(serde_json::from_slice(&body)?)
+        })
+        .collect()
+}

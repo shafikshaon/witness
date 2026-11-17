@@ -41,7 +41,9 @@ pub struct Filter {
     pub uid: Option<u32>,
     pub puid: Option<String>,
     pub ses: Option<u32>,
-    /// FTS5 query over cmdline, path and name.
+    /// Plain-text search over cmdline, path and name. Whitespace-separated words must all
+    /// match; a trailing `*` makes a word a prefix. Characters such as `-` or `"` are
+    /// literal text, never query syntax.
     pub text: Option<String>,
     /// Keyset cursor: return events with `seq` strictly below this (newest-first order).
     pub before_seq: Option<u64>,
@@ -201,10 +203,10 @@ impl Index {
         if let Some(v) = f.ses {
             and("ses = ?", Sql::Integer(v.into()));
         }
-        if let Some(v) = &f.text {
+        if let Some(v) = f.text.as_deref().and_then(fts_query) {
             and(
                 "seq IN (SELECT rowid FROM fts WHERE fts MATCH ?)",
-                Sql::Text(v.clone()),
+                Sql::Text(v),
             );
         }
         if let Some(v) = f.before_seq {
@@ -338,4 +340,48 @@ fn join_strings(v: &Value) -> Option<String> {
 
 fn db(e: rusqlite::Error) -> StoreError {
     StoreError::Corrupt(format!("index database error: {e}"))
+}
+
+/// Turns user text into a safe FTS5 expression: every word becomes a quoted phrase, so
+/// operators and punctuation in the input cannot change the meaning of the query.
+fn fts_query(text: &str) -> Option<String> {
+    let parts: Vec<String> = text
+        .split_whitespace()
+        .filter_map(|w| {
+            let (word, prefix) = match w.strip_suffix('*') {
+                Some(x) => (x, true),
+                None => (w, false),
+            };
+            if word.is_empty() {
+                return None;
+            }
+            let quoted = format!("\"{}\"", word.replace('"', "\"\""));
+            Some(if prefix { format!("{quoted}*") } else { quoted })
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fts_query;
+
+    #[test]
+    fn user_text_is_quoted() {
+        assert_eq!(fts_query("job-77").as_deref(), Some("\"job-77\""));
+        assert_eq!(
+            fts_query("curl  http://x").as_deref(),
+            Some("\"curl\" \"http://x\"")
+        );
+        assert_eq!(fts_query("pay*").as_deref(), Some("\"pay\"*"));
+        assert_eq!(
+            fts_query("say \"hi\"").as_deref(),
+            Some("\"say\" \"\"\"hi\"\"\"")
+        );
+        assert_eq!(
+            fts_query("NOT OR AND").as_deref(),
+            Some("\"NOT\" \"OR\" \"AND\"")
+        );
+        assert_eq!(fts_query("   *  "), None);
+    }
 }

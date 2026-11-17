@@ -490,3 +490,17 @@ fn recent_lines(seg_dir: &Path) -> Result<Vec<Vec<u8>>> {
     let tail = scan_plain_tail(&last.path)?;
     Ok(tail.prev_line.into_iter().chain(tail.last_line).collect())
 }
+
+/// Read-only `(last seq, chain head)` of a store; `(0, GENESIS)` if it has no records.
+/// Safe to call while the daemon is writing (it never modifies anything).
+pub fn read_head(seg_dir: &Path) -> Result<(u64, Hash)> {
+    let Some(line) = recent_lines(seg_dir)?.pop() else {
+        return Ok((0, GENESIS));
+    };
+    let (body, h) = chain::decode_line(&line)?;
+    let v: Value = serde_json::from_slice(&body)?;
+    let seq = v["seq"]
+        .as_u64()
+        .ok_or_else(|| StoreError::Corrupt("last record has no seq".into()))?;
+    Ok((seq, h))
+}

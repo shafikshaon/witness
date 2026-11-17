@@ -132,11 +132,11 @@ impl Collector {
         let self_tgid = std::process::id();
         // Stats-only by default: a rejected program then costs one fast attempt instead of
         // aya's retry-with-a-bigger-buffer loop over a multi-megabyte trace. Set
-        // WITNESS_VERIFIER_LOG=debug for the full trace when diagnosing.
-        let log_level = if std::env::var("WITNESS_VERIFIER_LOG").as_deref() == Ok("debug") {
-            VerifierLogLevel::DEBUG | VerifierLogLevel::STATS
-        } else {
-            VerifierLogLevel::STATS
+        // WITNESS_VERIFIER_LOG=debug (or verbose) for the full trace when diagnosing.
+        let log_level = match std::env::var("WITNESS_VERIFIER_LOG").as_deref() {
+            Ok("debug") => VerifierLogLevel::DEBUG | VerifierLogLevel::STATS,
+            Ok("verbose") => VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS,
+            _ => VerifierLogLevel::STATS,
         };
         let mut ebpf = EbpfLoader::new()
             .verifier_log_level(log_level)

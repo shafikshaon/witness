@@ -324,17 +324,38 @@ struct MountHead {
     mountpoint: u64,
 }
 
-/// Reads `T` at `src` into zeroed memory; a failed read leaves zeros. Deliberately no
-/// branch on the helper's result: failure is handled by the zeros it leaves behind.
+/// Reads a [`DentryHead`] at `src`; a failed read leaves zeros. No branch on the helper's
+/// result, and the zeros are plain field stores: `MaybeUninit::zeroed()` would call
+/// `compiler_builtins`' byte-loop `memset`, which the verifier then explores iteration by
+/// iteration for every directory level.
 #[inline(always)]
-unsafe fn read_or_zero<T: Copy>(src: *const u8) -> T {
-    let mut v: core::mem::MaybeUninit<T> = core::mem::MaybeUninit::zeroed();
+unsafe fn read_dentry_head(src: *const u8) -> DentryHead {
+    let mut v = DentryHead {
+        parent: 0,
+        hash: 0,
+        len: 0,
+        name: 0,
+    };
     let _ = generated::bpf_probe_read_kernel(
-        v.as_mut_ptr().cast(),
-        core::mem::size_of::<T>() as u32,
+        (&mut v as *mut DentryHead).cast(),
+        core::mem::size_of::<DentryHead>() as u32,
         src.cast(),
     );
-    v.assume_init()
+    v
+}
+
+#[inline(always)]
+unsafe fn read_mount_head(src: *const u8) -> MountHead {
+    let mut v = MountHead {
+        parent: 0,
+        mountpoint: 0,
+    };
+    let _ = generated::bpf_probe_read_kernel(
+        (&mut v as *mut MountHead).cast(),
+        core::mem::size_of::<MountHead>() as u32,
+        src.cast(),
+    );
+    v
 }
 
 /// Builds the absolute path of `dentry` under mount `mnt` (a `struct vfsmount *`) into
@@ -358,14 +379,14 @@ unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offset
     let mut i = 0;
     while i < MAX_COMPONENTS {
         i += 1;
-        let head: DentryHead = read_or_zero(dentry.add(o.dentry_d_parent as usize));
+        let head = read_dentry_head(dentry.add(o.dentry_d_parent as usize));
         if head.parent == dentry as u64 || head.parent == 0 {
             // Root of this filesystem: continue at its mount point in the parent mount.
             if mnt.is_null() {
                 break;
             }
             let mount = mnt.sub(o.mount_mnt as usize);
-            let m: MountHead = read_or_zero(mount.add(o.mount_mnt_parent as usize));
+            let m = read_mount_head(mount.add(o.mount_mnt_parent as usize));
             if m.parent == 0 || m.parent == mount as u64 {
                 break; // the namespace root
             }

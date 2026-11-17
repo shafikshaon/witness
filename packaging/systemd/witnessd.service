@@ -36,8 +36,11 @@ IOWeight=200
 
 # --- Hardening (each choice is explained in docs/DESIGN.md §6.3) ---------------------------
 User=root
-# The minimum that eBPF capture, hashing and /proc inspection need; see DESIGN.md §6.3.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_AUDIT_READ CAP_NET_ADMIN
+# Measured, not guessed (DESIGN.md §6.3): capture works with just CAP_BPF + CAP_PERFMON.
+# CAP_SYS_PTRACE reads other users' /proc/<pid>/exe and cwd; CAP_DAC_READ_SEARCH is for
+# hashing files. CAP_SYS_ADMIN / CAP_NET_ADMIN / CAP_AUDIT_READ are deliberately absent until
+# a feature that needs them lands and is tested.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 AmbientCapabilities=
 NoNewPrivileges=yes
 ProtectSystem=strict

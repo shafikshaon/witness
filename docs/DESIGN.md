@@ -149,6 +149,18 @@ Each source (every eBPF program group, each ring buffer, fanotify, D-Bus, journa
 - **Fixed along the way:** user search text was handed to FTS5 as query syntax, so a plain search for `job-77` failed (`-` is NOT); it is now quoted word by word (trailing `*` = prefix).
 - Not yet done (M6): systemd unit and `sd_notify`/watchdog, baseline snapshot, the API socket, and the journald anchor sink.
 
+### 2.8 The service, as built and verified (Ubuntu 22.04 / 5.15.0-198 / aarch64, real reboots)
+
+`packaging/systemd/witnessd.service` (`Type=notify`, `READY=1` only after the eBPF programs attach; `WatchdogSec=30` with pings from the main loop only; `Restart=always`, `RestartSec=1`) and `packaging/dev-install.sh`. Verified on the VM:
+
+- **Boot ordering (monotonic µs since boot):** `witnessd` active at 3.13 s, before `network-pre.target` 3.39 s, `network.target` 3.44 s, `systemd-user-sessions` 5.01 s, `ssh` 5.04 s. Not claimed: anything before `local-fs.target` (kernel, initramfs) — that window is only made visible, via the `new_boot` gap.
+- **Graceful power cycle:** `daemon_stop{clean, signal 15}` at shutdown; at boot `capture_gap{new_boot, prev_shutdown:clean}` + `daemon_start`. **Hard power-off:** `capture_gap{new_boot, prev_shutdown:unclean}`; the chain verifies (no torn tail needed repair in this run).
+- **`kill -9`:** systemd restarted it within the 1 s `RestartSec`; unclean gap recorded; events captured before the kill survived.
+- **Watchdog:** a SIGSTOP'd (frozen but alive) daemon was replaced by systemd at ~30 s; the recorded gap covered the ~29 s freeze.
+- **`systemctl stop`:** `Result=success`, exit 0, `reason: signal`.
+- **Capabilities, measured:** capture works with only `CAP_BPF` + `CAP_PERFMON`; dropping either (with `CAP_SYS_PTRACE` alone) prevents startup. The unit keeps `CAP_SYS_PTRACE` (other users' `/proc/<pid>/exe`, `cwd`) and `CAP_DAC_READ_SEARCH` (hashing, M3) and **omits `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_AUDIT_READ`** until a tested feature needs them. The doc's earlier draft list (§6.1) was a starting point; this supersedes it.
+- **Bugs found only by real shutdowns, now fixed and regression-tested:** (1) systemd's SIGTERM interrupted `poll()` (`EINTR`) and the loop treated it as fatal, so every stop exited 1 and showed "Failed"; (2) a SIGTERM arriving during `signal-hook`'s own registration was silently swallowed and the daemon ran on. Both are gone: SIGTERM/SIGINT are blocked first thing (before any thread) and read from a `signalfd`, so a signal can neither be lost nor kill the process mid-startup. The only remaining window is before `main()` runs its first line, when nothing has been written yet.
+
 ## 3. Kernel side and daemon internals
 
 ### 3.1 Programs, maps, buffers

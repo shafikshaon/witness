@@ -5,7 +5,7 @@
 //! ```sh
 //! sudo mkdir -p /mnt/witness-small && sudo mount -t tmpfs -o size=1m tmpfs /mnt/witness-small
 //! sudo chown $USER /mnt/witness-small
-//! WITNESS_SMALL_FS=/mnt/witness-small cargo test -p witness-store --test real_enospc -- --ignored
+//! WITNESS_SMALL_FS=/mnt/witness-small cargo test -p witness-store --test real_enospc -- --ignored --test-threads=1
 //! ```
 
 use std::fs;

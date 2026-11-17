@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
+use witness_config::{Config as WitnessConfig, ConfigError};
 use witness_store::anchor::read_anchors;
 use witness_store::archive::plan_prefix;
 use witness_store::chain::{self, to_hex, Hash};
@@ -102,10 +103,29 @@ enum Cmd {
         #[arg(long)]
         seal: bool,
     },
+    /// Validate or show the configuration file.
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
     /// Print the current chain head to record somewhere the host cannot rewrite.
     Anchor {
         #[arg(long, default_value = DEFAULT_DIR)]
         dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Check a config file; reports every problem at once. Exit 1 if invalid.
+    Check {
+        #[arg(long, default_value = witness_config::DEFAULT_PATH)]
+        file: PathBuf,
+    },
+    /// Print the effective configuration (defaults filled in).
+    Show {
+        #[arg(long, default_value = witness_config::DEFAULT_PATH)]
+        file: PathBuf,
     },
 }
 
@@ -154,6 +174,7 @@ fn run() -> Result<ExitCode> {
             expect,
         } => cmd_prune(&dir, &before, yes_delete_evidence, expect),
         Cmd::Init { dir, seal } => cmd_init(&dir, seal),
+        Cmd::Config { cmd } => cmd_config(cmd),
         Cmd::Anchor { dir } => {
             let (seq, head) = read_head(&dir.join("segments"))
                 .with_context(|| format!("reading {}", dir.display()))?;
@@ -384,6 +405,35 @@ fn parse_time_ns(s: &str) -> Result<u64> {
         .ok()
         .and_then(|s| s.checked_mul(1_000_000_000))
         .ok_or_else(bad)
+}
+
+fn cmd_config(cmd: ConfigCmd) -> Result<ExitCode> {
+    let (file, show) = match cmd {
+        ConfigCmd::Check { file } => (file, false),
+        ConfigCmd::Show { file } => (file, true),
+    };
+    let cfg = if file.exists() {
+        match WitnessConfig::load(&file) {
+            Ok((c, sha)) => {
+                if !show {
+                    println!("OK: {} (sha256 {})", file.display(), to_hex(&sha));
+                }
+                c
+            }
+            Err(e @ ConfigError::Invalid(_)) | Err(e @ ConfigError::Parse(_)) => {
+                eprintln!("{}: {e}", file.display());
+                return Ok(ExitCode::from(1));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        eprintln!("note: {} not found; defaults are in effect", file.display());
+        WitnessConfig::default()
+    };
+    if show {
+        print!("{}", cfg.to_toml());
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_init(dir: &Path, seal: bool) -> Result<ExitCode> {

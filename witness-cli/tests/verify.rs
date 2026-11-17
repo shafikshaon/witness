@@ -249,3 +249,46 @@ fn archive_refuses_while_another_writer_holds_the_store() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("in use by another writer"));
 }
+
+#[test]
+fn config_check_and_show() {
+    use std::process::Command;
+    let t = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_witness"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let good = t.path().join("good.toml");
+    fs::write(&good, "[storage]\non_full = \"stop\"\n").unwrap();
+    let out = run(&["config", "check", "--file", good.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().starts_with("OK:"));
+
+    let bad = t.path().join("bad.toml");
+    fs::write(
+        &bad,
+        "[capture]\nring_volume_mib = 33\n[daemon]\nlog_level = \"loud\"\n",
+    )
+    .unwrap();
+    let out = run(&["config", "check", "--file", bad.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        err.contains("ring_volume_mib") && err.contains("log_level"),
+        "{err}"
+    );
+
+    let out = run(&["config", "show", "--file", good.to_str().unwrap()]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("on_full = \"stop\"") && text.contains("[seal]"));
+    // A missing file means defaults, with a note.
+    let out = run(&[
+        "config",
+        "show",
+        "--file",
+        t.path().join("none.toml").to_str().unwrap(),
+    ]);
+    assert!(out.status.success());
+}

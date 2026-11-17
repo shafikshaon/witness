@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use witness_store::chain::to_hex;
+use witness_store::index::Index;
 use witness_store::verify::{verify_dir, Report};
 
 #[derive(Parser)]
@@ -29,6 +30,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Rebuild the SQLite query index from the segments.
+    Reindex {
+        #[arg(long, default_value = "/var/lib/witness")]
+        dir: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -43,6 +49,24 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     match Cli::parse().cmd {
+        Cmd::Reindex { dir } => {
+            let db = dir.join("index.db");
+            for ext in ["", "-wal", "-shm"] {
+                let p = PathBuf::from(format!("{}{ext}", db.display()));
+                match std::fs::remove_file(&p) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("removing {}", p.display())),
+                }
+            }
+            let mut ix = Index::open(&db).context("creating index")?;
+            let n = ix
+                .catch_up(&dir.join("segments"))
+                .context("indexing segments")?;
+            let (seq, head) = ix.position()?;
+            println!("indexed {n} records; head seq {seq} {}", to_hex(&head));
+            Ok(ExitCode::SUCCESS)
+        }
         Cmd::Verify { dir, json } => {
             let seg_dir = dir.join("segments");
             let report =

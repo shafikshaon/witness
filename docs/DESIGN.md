@@ -403,6 +403,15 @@ Config `[storage]`: `warn_pct = [80, 90]`, `min_free_bytes` (default 1 GiB), `on
 - The index lives under the same `/var/lib/witness` by default; a separate `index_dir` option is supported. Index failure never blocks evidence writing.
 - Disk usage is polled every 30 s (`statvfs`), exposed in the API/GUI, logged to the journal at thresholds.
 
+**Implemented in M2 (as built; refines the list above):**
+- Priorities `P0..P3`; `append` is P0, `append_prio` takes the class. Free space is polled by `tick()` (daemon: ~1 s) and every `probe_every_bytes` (default 8 MiB) of appended data, so a fast fill cannot outrun the check.
+- `shed` mode grades by free space against `min_free_bytes`: below 100 % sheds P3, below 2/3 also P2, below 1/3 also P1. P0 is never shed. A level is left only after 10 % of `min_free` extra headroom (no flapping). Shed events are counted per class and written as `capture_drop {reason:"disk", from_ns, to_ns, dropped:[p0,p1,p2,p3]}` (at most every `drop_report_interval`, and immediately when space recovers).
+- `stop` mode: below `min_free` the reserve is released, a `capture_gap` start record is written, the segment is sealed, and all appends are refused (counted). Capture resumes only when free space reaches `reserve + min_free + 10 %`; the reserve is recreated first, then a `capture_gap` end record carries the per-class counts and whether the start was recorded.
+- **Write failures are rolled back.** If a write hits ENOSPC/quota partway, the file is truncated back to the last good length, so a partial line can never enter the chain. A failed segment open removes its empty file. In `shed` mode a failed P0 write retries once into the released reserve; if that fails too, capture stops and records a gap. Policy records that cannot be written are counted (`unrecorded_notes`) and still returned as events for the caller to log.
+- Warnings fire once per threshold crossing (`disk_warning`) and again after recovery and re-crossing.
+- Compression is deferred while free space is too low to hold the new file; the plain segment is never removed first.
+- Known limits: the reserve is a real reservation only where `fallocate` allocates (Linux ext4/xfs); on copy-on-write or compressing filesystems it may not guarantee space. The SQLite index is not yet governed by this policy (it can fail independently and is rebuildable). Real ENOSPC on a full filesystem has so far been **simulated** (fault injection), not exercised on Linux.
+
 ### 5.7 Size estimates (to be measured, not promised)
 
 For a busy desktop at ~100 events/s avg (file events dominate): ~8.6 M events/day × ~500 B JSON ≈ **4.3 GB/day raw → ~0.4 GB/day sealed**; index (rows + FTS) ≈ **2–3 GB/day**. A quiet server is 10–100× less. These drive defaults for P3 summarization. M2/M10 include real measurements.

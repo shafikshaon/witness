@@ -218,6 +218,8 @@ mod store_mode {
     use witness_store::segment;
     use witness_store::verify::{verify_with, Options};
 
+    // The child is handed to the caller, which always waits on or kills it.
+    #[allow(clippy::zombie_processes)]
     fn spawn(data: &Path, seconds: u32) -> (Child, std::io::BufReader<std::process::ChildStderr>) {
         assert!(rustix::process::geteuid().is_root(), "run with sudo");
         let mut child = Command::new(env!("CARGO_BIN_EXE_witnessd"))

@@ -25,3 +25,10 @@ Linux forensic activity monitor. Authoritative design: `docs/DESIGN.md` (approve
 
 ## Git
 - Small, focused commits. **No Co-Authored-By trailer** (user preference).
+
+## Linux test VM (Lima)
+- VM `witness-dev`: Ubuntu 22.04.5, kernel 5.15.0-198-generic, **aarch64**, 4 CPU / 8 GiB, BTF on, passwordless sudo. Start: `limactl start witness-dev`. Run: `limactl shell witness-dev -- bash -lc '<cmd>'`.
+- The macOS home is mounted **read-only** in the VM. Work in the VM-local clone `~/witness`: `git -c safe.directory='*' pull /Users/shafikshaon/Workplace/Projects/Witness main`, commit on the Mac, pull in the VM. Build with `source ~/.cargo/env; export PATH=$HOME/.local/bin:$PATH`.
+- Installed there: rustup stable + nightly (`rust-src`), `bpf-linker` 0.13.0 (prebuilt musl release; hash not independently verified), bpftool 5.15, clang/llvm 14, strace.
+- Real-ENOSPC tests need a tiny mount: `sudo mount -t tmpfs -o size=1m tmpfs /mnt/witness-small && sudo chown $USER /mnt/witness-small`, then `WITNESS_SMALL_FS=/mnt/witness-small cargo test -p witness-store --test real_enospc -- --ignored --test-threads=1`.
+- It is aarch64; x86_64 still needs a separate check (cloud VM or UTM). Always report the kernel (`uname -r`) and arch when claiming "verified on a real kernel".

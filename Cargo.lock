@@ -687,11 +687,13 @@ dependencies = [
  "getrandom",
  "hmac",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "witness-store",
  "zeroize",
  "zstd",
 ]

@@ -13,6 +13,7 @@ workspace = true
 getrandom = "=0.4.3"
 hmac = "=0.13.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustix = { version = "=1.1.6", features = ["fs"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 sha2 = "=0.11.0"
@@ -20,5 +21,10 @@ thiserror = "=2.0.21"
 zeroize = { version = "=1.9.2", features = ["derive"] }
 zstd = "=0.14.4"
 
+[features]
+# Test-only hook that simulates a disk filling up mid-write.
+fault-injection = []
+
 [dev-dependencies]
+witness-store = { path = ".", features = ["fault-injection"] }
 tempfile = "=3.27.0"

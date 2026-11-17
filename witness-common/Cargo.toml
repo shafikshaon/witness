@@ -1,0 +1,14 @@
+[package]
+name = "witness-common"
+description = "Shared kernel/userspace types for Witness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["std"]
+std = []
+
+[lints]
+workspace = true

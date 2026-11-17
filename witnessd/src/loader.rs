@@ -78,7 +78,10 @@ impl Collector {
     /// Waits up to `timeout` for data, then calls `f` with each pending record.
     pub fn poll(&mut self, timeout: Duration, mut f: impl FnMut(&[u8])) -> Result<usize> {
         let fd = self.ring.as_fd();
-        let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
+        let mut fds = [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN,
+        )];
         let ts = rustix::time::Timespec {
             tv_sec: timeout.as_secs() as _,
             tv_nsec: timeout.subsec_nanos() as _,

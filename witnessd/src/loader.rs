@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
-use aya::programs::{BtfTracePoint, FExit};
+use aya::programs::{BtfTracePoint, FExit, KProbe};
 use aya::{Btf as AyaBtf, EbpfLoader};
 use witness_common::{Offsets, UNAVAILABLE};
 
@@ -40,18 +40,20 @@ const PROGRAMS: [&str; 3] = [
 /// File hooks: `(program, kernel function, expected parameter count)`. The count is checked
 /// against the running kernel's BTF so a changed signature degrades the hook instead of
 /// letting the program read the wrong argument.
-const FILE_HOOKS: [(&str, &str, usize); 11] = [
-    ("file_open", "security_file_open", 1),
-    ("path_mknod", "security_path_mknod", 4),
-    ("path_mkdir", "security_path_mkdir", 3),
-    ("path_unlink", "security_path_unlink", 2),
-    ("path_rmdir", "security_path_rmdir", 2),
-    ("path_chmod", "security_path_chmod", 2),
-    ("path_chown", "security_path_chown", 3),
-    ("path_truncate", "security_path_truncate", 1),
-    ("path_rename", "security_path_rename", 5),
-    ("path_link", "security_path_link", 3),
-    ("path_symlink", "security_path_symlink", 3),
+/// `true` marks a kprobe (used where the signature has by-value struct arguments, which
+/// fexit cannot carry); all others are fexit.
+const FILE_HOOKS: [(&str, &str, usize, bool); 11] = [
+    ("file_open", "security_file_open", 1, false),
+    ("path_mknod", "security_path_mknod", 4, false),
+    ("path_mkdir", "security_path_mkdir", 3, false),
+    ("path_unlink", "security_path_unlink", 2, false),
+    ("path_rmdir", "security_path_rmdir", 2, false),
+    ("path_chmod", "security_path_chmod", 2, false),
+    ("path_chown", "security_path_chown", 3, true),
+    ("path_truncate", "security_path_truncate", 1, false),
+    ("path_rename", "security_path_rename", 5, false),
+    ("path_link", "security_path_link", 3, false),
+    ("path_symlink", "security_path_symlink", 3, false),
 ];
 
 /// Outcome of attaching one optional hook.
@@ -131,7 +133,7 @@ impl Collector {
 
         let mut reports = Vec::new();
         let missing = missing_file_offsets(&offsets);
-        for (prog_name, func, params) in FILE_HOOKS {
+        for (prog_name, func, params, kprobe) in FILE_HOOKS {
             let status: Result<(), String> = (|| {
                 if !files {
                     return Err("file capture disabled in the configuration".into());
@@ -146,13 +148,18 @@ impl Collector {
                     }
                     Some(_) => {}
                 }
-                let prog: &mut FExit = ebpf
+                let program = ebpf
                     .program_mut(prog_name)
-                    .ok_or_else(|| format!("program {prog_name} missing from the object"))?
-                    .try_into()
-                    .map_err(|e| format!("{e}"))?;
-                prog.load(func, &kbtf).map_err(|e| format!("load: {e}"))?;
-                prog.attach().map_err(|e| format!("attach: {e}"))?;
+                    .ok_or_else(|| format!("program {prog_name} missing from the object"))?;
+                if kprobe {
+                    let prog: &mut KProbe = program.try_into().map_err(|e| format!("{e}"))?;
+                    prog.load().map_err(|e| format!("load: {e}"))?;
+                    prog.attach(func, 0).map_err(|e| format!("attach: {e}"))?;
+                } else {
+                    let prog: &mut FExit = program.try_into().map_err(|e| format!("{e}"))?;
+                    prog.load(func, &kbtf).map_err(|e| format!("load: {e}"))?;
+                    prog.attach().map_err(|e| format!("attach: {e}"))?;
+                }
                 Ok(())
             })();
             reports.push(HookReport { hook: func, status });

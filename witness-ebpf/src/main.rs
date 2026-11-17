@@ -14,9 +14,9 @@ use aya_ebpf::{
         bpf_get_current_uid_gid, bpf_ktime_get_boot_ns, bpf_probe_read_kernel,
         bpf_probe_read_kernel_str_bytes, generated,
     },
-    macros::{btf_tracepoint, fexit, map},
+    macros::{btf_tracepoint, fexit, kprobe, map},
     maps::{PerCpuArray, RingBuf},
-    programs::{BtfTracePointContext, FExitContext},
+    programs::{BtfTracePointContext, FExitContext, ProbeContext},
 };
 use witness_common::{
     fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
@@ -351,7 +351,9 @@ unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offset
             trunc = 1;
             break;
         }
-        off -= len + 1;
+        // The guard above makes this non-negative, but the verifier tracks value ranges, not
+        // that relation: masking proves `off` lies within the buffer.
+        off = (off - (len + 1)) & (PATH_CAP - 1);
         *buf.add(off) = b'/';
         // `off + 1 + len` is at most PATH_CAP, so the copy cannot leave the buffer.
         let _ = generated::bpf_probe_read_kernel(
@@ -613,17 +615,23 @@ pub fn path_chmod(ctx: FExitContext) -> i32 {
 }
 
 /// security_path_chown(const struct path *path, kuid_t uid, kgid_t gid)
-#[fexit(function = "security_path_chown")]
-pub fn path_chown(ctx: FExitContext) -> i32 {
+///
+/// `kuid_t`/`kgid_t` are structs passed by value, which BPF trampolines (fentry/fexit)
+/// cannot carry on 5.15, so this one is a kprobe. A kprobe sees the call, not its result.
+#[kprobe(function = "security_path_chown")]
+pub fn path_chown(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let path: *const u8 = ctx.arg(0);
-        let uid: u32 = ctx.arg(1);
-        let gid: u32 = ctx.arg(2);
-        let ret: i32 = ctx.arg(3);
+        let (Some(path), Some(uid), Some(gid)) = (
+            ctx.arg::<*const u8>(0),
+            ctx.arg::<u32>(1),
+            ctx.arg::<u32>(2),
+        ) else {
+            return 0;
+        };
         let o = offsets();
         let (mnt, dentry) = path_parts(path, &o);
-        emit_file(fop::CHOWN, ret, mnt, dentry, 0, 0, uid, gid);
+        emit_file(fop::CHOWN, 0, mnt, dentry, 0, 0, uid, gid);
     }
     0
 }

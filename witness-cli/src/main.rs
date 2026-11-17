@@ -103,6 +103,23 @@ enum Cmd {
         #[arg(long)]
         seal: bool,
     },
+    /// Print stored records (most recent last). A quick look at the evidence, not a query API.
+    Show {
+        #[arg(long, default_value = DEFAULT_DIR)]
+        dir: PathBuf,
+        /// Also read segments from this archive directory (repeatable).
+        #[arg(long = "include")]
+        include: Vec<PathBuf>,
+        /// Only these record types (repeatable), e.g. `--type daemon_start`.
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Show only the last N matching records.
+        #[arg(long, default_value_t = 20)]
+        last: usize,
+        /// Print the raw stored JSON line instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate or show the configuration file.
     Config {
         #[command(subcommand)]
@@ -175,6 +192,13 @@ fn run() -> Result<ExitCode> {
         } => cmd_prune(&dir, &before, yes_delete_evidence, expect),
         Cmd::Init { dir, seal } => cmd_init(&dir, seal),
         Cmd::Config { cmd } => cmd_config(cmd),
+        Cmd::Show {
+            dir,
+            include,
+            types,
+            last,
+            json,
+        } => cmd_show(&dir, &include, &types, last, json),
         Cmd::Anchor { dir } => {
             let (seq, head) = read_head(&dir.join("segments"))
                 .with_context(|| format!("reading {}", dir.display()))?;
@@ -407,6 +431,100 @@ fn parse_time_ns(s: &str) -> Result<u64> {
         .ok_or_else(bad)
 }
 
+fn cmd_show(
+    dir: &Path,
+    include: &[PathBuf],
+    types: &[String],
+    last: usize,
+    json: bool,
+) -> Result<ExitCode> {
+    use std::collections::VecDeque;
+    use std::io::BufRead;
+    let mut dirs = vec![dir.join("segments")];
+    dirs.extend(include.iter().map(|d| d.join("segments")));
+    let mut keep: VecDeque<(serde_json::Value, String)> = VecDeque::with_capacity(last + 1);
+    for seg in witness_store::segment::list_segments_in(&dirs)? {
+        for line in witness_store::segment::open_reader(&seg)?.lines() {
+            let line = line?;
+            let (body, _) = chain::decode_line(line.as_bytes())?;
+            let v: serde_json::Value = serde_json::from_slice(&body)?;
+            let t = v["type"].as_str().unwrap_or("?");
+            if !types.is_empty() && !types.iter().any(|x| x == t) {
+                continue;
+            }
+            keep.push_back((v, line));
+            if keep.len() > last {
+                keep.pop_front();
+            }
+        }
+    }
+    for (v, raw) in &keep {
+        if json {
+            println!("{raw}");
+        } else {
+            println!("{}", summarize(v));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One-line description of a stored record.
+fn summarize(v: &serde_json::Value) -> String {
+    let seq = v["seq"].as_u64().unwrap_or(0);
+    let ns = v["wall_ns"].as_u64().or_else(|| v["ts_wall_ns"].as_u64());
+    let when = ns.map_or_else(|| "-".to_string(), format_time_ns);
+    let t = v["type"].as_str().unwrap_or("?");
+    let detail = match t {
+        "proc_exec" => {
+            let a = &v["actor"];
+            let cmd: Vec<&str> = a["cmdline"]
+                .as_array()
+                .map(|c| c.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            format!("pid={} uid={} {}", a["pid"], a["uid"], cmd.join(" "))
+        }
+        "proc_exit" | "proc_fork" => {
+            format!("pid={} {}", v["actor"]["pid"], v["data"])
+        }
+        _ => v["data"]
+            .as_object()
+            .filter(|o| !o.is_empty())
+            .map(|_| v["data"].to_string())
+            .unwrap_or_else(|| {
+                let mut m = v.as_object().cloned().unwrap_or_default();
+                for k in ["seq", "h", "type", "ts_wall_ns", "v"] {
+                    m.remove(k);
+                }
+                serde_json::Value::Object(m).to_string()
+            }),
+    };
+    let detail: String = detail.chars().take(160).collect();
+    format!("{seq:>8}  {when}  {t:<14} {detail}")
+}
+
+/// `2026-11-17T17:19:37Z` from nanoseconds since the Unix epoch (UTC).
+fn format_time_ns(ns: u64) -> String {
+    let secs = (ns / 1_000_000_000) as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 fn cmd_config(cmd: ConfigCmd) -> Result<ExitCode> {
     let (file, show) = match cmd {
         ConfigCmd::Check { file } => (file, false),
@@ -530,7 +648,7 @@ fn report_json(r: &Report) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_time_ns;
+    use super::{format_time_ns, parse_time_ns};
 
     #[test]
     fn dates_parse_to_known_epochs() {
@@ -547,6 +665,18 @@ mod tests {
             parse_time_ns("2026-11-17").unwrap(),
             1_794_873_600_000_000_000
         );
+    }
+
+    #[test]
+    fn formatting_inverts_parsing() {
+        for s in [
+            "1970-01-01T00:00:00Z",
+            "2000-03-01T00:00:00Z",
+            "2024-02-29T12:30:45Z",
+            "2026-11-17T17:19:37Z",
+        ] {
+            assert_eq!(format_time_ns(parse_time_ns(s).unwrap()), s);
+        }
     }
 
     #[test]

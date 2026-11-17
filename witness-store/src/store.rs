@@ -113,6 +113,8 @@ pub struct Store {
     last_id: u64,
     active: Option<Active>,
     seal: Option<SealState>,
+    /// Held for the life of the store; releasing it lets another writer in.
+    _lock: File,
     probe: Box<dyn SpaceProbe>,
     state: DiskState,
     level: u8,
@@ -148,6 +150,7 @@ impl Store {
             fs::create_dir_all(d)?;
         }
         restrict(root)?;
+        let lock = lock_exclusive(&root.join("store.lock"))?;
         let mut store = Store {
             seg_dir,
             quarantine_dir,
@@ -157,6 +160,7 @@ impl Store {
             last_id: 0,
             active: None,
             seal: None,
+            _lock: lock,
             probe,
             state: DiskState::Normal,
             level: 0,
@@ -935,4 +939,20 @@ pub fn read_head(seg_dir: &Path) -> Result<(u64, Hash)> {
         .as_u64()
         .ok_or_else(|| StoreError::Corrupt("last record has no seq".into()))?;
     Ok((seq, h))
+}
+
+/// Takes the single-writer lock. Only one `Store` (the daemon, or an offline tool such as
+/// `witness archive`) may append to a data directory at a time.
+fn lock_exclusive(path: &Path) -> Result<File> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(f),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(StoreError::Locked),
+        Err(e) => Err(StoreError::Io(e.into())),
+    }
 }

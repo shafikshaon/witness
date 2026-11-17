@@ -12,6 +12,8 @@ pub enum StoreError {
     Corrupt(String),
     #[error("disk is full: capture is stopped until space returns")]
     DiskFull,
+    #[error("the store is locked by another writer (is witnessd running?)")]
+    Locked,
     #[error("invalid argument: {0}")]
     Invalid(&'static str),
 }

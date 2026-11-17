@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 use witness_store::anchor::{read_anchors, AnchorSink, CommandSink, FileSink};
 use witness_store::chain::{self, Hash, GENESIS};
+use witness_store::disk::DiskPolicy;
 use witness_store::seal::SealState;
 use witness_store::segment;
 use witness_store::verify::{verify_with, BreakKind, Options};
@@ -40,7 +41,14 @@ fn env() -> Env {
 }
 
 fn open(e: &Env) -> Store {
-    let (mut s, _) = Store::open(&e.root, Config::default()).unwrap();
+    let (mut s, _) = Store::open(
+        &e.root,
+        Config {
+            disk: DiskPolicy::disabled(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     s.enable_sealing(&e.key_path).unwrap();
     s
 }
@@ -242,7 +250,14 @@ fn anchors_pass_on_an_untouched_store() {
 #[test]
 fn require_seals_flags_a_stripped_store() {
     let e = env();
-    let (mut s, _) = Store::open(&e.root, Config::default()).unwrap();
+    let (mut s, _) = Store::open(
+        &e.root,
+        Config {
+            disk: DiskPolicy::disabled(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     s.append(rec(1)).unwrap();
     s.sync().unwrap();
     let opts = Options {
@@ -287,7 +302,14 @@ fn stale_key_file_is_refused() {
     }
     drop(s);
     fs::write(&e.key_path, old).unwrap(); // restored from an old backup
-    let (mut s, _) = Store::open(&e.root, Config::default()).unwrap();
+    let (mut s, _) = Store::open(
+        &e.root,
+        Config {
+            disk: DiskPolicy::disabled(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(s.enable_sealing(&e.key_path).is_err());
 }
 

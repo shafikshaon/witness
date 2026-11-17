@@ -1,15 +1,18 @@
 //! Append-only writer with crash recovery and rotation (DESIGN.md §5.1).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::anchor::{Anchor, AnchorSink, TYPE_ANCHOR};
 use crate::chain::{self, Hash, GENESIS};
+use crate::disk::{
+    self, DiskPolicy, DiskState, OnFull, Priority, Space, SpaceProbe, StatvfsProbe, RESERVE_FILE,
+};
 use crate::error::{Result, StoreError};
 use crate::seal::{SealState, TYPE_SEAL_MAC};
 use crate::segment::{self, SegmentInfo};
@@ -22,14 +25,60 @@ const TAIL_WINDOW: u64 = 8 << 20;
 pub struct Config {
     /// An active segment is sealed once it reaches this size.
     pub max_segment_bytes: u64,
+    pub disk: DiskPolicy,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             max_segment_bytes: 256 << 20,
+            disk: DiskPolicy::default(),
         }
     }
+}
+
+/// Result of [`Store::append_prio`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Append {
+    Written(Appended),
+    /// Not written because of the disk-full policy; counted and later reported.
+    Dropped,
+}
+
+/// Something the disk policy did or noticed, for the caller to log and surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiskEvent {
+    Warning {
+        pct: u8,
+        used_pct: u8,
+        free_bytes: u64,
+    },
+    StateChanged {
+        from: String,
+        to: String,
+        free_bytes: u64,
+    },
+    /// Capture stopped (`on_full = "stop"`, or writes failed with no space left).
+    GapStarted,
+    GapEnded {
+        dropped: [u64; 4],
+    },
+    /// Periodic report of events shed by priority (`[p0, p1, p2, p3]`).
+    Dropped {
+        counts: [u64; 4],
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskStatus {
+    pub state: DiskState,
+    pub space: Option<Space>,
+    pub used_pct: u8,
+    pub dropped: [u64; 4],
+    pub reserve_present: bool,
+    /// Policy records that could not be written for lack of space (they are still returned
+    /// as [`DiskEvent`]s so the caller can log them).
+    pub unrecorded_notes: u64,
 }
 
 /// A torn (unterminated) tail removed while opening. The bytes are preserved on disk
@@ -64,11 +113,35 @@ pub struct Store {
     last_id: u64,
     active: Option<Active>,
     seal: Option<SealState>,
+    probe: Box<dyn SpaceProbe>,
+    state: DiskState,
+    level: u8,
+    space: Option<Space>,
+    bytes_since_probe: u64,
+    warned: usize,
+    dropped: [u64; 4],
+    drop_window_start_ns: Option<u64>,
+    last_drop_report: Option<Instant>,
+    gap_start_ns: Option<u64>,
+    gap_unrecorded: bool,
+    unrecorded_notes: u64,
+    pending: Vec<DiskEvent>,
+    inject_partial: Option<usize>,
 }
 
 impl Store {
     /// Opens (or creates) a store rooted at `root`, resuming after the last record.
     pub fn open(root: &Path, cfg: Config) -> Result<(Self, Vec<Recovery>)> {
+        Self::open_with_probe(root, cfg, Box::new(StatvfsProbe(root.to_path_buf())))
+    }
+
+    /// Like [`Store::open`] with an explicit free-space source (used by tests).
+    pub fn open_with_probe(
+        root: &Path,
+        cfg: Config,
+        probe: Box<dyn SpaceProbe>,
+    ) -> Result<(Self, Vec<Recovery>)> {
+        cfg.disk.validate().map_err(StoreError::Invalid)?;
         let seg_dir = root.join("segments");
         let quarantine_dir = root.join("quarantine");
         for d in [root, &seg_dir, &quarantine_dir] {
@@ -84,8 +157,23 @@ impl Store {
             last_id: 0,
             active: None,
             seal: None,
+            probe,
+            state: DiskState::Normal,
+            level: 0,
+            space: None,
+            bytes_since_probe: 0,
+            warned: 0,
+            dropped: [0; 4],
+            drop_window_start_ns: None,
+            last_drop_report: None,
+            gap_start_ns: None,
+            gap_unrecorded: false,
+            unrecorded_notes: 0,
+            pending: Vec::new(),
+            inject_partial: None,
         };
         let recoveries = store.resume()?;
+        store.init_disk();
         Ok((store, recoveries))
     }
 
@@ -181,23 +269,59 @@ impl Store {
         })
     }
 
-    /// Appends one record. `fields` must not contain `seq` or `h`; both are assigned here.
+    /// Appends one P0 record. Fails with [`StoreError::DiskFull`] if capture is stopped.
     pub fn append(&mut self, fields: Map<String, Value>) -> Result<Appended> {
+        match self.append_prio(Priority::P0, fields)? {
+            Append::Written(a) => Ok(a),
+            Append::Dropped => Err(StoreError::DiskFull),
+        }
+    }
+
+    /// Appends one record at `prio`, subject to the disk-full policy. `fields` must not
+    /// contain `seq` or `h`; both are assigned here.
+    pub fn append_prio(
+        &mut self,
+        prio: Priority,
+        mut fields: Map<String, Value>,
+    ) -> Result<Append> {
         if fields.contains_key("seq") || fields.contains_key("h") {
             return Err(StoreError::Invalid("`seq` and `h` are reserved"));
         }
-        if self.active.is_none() {
-            self.start_segment()?;
+        self.maybe_probe();
+        if self.state == DiskState::Stopped || disk::sheds(self.level, prio) {
+            self.count_drop(prio);
+            return Ok(Append::Dropped);
         }
-        let appended = self.write_record(fields)?;
+        let written = match self.write_with_segment(&mut fields) {
+            Ok(a) => a,
+            Err(StoreError::Io(e)) if is_full(&e) => return self.on_write_full(prio, &mut fields),
+            Err(e) => return Err(e),
+        };
         let full = self
             .active
             .as_ref()
             .is_some_and(|a| a.bytes >= self.cfg.max_segment_bytes);
         if full {
-            self.rotate()?;
+            // The record is already durable-bound; failing to seal for lack of space only
+            // defers rotation to the next append.
+            match self.rotate() {
+                Err(StoreError::Io(e)) if is_full(&e) => {}
+                other => other?,
+            }
         }
-        Ok(appended)
+        Ok(Append::Written(written))
+    }
+
+    fn write_with_segment(&mut self, fields: &mut Map<String, Value>) -> Result<Appended> {
+        if self.active.is_none() {
+            self.start_segment()?;
+        }
+        self.write_record(fields)
+    }
+
+    fn count_drop(&mut self, prio: Priority) {
+        self.dropped[prio.index()] += 1;
+        self.drop_window_start_ns.get_or_insert_with(now_ns);
     }
 
     /// Turns on forward-secure sealing using the evolving key stored at `key_path`.
@@ -303,7 +427,7 @@ impl Store {
         f.insert("type".into(), TYPE_SEAL.into());
         f.insert("ts_wall_ns".into(), now_ns().into());
         f.insert("records".into(), (self.next_seq - first_seq).into());
-        self.write_record(f)?;
+        self.write_record(&mut f)?;
         if let Some(a) = self.active.take() {
             a.file.sync_all()?;
         }
@@ -315,9 +439,17 @@ impl Store {
         let active_id = self.active.as_ref().map(|a| a.id);
         let mut done = Vec::new();
         for s in segment::list_segments(&self.seg_dir)? {
-            if !s.compressed && Some(s.id) != active_id {
-                done.push(segment::compress_segment(&s)?);
+            if s.compressed || Some(s.id) == active_id {
+                continue;
             }
+            // Compression needs room for the new file before the plain one can go.
+            let size = fs::metadata(&s.path)?.len();
+            if let Ok(space) = self.probe.probe() {
+                if space.avail < size.saturating_add(self.cfg.disk.min_free_bytes / 4) {
+                    continue;
+                }
+            }
+            done.push(segment::compress_segment(&s)?);
         }
         Ok(done)
     }
@@ -349,30 +481,330 @@ impl Store {
         f.insert("seg".into(), id.into());
         f.insert("prev_seg_sha256".into(), chain::to_hex(&prev_sha).into());
         f.insert("prev_head".into(), chain::to_hex(&self.head).into());
-        self.write_record(f)?;
-        if let Some(a) = &self.active {
-            a.file.sync_all()?;
+        let opened = self.write_record(&mut f).and_then(|_| {
+            if let Some(a) = &self.active {
+                a.file.sync_all()?;
+            }
+            segment::sync_dir(&self.seg_dir).map_err(StoreError::from)
+        });
+        if let Err(e) = opened {
+            // Leave no half-born segment behind; the id is reused by the next attempt.
+            self.active = None;
+            self.last_id = id - 1;
+            let _ = fs::remove_file(&path);
+            return Err(e);
         }
-        segment::sync_dir(&self.seg_dir)?;
         Ok(())
     }
 
-    fn write_record(&mut self, mut fields: Map<String, Value>) -> Result<Appended> {
+    fn write_record(&mut self, fields: &mut Map<String, Value>) -> Result<Appended> {
         let seq = self.next_seq;
         fields.insert("seq".into(), json!(seq));
-        let body = serde_json::to_vec(&Value::Object(fields))?;
+        let body = serde_json::to_vec(&*fields)?;
         let (mut line, hash) = chain::encode_line(&self.head, &body)?;
         line.push(b'\n');
+        let inject = self.inject_partial.take();
         let active = self
             .active
             .as_mut()
             .ok_or(StoreError::Invalid("no active segment"))?;
-        active.file.write_all(&line)?;
+        let before = active.bytes;
+        if let Err(e) = write_line(&mut active.file, &line, inject) {
+            // A partial line must never stay in the chain: put the file back exactly as it was.
+            active.file.set_len(before).map_err(|te| {
+                StoreError::Corrupt(format!(
+                    "could not roll back a failed write ({te}); original error: {e}"
+                ))
+            })?;
+            return Err(e.into());
+        }
         active.bytes += line.len() as u64;
+        self.bytes_since_probe += line.len() as u64;
         self.next_seq = seq + 1;
         self.head = hash;
         Ok(Appended { seq, hash })
     }
+
+    // ---- disk-full policy ------------------------------------------------------------
+
+    fn reserve_path(&self) -> PathBuf {
+        self.seg_dir
+            .parent()
+            .unwrap_or(&self.seg_dir)
+            .join(RESERVE_FILE)
+    }
+
+    fn init_disk(&mut self) {
+        if let Ok(space) = self.probe.probe() {
+            self.space = Some(space);
+            let need = self.cfg.disk.reserve_bytes + self.cfg.disk.min_free_bytes;
+            if space.avail >= need {
+                let _ = disk::create_reserve(&self.reserve_path(), self.cfg.disk.reserve_bytes);
+            }
+            let mut ev = Vec::new();
+            self.apply_space(space, &mut ev);
+            self.pending.extend(ev);
+        }
+    }
+
+    fn maybe_probe(&mut self) {
+        if self.bytes_since_probe < self.cfg.disk.probe_every_bytes {
+            return;
+        }
+        self.bytes_since_probe = 0;
+        if let Ok(space) = self.probe.probe() {
+            let mut ev = Vec::new();
+            self.apply_space(space, &mut ev);
+            self.pending.extend(ev);
+        }
+    }
+
+    /// Polls free space, advances the policy state machine and returns what happened.
+    /// The daemon should call this about every second.
+    pub fn tick(&mut self) -> Result<Vec<DiskEvent>> {
+        let mut events = std::mem::take(&mut self.pending);
+        self.bytes_since_probe = 0;
+        let space = self.probe.probe()?;
+        self.apply_space(space, &mut events);
+        self.flush_drop_report(&mut events, false);
+        Ok(events)
+    }
+
+    pub fn disk_status(&self) -> DiskStatus {
+        DiskStatus {
+            state: self.state,
+            space: self.space,
+            used_pct: self.space.map_or(0, |s| s.used_pct()),
+            dropped: self.dropped,
+            reserve_present: self.reserve_path().exists(),
+            unrecorded_notes: self.unrecorded_notes,
+        }
+    }
+
+    fn apply_space(&mut self, space: Space, events: &mut Vec<DiskEvent>) {
+        self.space = Some(space);
+        let used = space.used_pct();
+        let crossed = self
+            .cfg
+            .disk
+            .warn_pcts
+            .iter()
+            .filter(|&&p| used >= p)
+            .count();
+        for idx in self.warned..crossed {
+            let pct = self.cfg.disk.warn_pcts[idx];
+            self.note("disk_warning", |f| {
+                f.insert("threshold_pct".into(), pct.into());
+                f.insert("used_pct".into(), used.into());
+                f.insert("free_bytes".into(), space.avail.into());
+            });
+            events.push(DiskEvent::Warning {
+                pct,
+                used_pct: used,
+                free_bytes: space.avail,
+            });
+        }
+        self.warned = crossed;
+
+        let min_free = self.cfg.disk.min_free_bytes;
+        match self.cfg.disk.on_full {
+            OnFull::Shed => {
+                let new = disk::level_for(space.avail, min_free, self.level);
+                if new != self.level {
+                    self.transition(new, space, events);
+                    if new == 0 {
+                        self.flush_drop_report(events, true);
+                    }
+                }
+            }
+            OnFull::Stop => match self.state {
+                DiskState::Stopped => {
+                    let headroom = self.cfg.disk.reserve_bytes + min_free + min_free / 10;
+                    if space.avail >= headroom {
+                        self.resume_from_stop(space, events);
+                    }
+                }
+                _ if space.avail < min_free => self.enter_stopped(space, events),
+                _ => {}
+            },
+        }
+    }
+
+    fn transition(&mut self, new_level: u8, space: Space, events: &mut Vec<DiskEvent>) {
+        let from = self.state.label();
+        self.level = new_level;
+        self.state = if new_level == 0 {
+            DiskState::Normal
+        } else {
+            DiskState::Shedding(new_level)
+        };
+        let to = self.state.label();
+        let (f, t) = (from.clone(), to.clone());
+        self.note("disk_state", |m| {
+            m.insert("from".into(), f.into());
+            m.insert("to".into(), t.into());
+            m.insert("free_bytes".into(), space.avail.into());
+        });
+        events.push(DiskEvent::StateChanged {
+            from,
+            to,
+            free_bytes: space.avail,
+        });
+    }
+
+    /// Stops capture: frees the reserve, records the gap start, and seals the segment.
+    fn enter_stopped(&mut self, space: Space, events: &mut Vec<DiskEvent>) {
+        let from = self.state.label();
+        let _ = disk::release_reserve(&self.reserve_path());
+        self.state = DiskState::Stopped;
+        self.level = 3;
+        let start = now_ns();
+        self.gap_start_ns = Some(start);
+        self.gap_unrecorded = !self.note_checked("capture_gap", |f| {
+            f.insert("kind".into(), "disk_full".into());
+            f.insert("phase".into(), "start".into());
+            f.insert("free_bytes".into(), space.avail.into());
+        });
+        let _ = self.rotate();
+        events.push(DiskEvent::StateChanged {
+            from,
+            to: "stopped".into(),
+            free_bytes: space.avail,
+        });
+        events.push(DiskEvent::GapStarted);
+    }
+
+    fn resume_from_stop(&mut self, space: Space, events: &mut Vec<DiskEvent>) {
+        if disk::create_reserve(&self.reserve_path(), self.cfg.disk.reserve_bytes).is_err() {
+            return; // not enough real room yet
+        }
+        self.state = DiskState::Normal;
+        self.level = 0;
+        let counts = self.dropped;
+        let (from_ns, to_ns) = (self.gap_start_ns.take().unwrap_or(0), now_ns());
+        let start_recorded = !self.gap_unrecorded;
+        self.gap_unrecorded = false;
+        self.note("capture_gap", |f| {
+            f.insert("kind".into(), "disk_full".into());
+            f.insert("phase".into(), "end".into());
+            f.insert("from_ns".into(), from_ns.into());
+            f.insert("to_ns".into(), to_ns.into());
+            f.insert("start_recorded".into(), start_recorded.into());
+            f.insert("dropped".into(), json!(counts));
+        });
+        self.dropped = [0; 4];
+        self.drop_window_start_ns = None;
+        events.push(DiskEvent::StateChanged {
+            from: "stopped".into(),
+            to: "normal".into(),
+            free_bytes: space.avail,
+        });
+        events.push(DiskEvent::GapEnded { dropped: counts });
+    }
+
+    /// A write hit ENOSPC despite the free-space estimate.
+    fn on_write_full(&mut self, prio: Priority, fields: &mut Map<String, Value>) -> Result<Append> {
+        let space = self.space.unwrap_or(Space { total: 0, avail: 0 });
+        let mut ev = Vec::new();
+        if self.cfg.disk.on_full == OnFull::Stop {
+            self.enter_stopped(space, &mut ev);
+            self.pending.extend(ev);
+            self.count_drop(prio);
+            return Ok(Append::Dropped);
+        }
+        if self.level < 3 {
+            self.transition(3, space, &mut ev);
+        }
+        self.pending.extend(ev);
+        if prio != Priority::P0 {
+            self.count_drop(prio);
+            return Ok(Append::Dropped);
+        }
+        // P0 may use the reserve.
+        let released = disk::release_reserve(&self.reserve_path()).unwrap_or(false);
+        if released {
+            if let Ok(a) = self.write_with_segment(fields) {
+                return Ok(Append::Written(a));
+            }
+        }
+        let mut ev = Vec::new();
+        self.enter_stopped(space, &mut ev);
+        self.pending.extend(ev);
+        self.count_drop(prio);
+        Ok(Append::Dropped)
+    }
+
+    fn flush_drop_report(&mut self, events: &mut Vec<DiskEvent>, force: bool) {
+        let shed: u64 = self.dropped.iter().sum();
+        if shed == 0 || self.state == DiskState::Stopped {
+            return; // a stop reports its counts when the gap ends
+        }
+        let due = self
+            .last_drop_report
+            .is_none_or(|t| t.elapsed() >= self.cfg.disk.drop_report_interval);
+        if !(force || due) {
+            return;
+        }
+        let counts = self.dropped;
+        let from_ns = self.drop_window_start_ns.unwrap_or_else(now_ns);
+        let to_ns = now_ns();
+        self.note("capture_drop", |f| {
+            f.insert("reason".into(), "disk".into());
+            f.insert("from_ns".into(), from_ns.into());
+            f.insert("to_ns".into(), to_ns.into());
+            f.insert("dropped".into(), json!(counts));
+        });
+        self.dropped = [0; 4];
+        self.drop_window_start_ns = None;
+        self.last_drop_report = Some(Instant::now());
+        events.push(DiskEvent::Dropped { counts });
+    }
+
+    /// Writes a policy record at P0, bypassing shedding. Failure is counted, not raised:
+    /// the same fact is returned to the caller as a [`DiskEvent`].
+    fn note(&mut self, kind: &str, fill: impl FnOnce(&mut Map<String, Value>)) {
+        let _ = self.note_checked(kind, fill);
+    }
+
+    fn note_checked(&mut self, kind: &str, fill: impl FnOnce(&mut Map<String, Value>)) -> bool {
+        let mut f = Map::new();
+        f.insert("type".into(), kind.into());
+        f.insert("ts_wall_ns".into(), now_ns().into());
+        fill(&mut f);
+        match self.write_with_segment(&mut f) {
+            Ok(_) => true,
+            Err(_) => {
+                self.unrecorded_notes += 1;
+                false
+            }
+        }
+    }
+
+    /// Test hook: the next write stores `accept_bytes` of the line and then fails as if the
+    /// disk filled up.
+    #[cfg(feature = "fault-injection")]
+    pub fn inject_partial_write_failure(&mut self, accept_bytes: usize) {
+        self.inject_partial = Some(accept_bytes);
+    }
+}
+
+fn write_line(f: &mut File, line: &[u8], inject: Option<usize>) -> io::Result<()> {
+    match inject {
+        Some(n) => {
+            let k = n.min(line.len().saturating_sub(1));
+            f.write_all(&line[..k])?;
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        }
+        None => f.write_all(line),
+    }
+}
+
+/// True for "no space left" and quota errors.
+fn is_full(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+    )
 }
 
 fn now_ns() -> u64 {

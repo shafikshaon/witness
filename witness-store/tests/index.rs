@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use serde_json::{json, Map, Value};
+use witness_store::disk::DiskPolicy;
 use witness_store::index::{Filter, Index};
 use witness_store::{Config, Store};
 
@@ -22,6 +23,7 @@ fn setup(n: u64) -> (tempfile::TempDir, std::path::PathBuf) {
         t.path(),
         Config {
             max_segment_bytes: 4000,
+            disk: DiskPolicy::disabled(),
         },
     )
     .unwrap();
@@ -93,6 +95,7 @@ fn incremental_and_rebuild_agree() {
         t.path(),
         Config {
             max_segment_bytes: 4000,
+            disk: DiskPolicy::disabled(),
         },
     )
     .unwrap();

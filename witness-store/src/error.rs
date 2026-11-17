@@ -10,6 +10,8 @@ pub enum StoreError {
     Line(#[from] crate::chain::LineError),
     #[error("store is corrupt: {0}")]
     Corrupt(String),
+    #[error("disk is full: capture is stopped until space returns")]
+    DiskFull,
     #[error("invalid argument: {0}")]
     Invalid(&'static str),
 }

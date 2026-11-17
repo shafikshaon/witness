@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
+use witness_store::disk::DiskPolicy;
 use witness_store::segment::{self, SegmentInfo};
 use witness_store::verify::{verify_dir, BreakKind};
 use witness_store::{Config, Store};
@@ -25,6 +26,7 @@ fn fill(root: &Path, n: u64) -> PathBuf {
         root,
         Config {
             max_segment_bytes: 2000,
+            disk: DiskPolicy::disabled(),
         },
     )
     .unwrap();
@@ -71,6 +73,7 @@ fn reopen_resumes_chain() {
         t.path(),
         Config {
             max_segment_bytes: 2000,
+            disk: DiskPolicy::disabled(),
         },
     )
     .unwrap();
@@ -90,6 +93,7 @@ fn compressed_segments_verify_and_resume() {
         t.path(),
         Config {
             max_segment_bytes: 2000,
+            disk: DiskPolicy::disabled(),
         },
     )
     .unwrap();
@@ -103,7 +107,14 @@ fn compressed_segments_verify_and_resume() {
     s.sync().unwrap();
     assert!(verify_dir(&dir).unwrap().is_ok());
     drop(s);
-    let (mut s2, _) = Store::open(t.path(), Config::default()).unwrap();
+    let (mut s2, _) = Store::open(
+        t.path(),
+        Config {
+            disk: DiskPolicy::disabled(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     s2.append(rec(2)).unwrap();
     s2.sync().unwrap();
     assert!(verify_dir(&dir).unwrap().is_ok());
@@ -199,7 +210,14 @@ fn truncated_tail_is_reported_and_recovered() {
     let b = verify_dir(&dir).unwrap().broken.unwrap();
     assert_eq!(b.kind, BreakKind::TornTail);
 
-    let (mut s, recs) = Store::open(t.path(), Config::default()).unwrap();
+    let (mut s, recs) = Store::open(
+        t.path(),
+        Config {
+            disk: DiskPolicy::disabled(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(recs.len(), 1);
     assert!(fs::metadata(&recs[0].quarantined_to).unwrap().len() > 0);
     s.append(rec(1)).unwrap();
@@ -236,7 +254,14 @@ fn pruned_prefix_verifies_as_partial() {
 #[test]
 fn reserved_keys_are_rejected() {
     let t = tempfile::tempdir().unwrap();
-    let (mut s, _) = Store::open(t.path(), Config::default()).unwrap();
+    let (mut s, _) = Store::open(
+        t.path(),
+        Config {
+            disk: DiskPolicy::disabled(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let mut m = rec(1);
     m.insert("seq".into(), json!(5));
     assert!(s.append(m).is_err());

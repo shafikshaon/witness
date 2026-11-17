@@ -4,6 +4,7 @@ use std::fs;
 use std::process::Command;
 
 use serde_json::{json, Map, Value};
+use witness_store::disk::DiskPolicy;
 use witness_store::{Config, Store};
 
 fn witness(dir: &std::path::Path, extra: &[&str]) -> (i32, Value) {
@@ -24,6 +25,7 @@ fn verify_exit_codes_and_location() {
         t.path(),
         Config {
             max_segment_bytes: 1500,
+            disk: DiskPolicy::disabled(),
         },
     )
     .unwrap();
@@ -79,7 +81,14 @@ fn init_seal_anchor_and_keyed_verify() {
     // Re-running must not clobber the key.
     assert!(!run(&["init", "--seal"]).status.success());
 
-    let (mut s, _) = Store::open(t.path(), Config::default()).unwrap();
+    let (mut s, _) = Store::open(
+        t.path(),
+        Config {
+            disk: DiskPolicy::disabled(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     s.enable_sealing(&t.path().join("seal.key")).unwrap();
     for i in 0..5u64 {
         s.append(json!({"type": "t", "n": i}).as_object().unwrap().clone())

@@ -1,0 +1,64 @@
+[Unit]
+Description=Witness forensic activity monitor
+Documentation=https://github.com/witness-project/witness
+# Start as early as practical. DefaultDependencies=no lets us order before the network and
+# login services; the matching Conflicts/Before=shutdown.target makes us stop *after* them.
+DefaultDependencies=no
+RequiresMountsFor=/var/lib/witness
+After=local-fs.target systemd-journald.socket
+Requires=local-fs.target
+# Services that must not start unobserved: network, SSH, and any user session.
+Wants=network-pre.target
+Before=network-pre.target sshd.service ssh.service systemd-user-sessions.service
+Before=shutdown.target
+Conflicts=shutdown.target
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
+[Service]
+# READY=1 is sent only after the eBPF programs are attached, so everything ordered after
+# us starts under capture.
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/sbin/witnessd run --config /etc/witness/config.toml
+Restart=always
+RestartSec=1
+# The main loop pings only while the pipeline is healthy; a stall gets us restarted.
+WatchdogSec=30
+TimeoutStartSec=60
+TimeoutStopSec=30
+OOMScoreAdjust=-900
+LimitMEMLOCK=infinity
+MemoryHigh=384M
+MemoryMax=768M
+CPUWeight=200
+IOWeight=200
+
+# --- Hardening (each choice is explained in docs/DESIGN.md §6.3) ---------------------------
+User=root
+# The minimum that eBPF capture, hashing and /proc inspection need; see DESIGN.md §6.3.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_AUDIT_READ CAP_NET_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/witness /run/witness
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+RuntimeDirectory=witness
+RuntimeDirectoryMode=0750
+StateDirectory=witness
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rustix::time::{clock_gettime, ClockId};
+use sd_notify::NotifyState;
 use sha2::{Digest, Sha256};
 use witness_config::Config;
 use witness_store::anchor::{AnchorSink, CommandSink, FileSink};
@@ -136,6 +137,13 @@ pub fn tail(seconds: Option<u64>) -> Result<()> {
     Ok(())
 }
 
+/// Tells systemd; a missing `NOTIFY_SOCKET` (not run by systemd) is not an error.
+fn notify(state: &[NotifyState<'_>]) {
+    if let Err(e) = sd_notify::notify(state) {
+        tracing::debug!(error = %e, "sd_notify failed");
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     witness_store::chain::to_hex(&<[u8; 32]>::try_from(bytes).unwrap_or([0; 32]))
 }
@@ -229,6 +237,13 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         "attached; capturing into the tamper-evident store"
     );
 
+    // READY only now: programs are attached, so services ordered after us start under capture.
+    notify(&[NotifyState::Ready, NotifyState::Status("capturing")]);
+    // Ping the watchdog from the main loop only: a stalled pipeline stops pinging and systemd
+    // restarts the service.
+    let watchdog_every = sd_notify::watchdog_enabled().map(|d| d / 3);
+    let mut last_ping = Instant::now();
+
     let term = Arc::new(AtomicBool::new(false));
     let mut signalled: Option<u8> = None;
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
@@ -302,7 +317,18 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                 break 'main;
             }
         }
+        if watchdog_every.is_some_and(|every| last_ping.elapsed() >= every) {
+            let st = format!(
+                "capturing: {} events stored, {} shed, {} lost in kernel",
+                pipeline.stats.ingested - pipeline.stats.shed,
+                pipeline.stats.shed,
+                pipeline.stats.kernel_drops
+            );
+            notify(&[NotifyState::Watchdog, NotifyState::Status(&st)]);
+            last_ping = Instant::now();
+        }
     }
+    notify(&[NotifyState::Stopping]);
 
     // Detach from the kernel first so nothing new arrives while we finish.
     drop(collector);

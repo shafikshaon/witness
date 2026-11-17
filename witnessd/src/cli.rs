@@ -79,14 +79,16 @@ pub fn doctor() -> Result<()> {
     for n in &r.notes {
         println!("  note: {n}");
     }
-    println!("hook functions (fentry/fexit candidates):");
+    println!("hook functions (fentry/fexit candidates), with BTF parameter counts:");
     let missing = btf.missing_funcs(HOOK_FUNCS);
     for f in HOOK_FUNCS {
-        println!(
-            "  {:<24}{}",
-            f,
-            if missing.contains(f) { "MISSING" } else { "ok" }
-        );
+        match btf.func_param_count(f) {
+            Some(n) => println!("  {f:<24}ok ({n} params)"),
+            None => println!(
+                "  {f:<24}{}",
+                if missing.contains(f) { "MISSING" } else { "?" }
+            ),
+        }
     }
     Ok(())
 }

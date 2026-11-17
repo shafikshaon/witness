@@ -34,3 +34,9 @@ Linux forensic activity monitor. Authoritative design: `docs/DESIGN.md` (approve
 - Installed there: rustup stable + nightly (`rust-src`), `bpf-linker` 0.13.0 (prebuilt musl release; hash not independently verified), bpftool 5.15, clang/llvm 14, strace.
 - Real-ENOSPC tests need a tiny mount: `sudo mount -t tmpfs -o size=1m tmpfs /mnt/witness-small && sudo chown $USER /mnt/witness-small`, then `WITNESS_SMALL_FS=/mnt/witness-small cargo test -p witness-store --test real_enospc -- --ignored --test-threads=1`.
 - It is aarch64; x86_64 still needs a separate check (cloud VM or UTM). Always report the kernel (`uname -r`) and arch when claiming "verified on a real kernel".
+
+## eBPF verifier debugging (learned the hard way; see DESIGN.md §2.10)
+- Stats-only verifier logging is the default. `WITNESS_VERIFIER_LOG=debug|verbose` dumps the trace; `WITNESS_ONLY_HOOK=security_path_unlink` loads one hook. Under `sudo` pass them with `sudo env VAR=... cmd` (sudo strips the environment).
+- In eBPF code: never branch on a helper's result or on `Option`; use `rd_or`. Do not compare two ranged values in a loop; mask. Initialise structs with field stores, not `zeroed()`. A loop's cost explodes when two branch outcomes both stay live.
+- aarch64 < 6.0 has no fentry/fexit: file hooks are kprobes. aya's failed-load retry loop makes a rejection take minutes with full logging.
+- `witnessd` blocks SIGTERM/SIGINT at start and reads them from a signalfd, so `timeout`/SIGTERM cannot interrupt a stuck kernel call; use SIGKILL.

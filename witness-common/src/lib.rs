@@ -248,6 +248,27 @@ pub struct RawHdr {
 impl RawHdr {
     pub const SIZE: usize = 72;
 
+    /// Native-endian bytes in wire order (the inverse of [`RawHdr::parse`]).
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..2].copy_from_slice(&self.kind.to_ne_bytes());
+        b[2..4].copy_from_slice(&self.flags.to_ne_bytes());
+        b[4..8].copy_from_slice(&self.len.to_ne_bytes());
+        b[8..16].copy_from_slice(&self.boot_ns.to_ne_bytes());
+        for (i, v) in [
+            self.pid, self.tid, self.ppid, self._pad0, self.uid, self.gid, self.euid, self.egid,
+            self.auid, self.ses,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            b[16 + i * 4..20 + i * 4].copy_from_slice(&v.to_ne_bytes());
+        }
+        b[56..64].copy_from_slice(&self.cgroup_id.to_ne_bytes());
+        b[64..72].copy_from_slice(&self.start_boot_ns.to_ne_bytes());
+        b
+    }
+
     /// Parses a header from the start of `buf`. Returns `None` if `buf` is too short.
     pub fn parse(buf: &[u8]) -> Option<Self> {
         let b = buf.get(..Self::SIZE)?;

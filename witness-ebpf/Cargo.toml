@@ -1,0 +1,32 @@
+[package]
+name = "witness-ebpf"
+description = "Witness eBPF programs (kernel side)"
+version = "0.1.0"
+edition = "2021"
+# Apache-2.0 is GPLv2-incompatible, so the eBPF crate does not offer it (DESIGN.md §16).
+license = "MIT OR GPL-2.0-only"
+publish = false
+
+# Built by `witnessd/build.rs` with a pinned nightly (`aya-build`); not part of the main workspace.
+[workspace]
+
+[dependencies]
+aya-ebpf = "=0.3.0"
+witness-common = { path = "../witness-common", default-features = false }
+
+[[bin]]
+name = "witness-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = 2
+panic = "abort"
+overflow-checks = false
+
+[profile.release]
+opt-level = 3
+lto = true
+debug = 2
+panic = "abort"
+codegen-units = 1

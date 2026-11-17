@@ -17,6 +17,202 @@ pub mod kind {
     pub const PROC_EXIT: u16 = 3;
 }
 
+/// Marks an offset the running kernel does not provide (see [`Offsets`]).
+pub const UNAVAILABLE: u32 = u32::MAX;
+
+pub const COMM_LEN: usize = 16;
+pub const TTY_LEN: usize = 16;
+pub const FILENAME_CAP: usize = 256;
+/// Bytes of argv copied per exec. Longer argument areas set [`flags::TRUNCATED`].
+pub const ARGV_CAP: usize = 3072;
+
+/// Byte offsets of the kernel struct fields the programs read, resolved by userspace from
+/// the running kernel's BTF and handed to the programs as a read-only global (DESIGN.md
+/// §3.2). A field the kernel lacks is [`UNAVAILABLE`] and the program skips it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Offsets {
+    pub task_pid: u32,
+    pub task_tgid: u32,
+    pub task_real_parent: u32,
+    pub task_group_leader: u32,
+    pub task_cred: u32,
+    pub task_mm: u32,
+    pub task_signal: u32,
+    pub task_loginuid: u32,
+    pub task_sessionid: u32,
+    pub task_start_boottime: u32,
+    pub task_exit_code: u32,
+    pub cred_euid: u32,
+    pub cred_egid: u32,
+    pub mm_arg_start: u32,
+    pub mm_arg_end: u32,
+    pub signal_tty: u32,
+    pub tty_name: u32,
+    pub binprm_filename: u32,
+}
+
+impl Offsets {
+    pub const fn unavailable() -> Self {
+        Offsets {
+            task_pid: UNAVAILABLE,
+            task_tgid: UNAVAILABLE,
+            task_real_parent: UNAVAILABLE,
+            task_group_leader: UNAVAILABLE,
+            task_cred: UNAVAILABLE,
+            task_mm: UNAVAILABLE,
+            task_signal: UNAVAILABLE,
+            task_loginuid: UNAVAILABLE,
+            task_sessionid: UNAVAILABLE,
+            task_start_boottime: UNAVAILABLE,
+            task_exit_code: UNAVAILABLE,
+            cred_euid: UNAVAILABLE,
+            cred_egid: UNAVAILABLE,
+            mm_arg_start: UNAVAILABLE,
+            mm_arg_end: UNAVAILABLE,
+            signal_tty: UNAVAILABLE,
+            tty_name: UNAVAILABLE,
+            binprm_filename: UNAVAILABLE,
+        }
+    }
+}
+
+/// Body of a [`kind::PROC_EXEC`] record, following the [`RawHdr`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExecBody {
+    /// Valid bytes in `argv` (NUL-separated arguments).
+    pub argv_len: u32,
+    /// Size of the whole argument area; larger than `argv_len` when truncated.
+    pub argv_total: u32,
+    pub filename_len: u32,
+    pub tty_len: u32,
+    pub comm: [u8; COMM_LEN],
+    pub tty: [u8; TTY_LEN],
+    pub filename: [u8; FILENAME_CAP],
+    pub argv: [u8; ARGV_CAP],
+}
+
+/// Body of a [`kind::PROC_EXIT`] record.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExitBody {
+    /// Raw `task->exit_code` (`status << 8 | signal`, `0x80` = core dumped).
+    pub exit_code: i32,
+    pub flags: u32,
+    pub comm: [u8; COMM_LEN],
+}
+
+/// Body of a [`kind::PROC_FORK`] record.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ForkBody {
+    pub child_pid: u32,
+    pub child_tgid: u32,
+    pub child_start_boot_ns: u64,
+    pub flags: u32,
+    pub _pad: u32,
+}
+
+/// A complete exec record as written into the ring buffer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExecEvent {
+    pub hdr: RawHdr,
+    pub body: ExecBody,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExitEvent {
+    pub hdr: RawHdr,
+    pub body: ExitBody,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ForkEvent {
+    pub hdr: RawHdr,
+    pub body: ForkBody,
+}
+
+/// Indexes into the per-class drop counters (`DROPS` map).
+pub const DROP_CLASS_CRITICAL: u32 = 0;
+
+/// [`ForkBody::flags`]: the child is a thread, not a new process.
+pub const FORK_THREAD: u32 = 1;
+
+impl ExecBody {
+    pub const SIZE: usize = 16 + COMM_LEN + TTY_LEN + FILENAME_CAP + ARGV_CAP;
+
+    /// Parses an exec body (the bytes after the header). Returns `None` if too short.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut comm = [0u8; COMM_LEN];
+        comm.copy_from_slice(&b[16..16 + COMM_LEN]);
+        let mut tty = [0u8; TTY_LEN];
+        tty.copy_from_slice(&b[32..32 + TTY_LEN]);
+        let mut filename = [0u8; FILENAME_CAP];
+        filename.copy_from_slice(&b[48..48 + FILENAME_CAP]);
+        let mut argv = [0u8; ARGV_CAP];
+        argv.copy_from_slice(&b[48 + FILENAME_CAP..Self::SIZE]);
+        Some(Self {
+            argv_len: u32_at(0),
+            argv_total: u32_at(4),
+            filename_len: u32_at(8),
+            tty_len: u32_at(12),
+            comm,
+            tty,
+            filename,
+            argv,
+        })
+    }
+}
+
+impl ExitBody {
+    pub const SIZE: usize = 8 + COMM_LEN;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let mut comm = [0u8; COMM_LEN];
+        comm.copy_from_slice(&b[8..8 + COMM_LEN]);
+        Some(Self {
+            exit_code: i32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+            flags: u32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
+            comm,
+        })
+    }
+}
+
+impl ForkBody {
+    pub const SIZE: usize = 24;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut ns = [0u8; 8];
+        ns.copy_from_slice(&b[8..16]);
+        Some(Self {
+            child_pid: u32_at(0),
+            child_tgid: u32_at(4),
+            child_start_boot_ns: u64::from_ne_bytes(ns),
+            flags: u32_at(16),
+            _pad: 0,
+        })
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ExecBody>() == ExecBody::SIZE);
+const _: () = assert!(core::mem::size_of::<ExitBody>() == ExitBody::SIZE);
+const _: () = assert!(core::mem::size_of::<ForkBody>() == ForkBody::SIZE);
+const _: () = assert!(core::mem::size_of::<Offsets>() == 18 * 4);
+const _: () = assert!(core::mem::size_of::<ExecEvent>() == RawHdr::SIZE + ExecBody::SIZE);
+const _: () = assert!(core::mem::size_of::<ExitEvent>() == RawHdr::SIZE + ExitBody::SIZE);
+const _: () = assert!(core::mem::size_of::<ForkEvent>() == RawHdr::SIZE + ForkBody::SIZE);
+const _: () =
+    assert!(ExecBody::SIZE % 8 == 0 && ExitBody::SIZE % 8 == 0 && ForkBody::SIZE % 8 == 0);
+
 /// Flags carried in [`RawHdr::flags`].
 pub mod flags {
     pub const TRUNCATED: u16 = 1 << 0;
@@ -115,6 +311,66 @@ mod tests {
         let bytes =
             unsafe { core::slice::from_raw_parts(&hdr as *const _ as *const u8, RawHdr::SIZE) };
         assert_eq!(RawHdr::parse(bytes), Some(hdr));
+    }
+
+    fn bytes_of<T>(v: &T) -> &[u8] {
+        // SAFETY: only used in tests with padding-free repr(C) plain-data structs.
+        unsafe {
+            core::slice::from_raw_parts(v as *const T as *const u8, core::mem::size_of::<T>())
+        }
+    }
+
+    #[test]
+    fn exec_body_roundtrip() {
+        let mut b = ExecBody {
+            argv_len: 9,
+            argv_total: 5000,
+            filename_len: 8,
+            tty_len: 5,
+            comm: [0; COMM_LEN],
+            tty: [0; TTY_LEN],
+            filename: [0; FILENAME_CAP],
+            argv: [0; ARGV_CAP],
+        };
+        b.comm[..4].copy_from_slice(b"curl");
+        b.tty[..5].copy_from_slice(b"pts/0");
+        b.filename[..8].copy_from_slice(b"/bin/ls\0");
+        b.argv[..9].copy_from_slice(b"ls\0-la\0\0\0");
+        let p = ExecBody::parse(bytes_of(&b)).unwrap();
+        assert_eq!(
+            (p.argv_len, p.argv_total, p.filename_len, p.tty_len),
+            (9, 5000, 8, 5)
+        );
+        assert_eq!(&p.comm[..4], b"curl");
+        assert_eq!(&p.tty[..5], b"pts/0");
+        assert_eq!(&p.filename[..7], b"/bin/ls");
+        assert_eq!(&p.argv[..8], b"ls\0-la\0\0");
+        assert!(ExecBody::parse(&bytes_of(&b)[..ExecBody::SIZE - 1]).is_none());
+    }
+
+    #[test]
+    fn exit_and_fork_bodies_roundtrip() {
+        let e = ExitBody {
+            exit_code: 0x0b80,
+            flags: 1,
+            comm: *b"sleep\0\0\0\0\0\0\0\0\0\0\0",
+        };
+        let p = ExitBody::parse(bytes_of(&e)).unwrap();
+        assert_eq!((p.exit_code, p.flags), (0x0b80, 1));
+        assert_eq!(&p.comm[..5], b"sleep");
+        let f = ForkBody {
+            child_pid: 7,
+            child_tgid: 7,
+            child_start_boot_ns: 123_456_789,
+            flags: FORK_THREAD,
+            _pad: 0,
+        };
+        let p = ForkBody::parse(bytes_of(&f)).unwrap();
+        assert_eq!(
+            (p.child_pid, p.child_tgid, p.child_start_boot_ns, p.flags),
+            (7, 7, 123_456_789, FORK_THREAD)
+        );
+        assert!(ForkBody::parse(&[0u8; 23]).is_none());
     }
 
     #[test]

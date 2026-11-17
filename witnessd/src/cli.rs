@@ -19,6 +19,7 @@ use witness_store::index::Index;
 
 use crate::btf::Btf;
 use crate::decode::Decoder;
+use crate::filepolicy::FilePolicy;
 use crate::loader::Collector;
 use crate::pipeline::{Pipeline, Settings, SystemClock};
 
@@ -100,7 +101,13 @@ const RING_CRITICAL_BYTES: u32 = 8 << 20;
 pub fn tail(seconds: Option<u64>) -> Result<()> {
     let btf = Btf::from_sys_fs().context("reading kernel BTF")?;
     let offsets = btf.resolve_offsets()?.offsets;
-    let mut collector = Collector::start(offsets, RING_CRITICAL_BYTES)?;
+    let (mut collector, hooks) =
+        Collector::start(offsets, &btf, RING_CRITICAL_BYTES, 32 << 20, true)?;
+    for h in &hooks {
+        if let Err(why) = &h.status {
+            tracing::warn!(hook = h.hook, %why, "hook not active");
+        }
+    }
     tracing::info!(kernel = %kernel_release(), "attached; capturing (ctrl-c to stop)");
 
     let mut decoder = Decoder::new(boot_id());
@@ -130,7 +137,7 @@ pub fn tail(seconds: Option<u64>) -> Result<()> {
             }
         })?;
         let _ = out.flush();
-        let drops = collector.dropped()?;
+        let drops: u64 = collector.dropped()?.iter().sum();
         if drops != last_drops {
             tracing::warn!(
                 dropped = drops - last_drops,
@@ -247,7 +254,27 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         Box::new(SystemClock::default()),
     )?;
 
-    let mut collector = Collector::start(offsets, cfg.capture.ring_critical_mib << 20)?;
+    let (mut collector, hooks) = Collector::start(
+        offsets,
+        &btf,
+        cfg.capture.ring_critical_mib << 20,
+        cfg.capture.ring_volume_mib << 20,
+        cfg.capture.files,
+    )?;
+    let failed: Vec<String> = hooks
+        .iter()
+        .filter_map(|h| h.status.as_ref().err().map(|e| format!("{}: {e}", h.hook)))
+        .collect();
+    for f in &failed {
+        tracing::warn!(reason = %f, "file hook not active");
+    }
+    pipeline.source_health("ebpf.process", "active", None)?;
+    let (status, reason) = match (failed.len(), hooks.len()) {
+        (0, _) => ("active", None),
+        (n, total) if n == total => ("unavailable", Some(failed.join("; "))),
+        _ => ("degraded", Some(failed.join("; "))),
+    };
+    pipeline.source_health("ebpf.files", status, reason)?;
     tracing::info!(
         kernel = %kernel_release(),
         data_dir = %data_dir.display(),
@@ -286,7 +313,17 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         "baseline snapshot stored"
     );
 
-    let mut decoder = Decoder::new(boot);
+    let mut decoder = Decoder::new(boot.clone());
+    for ev in &snapshot {
+        decoder.learn(ev);
+    }
+    let mut policy = FilePolicy::new(
+        &cfg.files.critical_extra,
+        &cfg.files.watch,
+        &cfg.files.exclude,
+    );
+    let summary_every = Duration::from_secs(60);
+    let mut last_summary = Instant::now();
     let resolve = |pid: u32| {
         use std::os::unix::ffi::OsStrExt;
         std::fs::read_link(format!("/proc/{pid}/exe"))
@@ -295,7 +332,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
     };
     let deadline = seconds.map(|s| Instant::now() + Duration::from_secs(s));
     let clock = SystemClock::default();
-    let mut last_drops = 0u64;
+    let mut last_drops = [0u64; 2];
     let mut drops_since = crate::pipeline::Clock::boot_ns(&clock);
     let mut failure: Option<anyhow::Error> = None;
 
@@ -315,8 +352,10 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
             }
             match decoder.decode(rec, &resolve) {
                 Ok(ev) => {
-                    if let Err(e) = pipeline.ingest(&ev) {
-                        err = Some(e);
+                    if let Some(ev) = policy.apply(ev) {
+                        if let Err(e) = pipeline.ingest(&ev) {
+                            err = Some(e);
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("undecodable record: {e}"),
@@ -327,18 +366,37 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
             break 'main;
         }
         let drops = collector.dropped()?;
-        if drops != last_drops {
-            let now = crate::pipeline::Clock::boot_ns(&clock);
-            tracing::warn!(
-                dropped = drops - last_drops,
-                "kernel ring buffer overflowed"
-            );
-            if let Err(e) = pipeline.kernel_drops(drops - last_drops, drops_since, now) {
-                failure = Some(e);
-                break 'main;
+        for (class, (now_n, was)) in drops.iter().zip(last_drops.iter_mut()).enumerate() {
+            if now_n != was {
+                let now = crate::pipeline::Clock::boot_ns(&clock);
+                tracing::warn!(
+                    class,
+                    dropped = *now_n - *was,
+                    "kernel ring buffer overflowed"
+                );
+                if let Err(e) = pipeline.kernel_drops(class, *now_n - *was, drops_since, now) {
+                    failure = Some(e);
+                    break 'main;
+                }
+                *was = *now_n;
             }
-            last_drops = drops;
-            drops_since = now;
+        }
+        if last_drops == drops {
+            drops_since = crate::pipeline::Clock::boot_ns(&clock);
+        }
+        if last_summary.elapsed() >= summary_every {
+            let interval = last_summary.elapsed().as_nanos() as u64;
+            last_summary = Instant::now();
+            let (b, w) = (
+                crate::pipeline::Clock::boot_ns(&clock),
+                crate::pipeline::Clock::wall_ns(&clock),
+            );
+            for ev in policy.take_summaries(&boot, b, w, interval) {
+                if let Err(e) = pipeline.ingest(&ev) {
+                    failure = Some(e);
+                    break 'main;
+                }
+            }
         }
         match pipeline.tick() {
             Ok(events) => {

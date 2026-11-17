@@ -289,15 +289,37 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Records events the kernel could not queue (ring buffer full).
-    pub fn kernel_drops(&mut self, n: u64, from_ns: u64, to_ns: u64) -> Result<()> {
+    /// Records events the kernel could not queue because ring buffer `class` was full
+    /// (0 = process lifecycle, 1 = high-volume file/network).
+    pub fn kernel_drops(&mut self, class: usize, n: u64, from_ns: u64, to_ns: u64) -> Result<()> {
         self.stats.kernel_drops += n;
+        let mut dropped = [0u64; 4];
+        dropped[class.min(3)] = n;
+        let source = if class == 0 {
+            "ebpf.critical"
+        } else {
+            "ebpf.volume"
+        };
         self.write(Body::CaptureDrop(CaptureDrop {
             reason: "ring_overflow".into(),
             from_ns,
             to_ns,
-            dropped: [n, 0, 0, 0],
-            source: Some("ebpf.critical".into()),
+            dropped,
+            source: Some(source.into()),
+        }))
+    }
+
+    /// Records that a capture source is active, degraded or unavailable (and why).
+    pub fn source_health(
+        &mut self,
+        source: &str,
+        status: &str,
+        reason: Option<String>,
+    ) -> Result<()> {
+        self.write(Body::SourceHealth(witness_common::schema::SourceHealth {
+            source: source.into(),
+            status: status.into(),
+            reason,
         }))
     }
 

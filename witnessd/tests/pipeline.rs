@@ -355,7 +355,7 @@ fn kernel_ring_drops_are_recorded() {
     let t = tempfile::tempdir().unwrap();
     let clock = Fake::new();
     let mut p = open(t.path(), BOOT_A, false, &clock, vec![]);
-    p.kernel_drops(17, 100, 200).unwrap();
+    p.kernel_drops(0, 17, 100, 200).unwrap();
     assert_eq!(p.stats.kernel_drops, 17);
     p.stop("sigterm", None).unwrap();
     let r = records(t.path());

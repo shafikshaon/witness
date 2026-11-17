@@ -413,6 +413,8 @@ unsafe fn build_path(
     };
     let mut off: usize = SCRATCH_LEN;
     let mut wide = 0u32;
+    // Set when the walk reaches the namespace root; only then is the path complete.
+    let mut at_root = false;
     let mut dentry = dentry;
     let mut mnt = mnt;
 
@@ -423,12 +425,14 @@ unsafe fn build_path(
         if head.parent == dentry as u64 || head.parent == 0 {
             // Root of this filesystem: continue at its mount point in the parent mount.
             if mnt.is_null() || EXP == 4 {
+                at_root = true;
                 break;
             }
             let mount = mnt.sub(o.mount_mnt as usize);
             let m = read_mount_head(mount.add(o.mount_mnt_parent as usize));
             if m.parent == 0 || m.parent == mount as u64 {
-                break; // the namespace root
+                at_root = true; // the namespace root
+                break;
             }
             dentry = m.mountpoint as *const u8;
             mnt = (m.parent as *const u8).add(o.mount_mnt as usize);
@@ -453,7 +457,7 @@ unsafe fn build_path(
         dentry = head.parent as *const u8;
     }
     let mut trunc = (wide != 0) as u32;
-    if i >= max {
+    if !at_root {
         trunc = 1;
     }
     let mut n = SCRATCH_LEN - off;

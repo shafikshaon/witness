@@ -174,11 +174,11 @@ pub const PATH_CAP: usize = 1024;
 /// Longest single path component copied.
 pub const COMP_CAP: usize = 255;
 /// Deepest nesting (directories plus mount crossings) walked before the path is cut.
-pub const MAX_COMPONENTS: usize = 24;
+pub const MAX_COMPONENTS: usize = 40;
 /// The per-CPU buffer the kernel walks paths into, right to left. Large enough that
 /// `MAX_COMPONENTS` components of `COMP_CAP + 1` bytes can never wrap it, which is what lets
 /// the walk avoid any overflow bookkeeping the verifier would have to track per path.
-pub const SCRATCH_LEN: usize = 8192;
+pub const SCRATCH_LEN: usize = 16384;
 /// `SCRATCH_LEN` plus slack so the final bounded copy is provably in range.
 pub const SCRATCH_BUF: usize = SCRATCH_LEN + PATH_CAP;
 

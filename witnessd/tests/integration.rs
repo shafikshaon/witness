@@ -220,7 +220,10 @@ mod store_mode {
 
     // The child is handed to the caller, which always waits on or kills it.
     #[allow(clippy::zombie_processes)]
-    fn spawn(data: &Path, seconds: u32) -> (Child, std::io::BufReader<std::process::ChildStderr>) {
+    pub(super) fn spawn(
+        data: &Path,
+        seconds: u32,
+    ) -> (Child, std::io::BufReader<std::process::ChildStderr>) {
         assert!(rustix::process::geteuid().is_root(), "run with sudo");
         let mut child = Command::new(env!("CARGO_BIN_EXE_witnessd"))
             .args(["run", "--config", "/nonexistent/witness.toml", "--data-dir"])
@@ -244,7 +247,7 @@ mod store_mode {
         }
     }
 
-    fn records(data: &Path) -> Vec<Value> {
+    pub(super) fn records(data: &Path) -> Vec<Value> {
         let mut out = Vec::new();
         for s in segment::list_segments(&data.join("segments")).unwrap() {
             for l in segment::open_reader(&s).unwrap().lines() {
@@ -254,7 +257,7 @@ mod store_mode {
         out
     }
 
-    fn verify(data: &Path) {
+    pub(super) fn verify(data: &Path) {
         let r = verify_with(&data.join("segments"), &Options::default()).unwrap();
         assert!(r.is_ok(), "chain broken: {:?}", r.broken);
     }
@@ -564,5 +567,320 @@ mod store_mode {
         first.kill().unwrap();
         first.wait().unwrap();
         verify(t.path());
+    }
+}
+
+// ---- file events -----------------------------------------------------------------------
+
+mod files {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    use serde_json::Value;
+
+    use super::capture;
+
+    /// A unique directory name so each test finds only its own events.
+    fn marker(tag: &str) -> String {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        format!("witness-it-{tag}-{}-{n}", std::process::id())
+    }
+
+    /// Every string-ish path field of a file event.
+    fn paths(e: &Value) -> Vec<String> {
+        ["path", "old", "new", "target"]
+            .iter()
+            .filter_map(|k| e["data"][k].as_str().map(String::from))
+            .collect()
+    }
+
+    fn about<'a>(ev: &'a [Value], m: &str) -> Vec<&'a Value> {
+        ev.iter()
+            .filter(|e| {
+                e["type"].as_str().is_some_and(|t| t.starts_with("file_"))
+                    && paths(e).iter().any(|p| p.contains(m))
+            })
+            .collect()
+    }
+
+    fn of<'a>(ev: &[&'a Value], t: &str) -> Vec<&'a Value> {
+        ev.iter().copied().filter(|e| e["type"] == t).collect()
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn a_files_whole_life_is_captured_with_attribution() {
+        let m = marker("life");
+        let base = PathBuf::from("/tmp").join(&m);
+        let b = base.clone();
+        let (ev, _) = capture(8, move || {
+            fs::create_dir(&b).unwrap();
+            let f = b.join("a.txt");
+            fs::write(&f, b"hello").unwrap();
+            fs::set_permissions(&f, fs::Permissions::from_mode(0o4755)).unwrap();
+            let g = b.join("b.txt");
+            fs::rename(&f, &g).unwrap();
+            fs::hard_link(&g, b.join("hard.txt")).unwrap();
+            symlink("../etc/passwd", b.join("sym")).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&g)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            fs::remove_file(b.join("hard.txt")).unwrap();
+            fs::remove_file(b.join("sym")).unwrap();
+            fs::remove_file(&g).unwrap();
+            fs::remove_dir(&b).unwrap();
+        });
+        let mine = about(&ev, &m);
+        let t = |name: &str| of(&mine, name);
+
+        assert!(
+            t("file_create")
+                .iter()
+                .any(|e| e["data"]["path"] == base.to_str().unwrap()),
+            "the directory creation"
+        );
+        assert!(t("file_create")
+            .iter()
+            .any(|e| e["data"]["path"] == format!("{}/a.txt", base.display())));
+        assert!(t("file_open_write")
+            .iter()
+            .any(|e| e["data"]["path"] == format!("{}/a.txt", base.display())));
+
+        let attr = t("file_attr");
+        let suid = attr
+            .iter()
+            .find(|e| e["data"]["suid_set"] == true)
+            .expect("SUID chmod");
+        assert_eq!(suid["data"]["new_mode"], 0o4755);
+
+        let rename = t("file_rename");
+        assert_eq!(rename.len(), 1);
+        assert_eq!(
+            rename[0]["data"]["old"],
+            format!("{}/a.txt", base.display())
+        );
+        assert_eq!(
+            rename[0]["data"]["new"],
+            format!("{}/b.txt", base.display())
+        );
+
+        let links = t("file_link");
+        let hard = links
+            .iter()
+            .find(|e| e["data"]["kind"] == "hard")
+            .expect("hard link");
+        assert_eq!(hard["data"]["target"], format!("{}/b.txt", base.display()));
+        let sym = links
+            .iter()
+            .find(|e| e["data"]["kind"] == "symbolic")
+            .expect("symlink");
+        assert_eq!(sym["data"]["target"], "../etc/passwd");
+
+        assert!(!t("file_truncate").is_empty(), "ftruncate");
+        let deletes = t("file_delete");
+        assert!(
+            deletes.len() >= 4,
+            "three files and the directory, got {}",
+            deletes.len()
+        );
+
+        // Everything is attributed to this process and its user.
+        for e in &mine {
+            assert_eq!(e["actor"]["pid"], std::process::id(), "{}", e["type"]);
+            assert_eq!(e["actor"]["uid"], 0);
+            assert!(
+                e["actor"]["exe"]
+                    .as_str()
+                    .is_some_and(|x| x.contains("integration")),
+                "{e}"
+            );
+            // The hook saw the call; its outcome is not observed.
+            assert_eq!(e["data"]["result"], "attempted");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn paths_cross_mounts_and_deep_nesting_correctly() {
+        let m = marker("deep");
+        let shm = format!("/dev/shm/{m}");
+        let deep20: String = (1..=20).map(|i| format!("/d{i}")).collect();
+        let deep_dir = PathBuf::from(format!("/tmp/{m}")).join(deep20.trim_start_matches('/'));
+        let (s2, d2) = (shm.clone(), deep_dir.clone());
+        let (ev, _) = capture(8, move || {
+            fs::write(&s2, b"x").unwrap(); // a different mount (tmpfs)
+            fs::create_dir_all(&d2).unwrap();
+            fs::write(d2.join("leaf.txt"), b"x").unwrap();
+            fs::remove_file(d2.join("leaf.txt")).unwrap();
+            fs::remove_file(&s2).unwrap();
+            fs::remove_dir_all(format!("/tmp/{}", s2.rsplit('/').next().unwrap())).ok();
+            fs::remove_dir_all(PathBuf::from(format!(
+                "/tmp/{}",
+                s2.rsplit('/').next().unwrap()
+            )))
+            .ok();
+        });
+        let mine = about(&ev, &m);
+        assert!(
+            of(&mine, "file_create")
+                .iter()
+                .any(|e| e["data"]["path"] == shm),
+            "the tmpfs file keeps its full /dev/shm path across the mount point"
+        );
+        let leaf = format!("{}/leaf.txt", deep_dir.display());
+        assert!(
+            of(&mine, "file_open_write")
+                .iter()
+                .any(|e| e["data"]["path"] == leaf),
+            "a 23-component path is reported exactly: {leaf}"
+        );
+        for e in &mine {
+            if e["data"]["path"] == leaf {
+                assert!(e["data"].get("path_truncated").is_none());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn a_path_deeper_than_the_walk_limit_is_flagged_and_keeps_its_leaf() {
+        let m = marker("toodeep");
+        let deep: String = (1..=40).map(|i| format!("/q{i}")).collect();
+        let dir = PathBuf::from(format!("/tmp/{m}{deep}"));
+        let d = dir.clone();
+        let (ev, _) = capture(8, move || {
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("end.txt"), b"x").unwrap();
+            fs::remove_dir_all(format!(
+                "/tmp/{}",
+                d.components().nth(2).unwrap().as_os_str().to_str().unwrap()
+            ))
+            .ok();
+        });
+        let hit = ev
+            .iter()
+            .find(|e| {
+                e["type"] == "file_open_write"
+                    && e["data"]["path"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with("/q40/end.txt"))
+            })
+            .expect("the write is still reported");
+        assert_eq!(
+            hit["data"]["path_truncated"], true,
+            "the walk gave up before the root"
+        );
+        assert!(hit["data"]["path"].as_str().unwrap().starts_with('/'));
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn awkward_names_survive() {
+        let m = marker("names");
+        let dir = PathBuf::from(format!("/tmp/{m}"));
+        let long = "n".repeat(255);
+        let weird = OsString::from_vec(vec![b'w', 0xff, 0xfe, b'z']);
+        let (d, l, w) = (dir.clone(), long.clone(), weird.clone());
+        let (ev, _) = capture(8, move || {
+            fs::create_dir(&d).unwrap();
+            fs::write(d.join(&l), b"x").unwrap();
+            fs::write(d.join(&w), b"x").unwrap();
+            fs::remove_dir_all(&d).unwrap();
+        });
+        let mine = about(&ev, &m);
+        assert!(
+            of(&mine, "file_create")
+                .iter()
+                .any(|e| e["data"]["path"] == format!("{}/{long}", dir.display())),
+            "a 255-byte name is intact"
+        );
+        // Non-UTF-8 bytes arrive base64-wrapped rather than mangled.
+        let wrapped = ev
+            .iter()
+            .filter(|e| e["type"] == "file_create")
+            .find(|e| e["data"]["path"]["b64"].is_string())
+            .expect("non-UTF-8 path kept as base64");
+        let b64 = wrapped["data"]["path"]["b64"].as_str().unwrap();
+        assert!(!b64.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn pseudo_filesystems_are_not_reported_and_a_burst_loses_nothing() {
+        let m = marker("burst");
+        let dir = PathBuf::from(format!("/tmp/{m}"));
+        let d = dir.clone();
+        let (ev, _) = capture(10, move || {
+            // Writes to procfs/sysfs are noise, not host file activity.
+            fs::write("/proc/self/comm", b"witness-t").ok();
+            fs::create_dir(&d).unwrap();
+            for i in 0..500 {
+                fs::write(d.join(format!("f{i}")), b"x").unwrap();
+            }
+            fs::remove_dir_all(&d).unwrap();
+        });
+        assert!(
+            !ev.iter().any(
+                |e| e["type"].as_str().is_some_and(|t| t.starts_with("file_"))
+                    && paths(e).iter().any(|p| p.starts_with("/proc/"))
+            ),
+            "procfs writes must be filtered in the kernel"
+        );
+        let creates = of(&about(&ev, &m), "file_create")
+            .iter()
+            .filter(|e| e["data"]["path"].as_str().is_some_and(|p| p.contains("/f")))
+            .count();
+        assert_eq!(creates, 500, "every one of 500 creations is captured");
+    }
+
+    /// In store mode the path policy applies: watched and critical paths are kept, the rest
+    /// is counted rather than stored, and the daemon never records its own writes.
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn store_mode_applies_the_path_policy_and_excludes_itself() {
+        use super::store_mode::{records, spawn, verify};
+        let t = tempfile::tempdir_in("/tmp").unwrap();
+        let (watched, quiet) = (marker("kept"), marker("dropped"));
+        let (child, _err) = spawn(t.path(), 6);
+        fs::write(format!("/tmp/{watched}"), b"x").unwrap();
+        let q = Path::new("/root").join(&quiet);
+        fs::write(&q, b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        fs::remove_file(format!("/tmp/{watched}")).unwrap();
+        fs::remove_file(&q).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+
+        verify(t.path());
+        let recs = records(t.path());
+        let has = |m: &str| {
+            recs.iter().any(|v| {
+                v["type"].as_str().is_some_and(|t| t.starts_with("file_"))
+                    && v["data"]["path"].as_str().is_some_and(|p| p.contains(m))
+            })
+        };
+        assert!(has(&watched), "/tmp is watched");
+        assert!(
+            !has(&quiet),
+            "/root is neither critical nor watched: counted, not stored"
+        );
+        let datadir = t.path().to_str().unwrap();
+        assert!(
+            !recs.iter().any(
+                |v| v["type"].as_str().is_some_and(|t| t.starts_with("file_"))
+                    && v["data"]["path"]
+                        .as_str()
+                        .is_some_and(|p| p.starts_with(datadir))
+            ),
+            "the daemon's own segment writes must not be recorded"
+        );
     }
 }

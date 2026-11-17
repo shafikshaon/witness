@@ -160,7 +160,12 @@ impl Collector {
 
         let mut reports = Vec::new();
         let missing = missing_file_offsets(&offsets);
+        // Diagnostic: attach only the named hook (e.g. WITNESS_ONLY_HOOK=security_file_open).
+        let only = std::env::var("WITNESS_ONLY_HOOK").ok();
         for (prog_name, func, params, kprobe) in FILE_HOOKS {
+            if only.as_deref().is_some_and(|o| o != func) {
+                continue;
+            }
             let status: Result<(), String> = (|| {
                 if !files {
                     return Err("file capture disabled in the configuration".into());

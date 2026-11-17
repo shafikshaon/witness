@@ -280,6 +280,10 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) -> Result<(), ()> {
 
 // ---- file hooks --------------------------------------------------------------------------
 
+/// Diagnostic switch for bisecting verifier cost (0 = normal). Non-zero values disable parts
+/// of the path walk; never ship non-zero.
+const EXP: u32 = 0;
+
 const FMODE_WRITE: u32 = 0x2;
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
@@ -376,18 +380,28 @@ unsafe fn build_path(
     dentry: *const u8,
     o: &Offsets,
 ) -> (u32, u32) {
+    if EXP == 1 {
+        return (0, 0);
+    }
+    let max = if EXP == 2 {
+        1
+    } else if EXP == 3 {
+        4
+    } else {
+        MAX_COMPONENTS
+    };
     let mut off: usize = SCRATCH_LEN;
     let mut trunc = 0u32;
     let mut dentry = dentry;
     let mut mnt = mnt;
 
     let mut i = 0;
-    while i < MAX_COMPONENTS {
+    while i < max {
         i += 1;
         let head = read_dentry_head(dentry.add(o.dentry_d_parent as usize));
         if head.parent == dentry as u64 || head.parent == 0 {
             // Root of this filesystem: continue at its mount point in the parent mount.
-            if mnt.is_null() {
+            if mnt.is_null() || EXP == 4 {
                 break;
             }
             let mount = mnt.sub(o.mount_mnt as usize);
@@ -417,7 +431,7 @@ unsafe fn build_path(
         );
         dentry = head.parent as *const u8;
     }
-    if i >= MAX_COMPONENTS {
+    if i >= max {
         trunc = 1;
     }
     let mut n = SCRATCH_LEN - off;

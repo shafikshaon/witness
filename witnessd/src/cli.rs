@@ -1,12 +1,15 @@
 //! Command implementations for the `witnessd` binary (Linux).
 
 use std::io::Write;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use nix::sys::signal::{SigSet, Signal};
+use nix::sys::signalfd::{SfdFlags, SignalFd};
 use rustix::time::{clock_gettime, ClockId};
 use sd_notify::NotifyState;
 use sha2::{Digest, Sha256};
@@ -114,7 +117,7 @@ pub fn tail(seconds: Option<u64>) -> Result<()> {
             break;
         }
         decoder.set_clock_offset(clock_offset_ns());
-        collector.poll(Duration::from_millis(250), |rec| {
+        collector.poll(Duration::from_millis(250), &[], |rec| {
             match decoder.decode(rec, &resolve) {
                 Ok(ev) => {
                     if let Ok(line) = serde_json::to_string(&ev) {
@@ -195,6 +198,18 @@ fn spawn_indexer(data_dir: PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinH
 
 /// The daemon: capture into the tamper-evident store until SIGTERM/SIGINT (or `seconds`).
 pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Result<()> {
+    // Block SIGTERM/SIGINT before anything else (and before any thread exists, so every
+    // thread inherits the mask) and read them from a signalfd. A blocked signal stays
+    // pending until read, so none can be lost or kill us mid-startup, and a stop request
+    // that arrives while starting is honoured as soon as capture is running.
+    let mut mask = SigSet::empty();
+    mask.add(Signal::SIGTERM);
+    mask.add(Signal::SIGINT);
+    mask.thread_block()
+        .context("blocking termination signals")?;
+    let sigfd = SignalFd::with_flags(&mask, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
+        .context("creating the signalfd")?;
+
     let (cfg, config_sha) = load_config(config)?;
     let data_dir = data_dir.unwrap_or_else(|| cfg.daemon.data_dir.clone());
 
@@ -244,11 +259,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
     let watchdog_every = sd_notify::watchdog_enabled().map(|d| d / 3);
     let mut last_ping = Instant::now();
 
-    let term = Arc::new(AtomicBool::new(false));
     let mut signalled: Option<u8> = None;
-    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
-        signal_hook::flag::register(sig, Arc::clone(&term))?;
-    }
     let index_stop = Arc::new(AtomicBool::new(false));
     let indexer = spawn_indexer(data_dir.clone(), Arc::clone(&index_stop));
 
@@ -266,8 +277,8 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
     let mut failure: Option<anyhow::Error> = None;
 
     'main: loop {
-        if term.load(Ordering::SeqCst) {
-            signalled = Some(signal_hook::consts::SIGTERM as u8);
+        if let Some(info) = sigfd.read_signal().context("reading the signalfd")? {
+            signalled = Some(info.ssi_signo as u8);
             break;
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -275,7 +286,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         }
         decoder.set_clock_offset(clock_offset_ns());
         let mut err: Option<anyhow::Error> = None;
-        let polled = collector.poll(Duration::from_millis(250), |rec| {
+        let polled = collector.poll(Duration::from_millis(250), &[sigfd.as_fd()], |rec| {
             if err.is_some() {
                 return;
             }

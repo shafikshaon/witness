@@ -356,6 +356,49 @@ mod store_mode {
         }
     }
 
+    /// SIGTERM sent while the daemon is still starting (before it has attached) must not
+    /// be lost and must not kill it ungracefully: it finishes starting, then stops cleanly.
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn sigterm_during_startup_is_not_lost() {
+        for delay_ms in [0u64, 5, 15, 30, 50, 80, 110, 150] {
+            let t = tempfile::tempdir().unwrap();
+            let child = Command::new(env!("CARGO_BIN_EXE_witnessd"))
+                .args(["run", "--config", "/nonexistent/witness.toml", "--data-dir"])
+                .arg(t.path())
+                .args(["--seconds", "60"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+            rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+            let started = std::time::Instant::now();
+            let out = child.wait_with_output().unwrap();
+            let log = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "delay {delay_ms} ms: exit {} \n{log}",
+                out.status
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "delay {delay_ms} ms: slow stop\n{log}"
+            );
+            let recs = records(t.path());
+            let stop = recs
+                .iter()
+                .find(|v| v["type"] == "daemon_stop")
+                .unwrap_or_else(|| panic!("delay {delay_ms} ms: no daemon_stop record\n{log}"));
+            assert_eq!(
+                stop["data"]["reason"], "signal",
+                "delay {delay_ms} ms\n{log}"
+            );
+            verify(t.path());
+        }
+    }
+
     #[test]
     #[ignore = "needs root and a kernel with BTF"]
     fn kill_9_then_restart_records_an_unclean_gap_and_keeps_the_events() {

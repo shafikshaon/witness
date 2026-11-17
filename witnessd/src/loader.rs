@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
 use aya::programs::{BtfTracePoint, FExit, KProbe};
-use aya::{Btf as AyaBtf, EbpfLoader};
+use aya::{Btf as AyaBtf, EbpfLoader, VerifierLogLevel};
 use witness_common::{Offsets, UNAVAILABLE};
 
 use crate::btf::Btf;
@@ -130,7 +130,16 @@ impl Collector {
             bail!("this build has no eBPF object (built off Linux or with WITNESS_SKIP_EBPF=1)");
         }
         let self_tgid = std::process::id();
+        // Stats-only by default: a rejected program then costs one fast attempt instead of
+        // aya's retry-with-a-bigger-buffer loop over a multi-megabyte trace. Set
+        // WITNESS_VERIFIER_LOG=debug for the full trace when diagnosing.
+        let log_level = if std::env::var("WITNESS_VERIFIER_LOG").as_deref() == Ok("debug") {
+            VerifierLogLevel::DEBUG | VerifierLogLevel::STATS
+        } else {
+            VerifierLogLevel::STATS
+        };
         let mut ebpf = EbpfLoader::new()
+            .verifier_log_level(log_level)
             .override_global("OFFSETS", &OffsetsPod(offsets), true)
             .override_global("SELF_TGID", &self_tgid, true)
             .map_max_entries("CRITICAL", critical_bytes)

@@ -204,3 +204,177 @@ fn a_burst_of_processes_loses_nothing() {
         .count();
     assert_eq!(execs, 500, "every one of 500 execs must be captured");
 }
+
+// ---- the daemon with the tamper-evident store ------------------------------------------
+
+mod store_mode {
+    use std::io::BufRead;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+
+    use serde_json::Value;
+    use witness_common::schema::{Body, Event};
+    use witness_store::index::{Filter, Index};
+    use witness_store::segment;
+    use witness_store::verify::{verify_with, Options};
+
+    fn spawn(data: &Path, seconds: u32) -> (Child, std::io::BufReader<std::process::ChildStderr>) {
+        assert!(rustix::process::geteuid().is_root(), "run with sudo");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_witnessd"))
+            .args(["run", "--config", "/nonexistent/witness.toml", "--data-dir"])
+            .arg(data)
+            .args(["--seconds", &seconds.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut err = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                err.read_line(&mut line).unwrap() > 0,
+                "daemon exited before attaching"
+            );
+            if line.contains("attached") {
+                return (child, err);
+            }
+        }
+    }
+
+    fn records(data: &Path) -> Vec<Value> {
+        let mut out = Vec::new();
+        for s in segment::list_segments(&data.join("segments")).unwrap() {
+            for l in segment::open_reader(&s).unwrap().lines() {
+                out.push(serde_json::from_str(&l.unwrap()).unwrap());
+            }
+        }
+        out
+    }
+
+    fn verify(data: &Path) {
+        let r = verify_with(&data.join("segments"), &Options::default()).unwrap();
+        assert!(r.is_ok(), "chain broken: {:?}", r.broken);
+    }
+
+    fn run_marker(marker: &str) {
+        Command::new("/bin/true").arg(marker).status().unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn captured_activity_lands_in_a_verifiable_chain_and_the_index() {
+        let t = tempfile::tempdir().unwrap();
+        let marker = format!("witness-store-{}", std::process::id());
+        let (child, _err) = spawn(t.path(), 5);
+        run_marker(&marker);
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+
+        verify(t.path());
+        let recs = records(t.path());
+        let kinds: Vec<&str> = recs.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        assert!(kinds.contains(&"daemon_start") && kinds.contains(&"daemon_stop"));
+        assert_eq!(recs.last().unwrap()["type"], "segment_seal");
+
+        // Searchable through the index the daemon maintained.
+        let mut ix = Index::open(&t.path().join("index.db")).unwrap();
+        ix.catch_up(&t.path().join("segments")).unwrap();
+        let hits = ix
+            .query(&Filter {
+                text: Some(marker.clone()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1, "exactly the one exec carries the marker");
+        assert_eq!(hits[0].kind, "proc_exec");
+
+        // And the stored line deserializes back into the typed schema.
+        let raw = ix.raw(&t.path().join("segments"), hits[0].seq).unwrap();
+        let ev: Event = serde_json::from_slice(&raw).unwrap();
+        let Body::ProcExec(x) = ev.body else {
+            panic!("not an exec")
+        };
+        assert!(x.argv.iter().any(|a| a.to_string_lossy() == marker));
+        assert_eq!(ev.actor.unwrap().uid, 0);
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn sigterm_is_a_clean_stop() {
+        let t = tempfile::tempdir().unwrap();
+        let (mut child, _err) = spawn(t.path(), 60);
+        run_marker("witness-term");
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "SIGTERM must exit 0 after a clean stop, got {status}"
+        );
+        verify(t.path());
+        let recs = records(t.path());
+        let stop = recs.iter().find(|v| v["type"] == "daemon_stop").unwrap();
+        assert_eq!(stop["data"]["clean"], true);
+        assert_eq!(stop["data"]["reason"], "signal");
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn kill_9_then_restart_records_an_unclean_gap_and_keeps_the_events() {
+        let t = tempfile::tempdir().unwrap();
+        let marker = format!("witness-crash-{}", std::process::id());
+        let (mut child, _err) = spawn(t.path(), 60);
+        run_marker(&marker);
+        std::thread::sleep(std::time::Duration::from_millis(800)); // let it store the exec
+        child.kill().unwrap(); // SIGKILL: no stop record, no seal
+        child.wait().unwrap();
+
+        let (child2, _err2) = spawn(t.path(), 3);
+        assert!(child2.wait_with_output().unwrap().status.success());
+
+        verify(t.path());
+        let recs = records(t.path());
+        let starts: Vec<&Value> = recs
+            .iter()
+            .filter(|v| v["type"] == "daemon_start")
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["data"]["prev_shutdown"], "none");
+        assert_eq!(starts[1]["data"]["prev_shutdown"], "unclean");
+        let gap = recs.iter().find(|v| v["type"] == "capture_gap").unwrap();
+        assert_eq!(gap["data"]["kind"], "restart_same_boot");
+        assert_eq!(gap["data"]["prev_shutdown"], "unclean");
+        assert!(
+            gap["data"]["from_wall_ns"].as_u64().unwrap()
+                < gap["data"]["to_wall_ns"].as_u64().unwrap()
+        );
+        // The activity captured before the kill survived it.
+        assert!(
+            recs.iter().any(|v| v["type"] == "proc_exec"
+                && v["data"]["argv"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == marker.as_str()))),
+            "the exec captured before SIGKILL must still be in the chain"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn a_second_daemon_on_the_same_data_dir_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let (mut first, _err) = spawn(t.path(), 30);
+        let second = Command::new(env!("CARGO_BIN_EXE_witnessd"))
+            .args(["run", "--config", "/nonexistent/witness.toml", "--data-dir"])
+            .arg(t.path())
+            .args(["--seconds", "5"])
+            .output()
+            .unwrap();
+        assert!(!second.status.success());
+        assert!(String::from_utf8_lossy(&second.stderr).contains("another witnessd"));
+        first.kill().unwrap();
+        first.wait().unwrap();
+        verify(t.path());
+    }
+}

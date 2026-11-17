@@ -418,8 +418,13 @@ For a busy desktop at ~100 events/s avg (file events dominate): ~8.6 M events/da
 
 ### 5.8 Archive / prune
 
-- `witness archive --to <path>`: copies sealed segments (+`.fidx`) to another path/device, verifies SHA-256 post-copy, writes an `archive` record, then (only with `--move`) removes the originals. Archived segments remain verifiable offline (`witness verify --dir <path>`), and can be re-attached to the index (`witness reindex --include <path>`).
-- `witness prune --before <date>`: explicit, logged, needs `--yes-delete-evidence` and a typed confirmation, writes a `prune` record with the list of segment hashes removed; never touches the active segment or its predecessor chain-link (a `prune` leaves a documented, *verifiable* hole: the surviving segment's header retains `prev_seg_file_sha256` and the `prune` record is the proof of intentional removal).
+Both operate only on the **oldest contiguous run of sealed segments** and never on the newest segment, so the chain always keeps a well-defined start and its head. Both need the single-writer lock (`store.lock`, `flock`), so they refuse to run while `witnessd` holds the store; daemon-mediated versions arrive with the API (M6).
+
+- `witness archive --to <dir> [--before <date>] [--move]`: copies each segment (and its `.fidx`) to `<dir>/segments/`, proves the copy (raw bytes and decompressed content hash identically to the source; an existing, differing destination file aborts), then appends an `archive` record (per-segment id, seq range, file name, SHA-256 of the file and of the uncompressed bytes, actor uid) and fsyncs it. Only with `--move` are the originals removed, and only after the record is durable. Re-running is idempotent.
+- `witness prune --before <date> [--yes-delete-evidence --expect N]`: a **dry run by default**. Deleting needs both the flag and `--expect N`, the segment count from the dry run; a mismatch aborts with nothing deleted. A `prune` record (same per-segment hashes, actor) is made durable **before** the first file is removed.
+- **How `verify` tells deliberate removal from tampering:** if the oldest segments are absent, the chain is `HistoryMissing` unless a chained `prune` or moving `archive` record accounts for exactly that prefix (`partial_explained`). `witness verify --include <archive-dir>` verifies live data plus archives as one chain from seq 1; `--allow-partial` accepts an arbitrary slice on purpose. The same `--include` works for `witness reindex`.
+- Limits: deleting the *newest* segments is still only provable with anchors (§5.4); a prune record proves intent and content hashes, not that the deleter was authorized.
+- Sealed compressed segments carry a derived `.fidx` frame table (rebuilt on demand if missing) so one record can be read without decoding the file.
 
 ---
 

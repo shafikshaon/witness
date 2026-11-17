@@ -92,7 +92,13 @@ impl Collector {
             tv_sec: timeout.as_secs() as _,
             tv_nsec: timeout.subsec_nanos() as _,
         };
-        rustix::event::poll(&mut fds, Some(&ts)).context("poll on the ring buffer")?;
+        match rustix::event::poll(&mut fds, Some(&ts)) {
+            Ok(_) => {}
+            // A signal (SIGTERM from systemd) interrupted the wait. That is not an error:
+            // return so the caller notices its shutdown flag; the data is read next round.
+            Err(rustix::io::Errno::INTR) => return Ok(0),
+            Err(e) => return Err(e).context("poll on the ring buffer"),
+        }
         let mut n = 0;
         while let Some(item) = self.ring.next() {
             f(&item);

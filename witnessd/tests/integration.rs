@@ -322,6 +322,26 @@ mod store_mode {
         assert_eq!(stop["data"]["reason"], "signal");
     }
 
+    /// SIGTERM can land anywhere in the loop, including inside `poll()` (EINTR). Every stop,
+    /// whenever the signal arrives, must exit 0 with a clean `signal` stop record.
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn sigterm_at_any_moment_is_a_clean_stop() {
+        for delay_ms in [0u64, 20, 70, 130, 210, 333] {
+            let t = tempfile::tempdir().unwrap();
+            let (mut child, _err) = spawn(t.path(), 60);
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+            rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+            let status = child.wait().unwrap();
+            assert!(status.success(), "delay {delay_ms} ms: exit {status}");
+            let recs = records(t.path());
+            let stop = recs.iter().find(|v| v["type"] == "daemon_stop").unwrap();
+            assert_eq!(stop["data"]["reason"], "signal", "delay {delay_ms} ms");
+            verify(t.path());
+        }
+    }
+
     #[test]
     #[ignore = "needs root and a kernel with BTF"]
     fn kill_9_then_restart_records_an_unclean_gap_and_keeps_the_events() {

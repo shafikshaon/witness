@@ -263,6 +263,27 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
     let index_stop = Arc::new(AtomicBool::new(false));
     let indexer = spawn_indexer(data_dir.clone(), Arc::clone(&index_stop));
 
+    // What already exists, so pre-existing activity is attributable. Done after READY so it
+    // never delays the services ordered after us, and after attach so nothing can be missed
+    // between the snapshot and live capture (duplicates are harmless).
+    let snap_ctx = crate::baseline::Context {
+        boot_id: boot.clone(),
+        boot_ns: pipeline.boot_ns(),
+        wall_ns: pipeline.wall_ns(),
+        gap_from_boot_ns: pipeline.gap_from_boot_ns(),
+    };
+    let t0 = Instant::now();
+    let snapshot = crate::baseline::collect(&crate::baseline::Roots::default(), &snap_ctx);
+    let n = snapshot.len();
+    for ev in &snapshot {
+        pipeline.ingest(ev)?;
+    }
+    tracing::info!(
+        records = n,
+        took_ms = t0.elapsed().as_millis() as u64,
+        "baseline snapshot stored"
+    );
+
     let mut decoder = Decoder::new(boot);
     let resolve = |pid: u32| {
         use std::os::unix::ffi::OsStrExt;

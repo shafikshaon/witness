@@ -294,7 +294,10 @@ fn puid_is_quantized_to_proc_resolution() {
     // The kernel's exact start time and /proc's tick-resolution value name one process.
     let exact = 1_234_567_890_123u64; // ns
     let proc_ticks = exact / 10_000_000; // what /proc/<pid>/stat reports
-    assert_eq!(puid(boot, 77, exact), puid(boot, 77, proc_ticks * 10_000_000));
+    assert_eq!(
+        puid(boot, 77, exact),
+        puid(boot, 77, proc_ticks * 10_000_000)
+    );
     assert_eq!(puid(boot, 77, exact), "4f2a9c1e-77-123456");
     // A different pid or a different tick is a different process.
     assert_ne!(puid(boot, 78, exact), puid(boot, 77, exact));

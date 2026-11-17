@@ -127,6 +127,9 @@ pub struct Pipeline {
     sinks: Vec<Box<dyn AnchorSink>>,
     set: Settings,
     dirty: bool,
+    /// Start (boot-relative ns) of the capture gap just recorded, if this restart was on the
+    /// same boot as the previous run.
+    gap_from_boot_ns: Option<u64>,
     last_sync: Duration,
     last_disk: Duration,
     last_anchor: Duration,
@@ -189,6 +192,7 @@ impl Pipeline {
             sinks,
             set,
             dirty: false,
+            gap_from_boot_ns: previous.as_ref().and_then(|p| p.from_boot_ns),
             last_sync: now,
             last_disk: now,
             last_anchor: now,
@@ -352,6 +356,19 @@ impl Pipeline {
         self.store.rotate().context("sealing the segment")?;
         self.store.sync()?;
         Ok(self.stats.clone())
+    }
+
+    /// Where the capture gap before this start began (same boot only).
+    pub fn gap_from_boot_ns(&self) -> Option<u64> {
+        self.gap_from_boot_ns
+    }
+
+    pub fn boot_ns(&self) -> u64 {
+        self.clock.boot_ns()
+    }
+
+    pub fn wall_ns(&self) -> u64 {
+        self.clock.wall_ns()
     }
 
     pub fn store(&self) -> &Store {

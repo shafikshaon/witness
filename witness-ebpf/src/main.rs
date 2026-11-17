@@ -14,13 +14,13 @@ use aya_ebpf::{
         bpf_get_current_uid_gid, bpf_ktime_get_boot_ns,
         bpf_probe_read_kernel_str_bytes, generated,
     },
-    macros::{btf_tracepoint, fexit, kprobe, map},
+    macros::{btf_tracepoint, kprobe, map},
     maps::{PerCpuArray, RingBuf},
-    programs::{BtfTracePointContext, FExitContext, ProbeContext},
+    programs::{BtfTracePointContext, ProbeContext},
 };
 use witness_common::{
-    fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
-    ARGV_CAP, COMP_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
+    RESULT_UNKNOWN, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
+    ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
     MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
 };
 
@@ -632,12 +632,12 @@ unsafe fn path_parts(path: *const u8, o: &Offsets) -> (*const u8, *const u8) {
 }
 
 /// security_file_open(struct file *file): a file opened for writing.
-#[fexit(function = "security_file_open")]
-pub fn file_open(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_file_open")]
+pub fn file_open(ctx: ProbeContext) -> u32 {
     // SAFETY: kernel pointers are only read through `bpf_probe_read_kernel`.
     unsafe {
-        let file: *const u8 = ctx.arg(0);
-        let ret: i32 = ctx.arg(1);
+        let file: *const u8 = ctx.arg(0).unwrap_or(null());
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let mode: u32 = rd_or(file, o.file_f_mode, 0);
         if mode & FMODE_WRITE == 0 {
@@ -660,14 +660,14 @@ pub fn file_open(ctx: FExitContext) -> i32 {
 }
 
 /// security_path_mknod(const struct path *dir, struct dentry *dentry, umode_t mode, unsigned dev)
-#[fexit(function = "security_path_mknod")]
-pub fn path_mknod(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_path_mknod")]
+pub fn path_mknod(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let dir: *const u8 = ctx.arg(0);
-        let dentry: *const u8 = ctx.arg(1);
-        let mode: u32 = ctx.arg::<u32>(2) & 0xffff;
-        let ret: i32 = ctx.arg(4);
+        let dir: *const u8 = ctx.arg(0).unwrap_or(null());
+        let dentry: *const u8 = ctx.arg(1).unwrap_or(null());
+        let mode: u32 = ctx.arg::<u32>(2).unwrap_or(0) & 0xffff;
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let (mnt, _) = path_parts(dir, &o);
         emit_file(fop::CREATE, ret, mnt, dentry, 0, mode, 0, 0);
@@ -676,14 +676,14 @@ pub fn path_mknod(ctx: FExitContext) -> i32 {
 }
 
 /// security_path_mkdir(const struct path *dir, struct dentry *dentry, umode_t mode)
-#[fexit(function = "security_path_mkdir")]
-pub fn path_mkdir(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_path_mkdir")]
+pub fn path_mkdir(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let dir: *const u8 = ctx.arg(0);
-        let dentry: *const u8 = ctx.arg(1);
-        let mode: u32 = ctx.arg::<u32>(2) & 0xffff;
-        let ret: i32 = ctx.arg(3);
+        let dir: *const u8 = ctx.arg(0).unwrap_or(null());
+        let dentry: *const u8 = ctx.arg(1).unwrap_or(null());
+        let mode: u32 = ctx.arg::<u32>(2).unwrap_or(0) & 0xffff;
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let (mnt, _) = path_parts(dir, &o);
         emit_file(fop::MKDIR, ret, mnt, dentry, 0, mode, 0, 0);
@@ -692,13 +692,13 @@ pub fn path_mkdir(ctx: FExitContext) -> i32 {
 }
 
 /// security_path_unlink(const struct path *dir, struct dentry *dentry)
-#[fexit(function = "security_path_unlink")]
-pub fn path_unlink(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_path_unlink")]
+pub fn path_unlink(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let dir: *const u8 = ctx.arg(0);
-        let dentry: *const u8 = ctx.arg(1);
-        let ret: i32 = ctx.arg(2);
+        let dir: *const u8 = ctx.arg(0).unwrap_or(null());
+        let dentry: *const u8 = ctx.arg(1).unwrap_or(null());
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let (mnt, _) = path_parts(dir, &o);
         emit_file(fop::UNLINK, ret, mnt, dentry, 0, 0, 0, 0);
@@ -707,13 +707,13 @@ pub fn path_unlink(ctx: FExitContext) -> i32 {
 }
 
 /// security_path_rmdir(const struct path *dir, struct dentry *dentry)
-#[fexit(function = "security_path_rmdir")]
-pub fn path_rmdir(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_path_rmdir")]
+pub fn path_rmdir(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let dir: *const u8 = ctx.arg(0);
-        let dentry: *const u8 = ctx.arg(1);
-        let ret: i32 = ctx.arg(2);
+        let dir: *const u8 = ctx.arg(0).unwrap_or(null());
+        let dentry: *const u8 = ctx.arg(1).unwrap_or(null());
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let (mnt, _) = path_parts(dir, &o);
         emit_file(fop::RMDIR, ret, mnt, dentry, 0, 0, 0, 0);
@@ -722,13 +722,13 @@ pub fn path_rmdir(ctx: FExitContext) -> i32 {
 }
 
 /// security_path_chmod(const struct path *path, umode_t mode)
-#[fexit(function = "security_path_chmod")]
-pub fn path_chmod(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_path_chmod")]
+pub fn path_chmod(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let path: *const u8 = ctx.arg(0);
-        let mode: u32 = ctx.arg::<u32>(1) & 0xffff;
-        let ret: i32 = ctx.arg(2);
+        let path: *const u8 = ctx.arg(0).unwrap_or(null());
+        let mode: u32 = ctx.arg::<u32>(1).unwrap_or(0) & 0xffff;
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let (mnt, dentry) = path_parts(path, &o);
         emit_file(fop::CHMOD, ret, mnt, dentry, 0, mode, 0, 0);
@@ -738,8 +738,9 @@ pub fn path_chmod(ctx: FExitContext) -> i32 {
 
 /// security_path_chown(const struct path *path, kuid_t uid, kgid_t gid)
 ///
-/// `kuid_t`/`kgid_t` are structs passed by value, which BPF trampolines (fentry/fexit)
-/// cannot carry on 5.15, so this one is a kprobe. A kprobe sees the call, not its result.
+/// All file hooks are kprobes: fentry/fexit trampolines do not exist on arm64 before 6.0,
+/// and `kuid_t`/`kgid_t` are structs passed by value, which trampolines cannot carry on 5.15
+/// anyway. A kprobe sees the call, not its result (`RESULT_UNKNOWN`).
 #[kprobe(function = "security_path_chown")]
 pub fn path_chown(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
@@ -753,18 +754,18 @@ pub fn path_chown(ctx: ProbeContext) -> u32 {
         };
         let o = offsets();
         let (mnt, dentry) = path_parts(path, &o);
-        emit_file(fop::CHOWN, 0, mnt, dentry, 0, 0, uid, gid);
+        emit_file(fop::CHOWN, RESULT_UNKNOWN, mnt, dentry, 0, 0, uid, gid);
     }
     0
 }
 
 /// security_path_truncate(const struct path *path)
-#[fexit(function = "security_path_truncate")]
-pub fn path_truncate(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_path_truncate")]
+pub fn path_truncate(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let path: *const u8 = ctx.arg(0);
-        let ret: i32 = ctx.arg(1);
+        let path: *const u8 = ctx.arg(0).unwrap_or(null());
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let (mnt, dentry) = path_parts(path, &o);
         emit_file(fop::TRUNCATE, ret, mnt, dentry, 0, 0, 0, 0);
@@ -773,16 +774,16 @@ pub fn path_truncate(ctx: FExitContext) -> i32 {
 }
 
 /// security_path_rename(old_dir, old_dentry, new_dir, new_dentry, unsigned int flags)
-#[fexit(function = "security_path_rename")]
-pub fn path_rename(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_path_rename")]
+pub fn path_rename(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let old_dir: *const u8 = ctx.arg(0);
-        let old_dentry: *const u8 = ctx.arg(1);
-        let new_dir: *const u8 = ctx.arg(2);
-        let new_dentry: *const u8 = ctx.arg(3);
-        let flags: u32 = ctx.arg(4);
-        let ret: i32 = ctx.arg(5);
+        let old_dir: *const u8 = ctx.arg(0).unwrap_or(null());
+        let old_dentry: *const u8 = ctx.arg(1).unwrap_or(null());
+        let new_dir: *const u8 = ctx.arg(2).unwrap_or(null());
+        let new_dentry: *const u8 = ctx.arg(3).unwrap_or(null());
+        let flags: u32 = ctx.arg(4).unwrap_or(0);
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let (old_mnt, _) = path_parts(old_dir, &o);
         let (new_mnt, _) = path_parts(new_dir, &o);
@@ -792,14 +793,14 @@ pub fn path_rename(ctx: FExitContext) -> i32 {
 }
 
 /// security_path_link(struct dentry *old_dentry, const struct path *new_dir, struct dentry *new_dentry)
-#[fexit(function = "security_path_link")]
-pub fn path_link(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_path_link")]
+pub fn path_link(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let old_dentry: *const u8 = ctx.arg(0);
-        let new_dir: *const u8 = ctx.arg(1);
-        let new_dentry: *const u8 = ctx.arg(2);
-        let ret: i32 = ctx.arg(3);
+        let old_dentry: *const u8 = ctx.arg(0).unwrap_or(null());
+        let new_dir: *const u8 = ctx.arg(1).unwrap_or(null());
+        let new_dentry: *const u8 = ctx.arg(2).unwrap_or(null());
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let (mnt, _) = path_parts(new_dir, &o);
         // A hard link stays on one mount, so the new directory's mount names the old path too.
@@ -809,14 +810,14 @@ pub fn path_link(ctx: FExitContext) -> i32 {
 }
 
 /// security_path_symlink(const struct path *dir, struct dentry *dentry, const char *old_name)
-#[fexit(function = "security_path_symlink")]
-pub fn path_symlink(ctx: FExitContext) -> i32 {
+#[kprobe(function = "security_path_symlink")]
+pub fn path_symlink(ctx: ProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe {
-        let dir: *const u8 = ctx.arg(0);
-        let dentry: *const u8 = ctx.arg(1);
-        let target: *const u8 = ctx.arg(2);
-        let ret: i32 = ctx.arg(3);
+        let dir: *const u8 = ctx.arg(0).unwrap_or(null());
+        let dentry: *const u8 = ctx.arg(1).unwrap_or(null());
+        let target: *const u8 = ctx.arg(2).unwrap_or(null());
+        let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let (mnt, _) = path_parts(dir, &o);
         emit_two(fop::SYMLINK, ret, null(), null(), mnt, dentry, target, 0);

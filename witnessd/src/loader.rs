@@ -43,17 +43,17 @@ const PROGRAMS: [&str; 3] = [
 /// `true` marks a kprobe (used where the signature has by-value struct arguments, which
 /// fexit cannot carry); all others are fexit.
 const FILE_HOOKS: [(&str, &str, usize, bool); 11] = [
-    ("file_open", "security_file_open", 1, false),
-    ("path_mknod", "security_path_mknod", 4, false),
-    ("path_mkdir", "security_path_mkdir", 3, false),
-    ("path_unlink", "security_path_unlink", 2, false),
-    ("path_rmdir", "security_path_rmdir", 2, false),
-    ("path_chmod", "security_path_chmod", 2, false),
+    ("file_open", "security_file_open", 1, true),
+    ("path_mknod", "security_path_mknod", 4, true),
+    ("path_mkdir", "security_path_mkdir", 3, true),
+    ("path_unlink", "security_path_unlink", 2, true),
+    ("path_rmdir", "security_path_rmdir", 2, true),
+    ("path_chmod", "security_path_chmod", 2, true),
     ("path_chown", "security_path_chown", 3, true),
-    ("path_truncate", "security_path_truncate", 1, false),
-    ("path_rename", "security_path_rename", 5, false),
-    ("path_link", "security_path_link", 3, false),
-    ("path_symlink", "security_path_symlink", 3, false),
+    ("path_truncate", "security_path_truncate", 1, true),
+    ("path_rename", "security_path_rename", 5, true),
+    ("path_link", "security_path_link", 3, true),
+    ("path_symlink", "security_path_symlink", 3, true),
 ];
 
 /// Outcome of attaching one optional hook.

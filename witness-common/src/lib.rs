@@ -237,6 +237,10 @@ pub struct FileTwoEvent {
     pub body: FileTwoBody,
 }
 
+/// `result` value meaning the hook's outcome was not observed (kprobes see the call, not
+/// its return value).
+pub const RESULT_UNKNOWN: i32 = i32::MAX;
+
 /// Index of the high-volume ring's drop counter (`DROPS` map).
 pub const DROP_CLASS_VOLUME: u32 = 1;
 

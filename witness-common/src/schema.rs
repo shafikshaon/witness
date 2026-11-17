@@ -246,6 +246,8 @@ impl Event {
 pub enum HookResult {
     Allowed,
     Denied,
+    /// The operation was attempted; its outcome was not observed (kprobe-sourced events).
+    Attempted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

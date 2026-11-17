@@ -34,10 +34,10 @@ pub enum DecodeError {
 }
 
 fn hook_result(r: i32) -> HookResult {
-    if r == 0 {
-        HookResult::Allowed
-    } else {
-        HookResult::Denied
+    match r {
+        witness_common::RESULT_UNKNOWN => HookResult::Attempted,
+        0 => HookResult::Allowed,
+        _ => HookResult::Denied,
     }
 }
 

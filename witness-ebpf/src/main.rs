@@ -347,6 +347,10 @@ unsafe fn read_or_zero<T: Copy>(src: *const u8) -> T {
 #[inline(always)]
 unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offsets) -> (u32, u32) {
     let mut off: usize = PATH_CAP;
+    // Total bytes consumed, compared once after the loop. Comparing two *ranged* values inside
+    // the loop (offset vs length) makes each branch refine them differently, so no two paths
+    // look alike and the verifier cannot prune; wrapping inside a mask avoids that.
+    let mut total: usize = 0;
     let mut trunc = 0u32;
     let mut dentry = dentry;
     let mut mnt = mnt;
@@ -369,24 +373,20 @@ unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offset
             mnt = (m.parent as *const u8).add(o.mount_mnt as usize);
             continue;
         }
-        let mut len = head.len as usize;
-        if len == 0 || head.name == 0 {
+        if head.len == 0 || head.name == 0 {
             break;
         }
+        let mut len = head.len as usize;
         if len > COMP_CAP {
             len = COMP_CAP;
             trunc = 1;
         }
-        // Room for "/" + name?
-        if off < len + 1 {
-            trunc = 1;
-            break;
-        }
-        // The guard above makes this non-negative, but the verifier tracks value ranges, not
-        // that relation: masking proves `off` lies within the buffer.
-        off = (off - (len + 1)) & (PATH_CAP - 1);
+        total += len + 1;
+        // Always in `0..PATH_CAP`; if the path is longer than the buffer the writes wrap and
+        // `total` (checked below) says so.
+        off = off.wrapping_sub(len + 1) & (PATH_CAP - 1);
         *buf.add(off) = b'/';
-        // `off + 1 + len` is at most PATH_CAP, so the copy cannot leave the buffer.
+        // `off + 1 + len` is at most PATH_CAP - 1 + 1 + COMP_CAP < PATH_BUF.
         let _ = generated::bpf_probe_read_kernel(
             buf.add(off + 1).cast(),
             len as u32,
@@ -394,11 +394,14 @@ unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offset
         );
         dentry = head.parent as *const u8;
     }
-    if i >= MAX_COMPONENTS {
+    if i >= MAX_COMPONENTS || total > PATH_CAP {
         trunc = 1;
     }
-    if off == PATH_CAP {
-        off -= 1;
+    if total > PATH_CAP {
+        // The buffer wrapped, so its contents are not a usable path: report it empty.
+        off = PATH_CAP;
+    } else if total == 0 {
+        off = PATH_CAP - 1;
         *buf.add(off) = b'/';
     }
     (off as u32, trunc)

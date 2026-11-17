@@ -52,3 +52,62 @@ fn verify_exit_codes_and_location() {
     assert_eq!(v["broken"]["kind"], "BadHash");
     assert_eq!(v["broken"]["segment_id"], seg.id);
 }
+
+#[test]
+fn init_seal_anchor_and_keyed_verify() {
+    use std::process::Command;
+    let t = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_witness");
+    let run = |args: &[&str]| {
+        Command::new(bin)
+            .args(args)
+            .arg("--dir")
+            .arg(t.path())
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["init", "--seal"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let k0 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Verification key (K_0): "))
+        .unwrap()
+        .to_string();
+    assert_eq!(k0.len(), 64);
+    // Re-running must not clobber the key.
+    assert!(!run(&["init", "--seal"]).status.success());
+
+    let (mut s, _) = Store::open(t.path(), Config::default()).unwrap();
+    s.enable_sealing(&t.path().join("seal.key")).unwrap();
+    for i in 0..5u64 {
+        s.append(json!({"type": "t", "n": i}).as_object().unwrap().clone())
+            .unwrap();
+    }
+    s.seal_now().unwrap().unwrap();
+    let mut sinks: Vec<Box<dyn witness_store::anchor::AnchorSink>> = vec![Box::new(
+        witness_store::anchor::FileSink::new(t.path().join("anchors.log")),
+    )];
+    s.anchor_now(&mut sinks).unwrap();
+    s.sync().unwrap();
+    drop(s);
+
+    let head = String::from_utf8(run(&["anchor"]).stdout).unwrap();
+    assert!(head.starts_with("seq="));
+
+    let ok = run(&["verify", "--json", "--seal-key", &k0, "--require-seals"]);
+    let v: Value = serde_json::from_slice(&ok.stdout).unwrap();
+    assert_eq!(ok.status.code(), Some(0));
+    assert_eq!(v["macs_checked"], true);
+    assert_eq!(v["anchors_checked"], 1);
+
+    let wrong = "0".repeat(64);
+    let bad = run(&["verify", "--json", "--seal-key", &wrong]);
+    assert_eq!(bad.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&bad.stdout).unwrap();
+    assert!(v["broken"]["kind"]
+        .as_str()
+        .unwrap()
+        .starts_with("BadSealMac"));
+}

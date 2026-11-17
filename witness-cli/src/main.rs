@@ -6,11 +6,14 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use witness_store::anchor::read_anchors;
+use witness_store::archive::plan_prefix;
 use witness_store::chain::{self, to_hex, Hash};
+use witness_store::disk::DiskPolicy;
 use witness_store::index::Index;
 use witness_store::seal::SealState;
 use witness_store::store::read_head;
 use witness_store::verify::{verify_dirs, Options, Report};
+use witness_store::{Config, Store, StoreError};
 
 const DEFAULT_DIR: &str = "/var/lib/witness";
 
@@ -59,6 +62,37 @@ enum Cmd {
     Reindex {
         #[arg(long, default_value = DEFAULT_DIR)]
         dir: PathBuf,
+        /// Also index segments from this archive directory (repeatable).
+        #[arg(long = "include")]
+        include: Vec<PathBuf>,
+    },
+    /// Copy the oldest sealed segments to another path/device, verify them, and log it.
+    Archive {
+        #[arg(long, default_value = DEFAULT_DIR)]
+        dir: PathBuf,
+        /// Destination directory (segments go to `<to>/segments`).
+        #[arg(long)]
+        to: PathBuf,
+        /// Only segments sealed before this UTC date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ).
+        #[arg(long)]
+        before: Option<String>,
+        /// Remove the originals after the copies are verified and logged.
+        #[arg(long = "move")]
+        move_: bool,
+    },
+    /// Permanently delete the oldest sealed segments. Dry run unless confirmed.
+    Prune {
+        #[arg(long, default_value = DEFAULT_DIR)]
+        dir: PathBuf,
+        /// Delete segments sealed before this UTC date.
+        #[arg(long)]
+        before: String,
+        /// Actually delete. Without this flag only the plan is printed.
+        #[arg(long)]
+        yes_delete_evidence: bool,
+        /// Number of segments you reviewed in the dry run; must match.
+        #[arg(long)]
+        expect: Option<usize>,
     },
     /// Create the forward-secure sealing key. Prints the verification key ONCE.
     Init {
@@ -106,7 +140,19 @@ fn run() -> Result<ExitCode> {
             &include,
             allow_partial,
         ),
-        Cmd::Reindex { dir } => cmd_reindex(&dir),
+        Cmd::Reindex { dir, include } => cmd_reindex(&dir, &include),
+        Cmd::Archive {
+            dir,
+            to,
+            before,
+            move_,
+        } => cmd_archive(&dir, &to, before.as_deref(), move_),
+        Cmd::Prune {
+            dir,
+            before,
+            yes_delete_evidence,
+            expect,
+        } => cmd_prune(&dir, &before, yes_delete_evidence, expect),
         Cmd::Init { dir, seal } => cmd_init(&dir, seal),
         Cmd::Anchor { dir } => {
             let (seq, head) = read_head(&dir.join("segments"))
@@ -170,7 +216,7 @@ fn cmd_verify(
     })
 }
 
-fn cmd_reindex(dir: &Path) -> Result<ExitCode> {
+fn cmd_reindex(dir: &Path, include: &[PathBuf]) -> Result<ExitCode> {
     let db = dir.join("index.db");
     for ext in ["", "-wal", "-shm"] {
         let p = PathBuf::from(format!("{}{ext}", db.display()));
@@ -181,12 +227,163 @@ fn cmd_reindex(dir: &Path) -> Result<ExitCode> {
         }
     }
     let mut ix = Index::open(&db).context("creating index")?;
-    let n = ix
-        .catch_up(&dir.join("segments"))
-        .context("indexing segments")?;
+    let mut dirs = vec![dir.join("segments")];
+    dirs.extend(include.iter().map(|d| d.join("segments")));
+    let n = ix.catch_up_dirs(&dirs).context("indexing segments")?;
     let (seq, head) = ix.position()?;
     println!("indexed {n} records; head seq {seq} {}", to_hex(&head));
     Ok(ExitCode::SUCCESS)
+}
+
+/// Opens the store for an offline maintenance action. No disk-policy reserve is created.
+fn open_offline(dir: &Path) -> Result<Store> {
+    let cfg = Config {
+        disk: DiskPolicy::disabled(),
+        ..Default::default()
+    };
+    match Store::open(dir, cfg) {
+        Ok((store, recovered)) => {
+            for r in recovered {
+                eprintln!(
+                    "warning: removed a torn tail ({} bytes) from {}; kept at {}",
+                    r.bytes,
+                    r.segment.display(),
+                    r.quarantined_to.display()
+                );
+            }
+            Ok(store)
+        }
+        Err(StoreError::Locked) => bail!(
+            "the store is in use by another writer (is witnessd running?). \
+             Stop it first; daemon-mediated archive/prune arrives with the API."
+        ),
+        Err(e) => Err(e).with_context(|| format!("opening {}", dir.display())),
+    }
+}
+
+fn cmd_archive(dir: &Path, to: &Path, before: Option<&str>, move_: bool) -> Result<ExitCode> {
+    let before_ns = before.map(parse_time_ns).transpose()?;
+    let mut store = open_offline(dir)?;
+    let rep = store
+        .archive(to, before_ns, move_)
+        .context("archiving segments")?;
+    if rep.segments.is_empty() {
+        println!("nothing to archive (only sealed segments older than the newest qualify)");
+        return Ok(ExitCode::SUCCESS);
+    }
+    for s in &rep.segments {
+        println!(
+            "segment {:>8}  seq {}..{}  {}",
+            s.id, s.first_seq, s.last_seq, s.file
+        );
+    }
+    println!(
+        "{} segment(s) verified at {} ({} copied, {} already present){}",
+        rep.segments.len(),
+        to.join("segments").display(),
+        rep.copied,
+        rep.segments.len() - rep.copied,
+        if rep.moved {
+            "; originals removed"
+        } else {
+            "; originals kept"
+        }
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_prune(dir: &Path, before: &str, confirmed: bool, expect: Option<usize>) -> Result<ExitCode> {
+    let before_ns = parse_time_ns(before)?;
+    let plan = plan_prefix(&dir.join("segments"), Some(before_ns))
+        .with_context(|| format!("reading {}", dir.display()))?;
+    if plan.is_empty() {
+        println!("nothing to prune before {before}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("segments that would be PERMANENTLY DELETED:");
+    for (info, m) in &plan {
+        println!(
+            "  segment {:>8}  seq {}..{}  {}",
+            info.id,
+            m.first_seq,
+            m.last_seq,
+            info.path.display()
+        );
+    }
+    println!(
+        "{} segment(s). Archive first (`witness archive --move`) if you may need them.",
+        plan.len()
+    );
+    if !confirmed {
+        println!(
+            "dry run: re-run with --yes-delete-evidence --expect {} to delete",
+            plan.len()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Some(expect) = expect else {
+        bail!("--yes-delete-evidence also needs --expect {}", plan.len());
+    };
+    let mut store = open_offline(dir)?;
+    let gone = store
+        .prune(before_ns, expect)
+        .context("pruning (nothing was deleted)")?;
+    println!(
+        "deleted {} segment(s); the removal is recorded in the chain",
+        gone.len()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Parses `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SSZ` (UTC) to nanoseconds since the epoch.
+fn parse_time_ns(s: &str) -> Result<u64> {
+    let bad = || {
+        anyhow::anyhow!(
+            "expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ (UTC, years 1970-2500), got {s:?}"
+        )
+    };
+    let (date, time) = match s.split_once('T') {
+        Some((d, t)) => (d, Some(t.strip_suffix('Z').ok_or_else(bad)?)),
+        None => (s, None),
+    };
+    let nums = |x: &str, sep: char, n: usize| -> Result<Vec<i64>> {
+        let v: Vec<i64> = x
+            .split(sep)
+            .map(|p| p.parse::<i64>().map_err(|_| bad()))
+            .collect::<Result<_>>()?;
+        if v.len() == n {
+            Ok(v)
+        } else {
+            Err(bad())
+        }
+    };
+    let d = nums(date, '-', 3)?;
+    let t = match time {
+        Some(t) => nums(t, ':', 3)?,
+        None => vec![0, 0, 0],
+    };
+    let (y, m, day) = (d[0], d[1], d[2]);
+    if !(1970..=2500).contains(&y)
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&day)
+        || !(0..24).contains(&t[0])
+        || !(0..60).contains(&t[1])
+        || !(0..61).contains(&t[2])
+    {
+        return Err(bad());
+    }
+    // Days from civil date (proleptic Gregorian), after Howard Hinnant's algorithm.
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + t[0] * 3600 + t[1] * 60 + t[2];
+    u64::try_from(secs)
+        .ok()
+        .and_then(|s| s.checked_mul(1_000_000_000))
+        .ok_or_else(bad)
 }
 
 fn cmd_init(dir: &Path, seal: bool) -> Result<ExitCode> {
@@ -279,4 +476,42 @@ fn report_json(r: &Report) -> serde_json::Value {
             "offset": b.offset,
         })),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_time_ns;
+
+    #[test]
+    fn dates_parse_to_known_epochs() {
+        assert_eq!(parse_time_ns("1970-01-01").unwrap(), 0);
+        assert_eq!(
+            parse_time_ns("2000-03-01").unwrap(),
+            951_868_800_000_000_000
+        );
+        assert_eq!(
+            parse_time_ns("2024-02-29T12:30:45Z").unwrap(),
+            1_709_209_845_000_000_000
+        );
+        assert_eq!(
+            parse_time_ns("2026-11-17").unwrap(),
+            1_794_873_600_000_000_000
+        );
+    }
+
+    #[test]
+    fn bad_dates_are_rejected() {
+        for s in [
+            "",
+            "2024",
+            "1969-12-31",
+            "2999-01-01",
+            "2024-01-32",
+            "yesterday",
+            "2024-01-01T10:00",
+            "1969-12-31",
+        ] {
+            assert!(parse_time_ns(s).is_err(), "{s}");
+        }
+    }
 }

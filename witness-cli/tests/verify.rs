@@ -120,3 +120,132 @@ fn init_seal_anchor_and_keyed_verify() {
         .unwrap()
         .starts_with("BadSealMac"));
 }
+
+#[test]
+fn archive_prune_flow_through_the_cli() {
+    use std::process::Command;
+    let t = tempfile::tempdir().unwrap();
+    let data = t.path().join("data");
+    let dest = t.path().join("archive");
+    let bin = env!("CARGO_BIN_EXE_witness");
+    let run = |args: &[&str]| Command::new(bin).args(args).output().unwrap();
+    let d = data.to_str().unwrap();
+    let a = dest.to_str().unwrap();
+
+    {
+        let (mut s, _) = Store::open(
+            &data,
+            Config {
+                max_segment_bytes: 2000,
+                disk: DiskPolicy::disabled(),
+            },
+        )
+        .unwrap();
+        for i in 0..150u64 {
+            s.append(
+                json!({"type": "t", "n": i, "pad": "p".repeat(50)})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        }
+        s.sync().unwrap();
+    }
+
+    // Copy-only archive, then verify the archive on its own.
+    let out = run(&["archive", "--dir", d, "--to", a]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .contains("originals kept"));
+    let v: Value = serde_json::from_slice(&run(&["verify", "--json", "--dir", a]).stdout).unwrap();
+    assert_eq!(v["ok"], true);
+
+    // Prune: dry run deletes nothing; a blind delete is refused; a confirmed one works.
+    let dry = run(&["prune", "--dir", d, "--before", "2500-01-01"]);
+    let text = String::from_utf8(dry.stdout).unwrap();
+    assert!(text.contains("dry run"), "{text}");
+    let n: usize = text
+        .split("--expect ")
+        .nth(1)
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|x| x.parse().ok())
+        .unwrap();
+    let blind = run(&[
+        "prune",
+        "--dir",
+        d,
+        "--before",
+        "2500-01-01",
+        "--yes-delete-evidence",
+    ]);
+    assert!(!blind.status.success());
+    let wrong = run(&[
+        "prune",
+        "--dir",
+        d,
+        "--before",
+        "2500-01-01",
+        "--yes-delete-evidence",
+        "--expect",
+        &(n + 1).to_string(),
+    ]);
+    assert!(!wrong.status.success());
+    let ok = run(&[
+        "prune",
+        "--dir",
+        d,
+        "--before",
+        "2500-01-01",
+        "--yes-delete-evidence",
+        "--expect",
+        &n.to_string(),
+    ]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // The deliberate removal verifies and is flagged as explained; with the archive the
+    // whole chain verifies from the start.
+    let v: Value = serde_json::from_slice(&run(&["verify", "--json", "--dir", d]).stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["partial_explained"], true);
+    let v: Value =
+        serde_json::from_slice(&run(&["verify", "--json", "--dir", d, "--include", a]).stdout)
+            .unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["partial_start"], false);
+
+    let r = run(&["reindex", "--dir", d, "--include", a]);
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+}
+
+#[test]
+fn archive_refuses_while_another_writer_holds_the_store() {
+    use std::process::Command;
+    let t = tempfile::tempdir().unwrap();
+    let (_live, _) = Store::open(
+        t.path(),
+        Config {
+            disk: DiskPolicy::disabled(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_witness"))
+        .args(["archive", "--dir"])
+        .arg(t.path())
+        .arg("--to")
+        .arg(t.path().join("out"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("in use by another writer"));
+}

@@ -302,6 +302,104 @@ mod store_mode {
         assert_eq!(ev.actor.unwrap().uid, 0);
     }
 
+    fn baseline_items<'a>(recs: &'a [Value], kind: &str) -> Vec<&'a Value> {
+        recs.iter()
+            .filter(|v| v["type"] == "baseline" && v["data"]["item"] == kind)
+            .collect()
+    }
+
+    /// The point of the baseline: a process that existed *before* the daemon started is
+    /// described, and when it later exits, the live event names it with the same identity.
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn a_preexisting_process_keeps_one_identity_from_baseline_to_exit() {
+        let t = tempfile::tempdir().unwrap();
+        let mut old = Command::new("/bin/sleep").arg("300").spawn().unwrap();
+        let old_pid = old.id();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let (child, _err) = spawn(t.path(), 6);
+        std::thread::sleep(std::time::Duration::from_millis(1500)); // baseline is stored
+        old.kill().unwrap();
+        old.wait().unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+
+        let recs = records(t.path());
+        let base = baseline_items(&recs, "process")
+            .into_iter()
+            .find(|v| v["actor"]["pid"] == old_pid)
+            .expect("the pre-existing sleep must be in the baseline");
+        assert_eq!(base["actor"]["comm"], "sleep");
+        assert_eq!(base["actor"]["cmdline"][1], "300");
+        assert_eq!(base["actor"]["uid"], 0);
+        let puid = base["actor"]["puid"].as_str().unwrap();
+        // Its parent (this test process) is described with the identity the tree points at.
+        let parent = baseline_items(&recs, "process")
+            .into_iter()
+            .find(|v| v["actor"]["pid"] == std::process::id())
+            .expect("the parent is in the baseline");
+        assert_eq!(
+            base["data"]["detail"]["parent_puid"],
+            parent["actor"]["puid"]
+        );
+
+        let exit = recs
+            .iter()
+            .find(|v| v["type"] == "proc_exit" && v["actor"]["pid"] == old_pid)
+            .expect("the live exit must be captured");
+        assert_eq!(exit["data"]["signal"], 9);
+        assert_eq!(
+            exit["actor"]["puid"], puid,
+            "baseline and live capture must name the same process identically"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn the_baseline_describes_the_running_system() {
+        let t = tempfile::tempdir().unwrap();
+        let (child, _err) = spawn(t.path(), 4);
+        assert!(child.wait_with_output().unwrap().status.success());
+        let recs = records(t.path());
+
+        let procs = baseline_items(&recs, "process");
+        assert!(
+            procs.len() > 10,
+            "a running system has many processes, got {}",
+            procs.len()
+        );
+        let init = procs
+            .iter()
+            .find(|v| v["actor"]["pid"] == 1)
+            .expect("pid 1");
+        assert!(
+            init["actor"]["comm"].as_str().unwrap().contains("systemd")
+                || init["actor"]["comm"] == "init"
+        );
+        assert!(
+            procs
+                .iter()
+                .any(|v| v["data"]["detail"]["kernel_thread"] == true),
+            "kernel threads are flagged"
+        );
+        let mounts = baseline_items(&recs, "mount");
+        assert!(mounts
+            .iter()
+            .any(|v| v["data"]["detail"]["mount_point"] == "/"));
+        assert!(
+            !baseline_items(&recs, "module").is_empty(),
+            "loaded kernel modules"
+        );
+
+        let summary = baseline_items(&recs, "summary");
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0]["data"]["detail"]["processes"], procs.len());
+        // The summary closes the snapshot: it comes after every baseline process record.
+        let pos = |v: &Value| v["seq"].as_u64().unwrap();
+        assert!(procs.iter().all(|p| pos(p) < pos(summary[0])));
+        verify(t.path());
+    }
+
     #[test]
     #[ignore = "needs root and a kernel with BTF"]
     fn sigterm_is_a_clean_stop() {

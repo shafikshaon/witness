@@ -179,9 +179,19 @@ pub struct Actor {
     pub tty: Option<String>,
 }
 
+/// Resolution of the process start time in `/proc/<pid>/stat` (`USER_HZ` = 100, fixed by
+/// the kernel ABI), in nanoseconds.
+const START_TICK_NS: u64 = 10_000_000;
+
+/// Process identity: `<boot id prefix>-<pid>-<start time in 10 ms ticks since boot>`.
+///
+/// The start time is quantized to the 10 ms that `/proc` exposes, so a process found by the
+/// baseline scan (which can only read ticks) and the same process seen later by the eBPF
+/// programs (which read exact nanoseconds) get the **same** identity. A pid is reused only
+/// after the counter wraps, which cannot happen twice within 10 ms.
 pub fn puid(boot_id: &str, pid: u32, start_boot_ns: u64) -> String {
     let short: String = boot_id.chars().filter(|c| *c != '-').take(8).collect();
-    format!("{short}-{pid}-{start_boot_ns}")
+    format!("{short}-{pid}-{}", start_boot_ns / START_TICK_NS)
 }
 
 fn is_false(b: &bool) -> bool {
@@ -953,7 +963,7 @@ impl Body {
             }
             FileCreate(_) | FileOpenWrite(_) | FileDelete(_) | FileTruncate(_) | FileRename(_)
             | FileAttr(_) | FileLink(_) | NetConnect(_) | NetAccept(_) | NetListen(_)
-            | ProcFork(_) | ClockSync(_) | Baseline(_) => Priority::P1,
+            | ProcFork(_) | ClockSync(_) => Priority::P1,
             _ => Priority::P0,
         }
     }

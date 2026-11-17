@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(e.wall_ns, 1_700_000_000_000_005_000);
         assert_eq!(e.prio, 0);
         let a = e.actor.unwrap();
-        assert_eq!(a.puid, "4f2a9c1e-321-1000");
+        assert_eq!(a.puid, "4f2a9c1e-321-0");
         assert_eq!((a.auid, a.ses), (Some(1000), None));
         assert_eq!(a.comm, "curl");
         assert_eq!(a.tty.as_deref(), Some("pts/0"));
@@ -297,7 +297,7 @@ mod tests {
         let Body::ProcFork(f) = e.body else { panic!() };
         assert_eq!(
             (f.child_pid, f.child_puid.as_str()),
-            (700, "4f2a9c1e-700-2000")
+            (700, "4f2a9c1e-700-0")
         );
         assert_eq!(e.prio, 1);
     }

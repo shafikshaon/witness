@@ -10,7 +10,7 @@ use witness_store::chain::{self, to_hex, Hash};
 use witness_store::index::Index;
 use witness_store::seal::SealState;
 use witness_store::store::read_head;
-use witness_store::verify::{verify_with, Options, Report};
+use witness_store::verify::{verify_dirs, Options, Report};
 
 const DEFAULT_DIR: &str = "/var/lib/witness";
 
@@ -48,6 +48,12 @@ enum Cmd {
         /// Fail if the store contains no seal records.
         #[arg(long)]
         require_seals: bool,
+        /// Also read segments from this archive directory (repeatable).
+        #[arg(long = "include")]
+        include: Vec<PathBuf>,
+        /// Accept missing oldest history that no prune/archive record explains.
+        #[arg(long)]
+        allow_partial: bool,
     },
     /// Rebuild the SQLite query index from the segments.
     Reindex {
@@ -88,7 +94,18 @@ fn run() -> Result<ExitCode> {
             seal_key_file,
             anchors,
             require_seals,
-        } => cmd_verify(&dir, json, seal_key, seal_key_file, anchors, require_seals),
+            include,
+            allow_partial,
+        } => cmd_verify(
+            &dir,
+            json,
+            seal_key,
+            seal_key_file,
+            anchors,
+            require_seals,
+            &include,
+            allow_partial,
+        ),
         Cmd::Reindex { dir } => cmd_reindex(&dir),
         Cmd::Init { dir, seal } => cmd_init(&dir, seal),
         Cmd::Anchor { dir } => {
@@ -105,6 +122,7 @@ fn parse_key(s: &str) -> Result<Hash> {
         .context("verification key must be 64 hex digits")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_verify(
     dir: &Path,
     json: bool,
@@ -112,6 +130,8 @@ fn cmd_verify(
     seal_key_file: Option<PathBuf>,
     anchors: Option<PathBuf>,
     require_seals: bool,
+    include: &[PathBuf],
+    allow_partial: bool,
 ) -> Result<ExitCode> {
     let seal_key = match (seal_key, seal_key_file) {
         (Some(k), _) => Some(parse_key(&k)?),
@@ -132,10 +152,12 @@ fn cmd_verify(
         seal_key,
         anchors,
         require_seals,
+        allow_partial,
     };
-    let seg_dir = dir.join("segments");
-    let report =
-        verify_with(&seg_dir, &opts).with_context(|| format!("reading {}", seg_dir.display()))?;
+    let mut dirs = vec![dir.join("segments")];
+    dirs.extend(include.iter().map(|d| d.join("segments")));
+    let report = verify_dirs(&dirs, &opts)
+        .with_context(|| format!("reading {}", dir.join("segments").display()))?;
     if json {
         println!("{}", report_json(&report));
     } else {
@@ -195,7 +217,11 @@ fn print_report(r: &Report, anchors: Option<&Path>) {
         to_hex(&r.head_hash)
     );
     if r.partial_start {
-        println!("note: history before the oldest segment is absent; its start cannot be checked");
+        if r.partial_explained {
+            println!("note: older history was removed by a logged prune/archive; its start cannot be checked");
+        } else {
+            println!("note: history before the oldest segment is absent and no prune/archive record explains it");
+        }
     }
     match (r.seals, r.macs_checked) {
         (0, _) => println!("seals: none"),
@@ -238,6 +264,7 @@ fn report_json(r: &Report) -> serde_json::Value {
         "head_seq": r.head_seq,
         "head_hash": to_hex(&r.head_hash),
         "partial_start": r.partial_start,
+        "partial_explained": r.partial_explained,
         "seals": r.seals,
         "last_seal_epoch": r.last_seal_epoch,
         "sealed_through_seq": r.sealed_through_seq,

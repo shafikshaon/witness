@@ -28,3 +28,4 @@ fault-injection = []
 [dev-dependencies]
 witness-store = { path = ".", features = ["fault-injection"] }
 tempfile = "=3.27.0"
+witness-common = { path = "../witness-common", features = ["schema"] }

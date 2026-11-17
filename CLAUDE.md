@@ -9,8 +9,8 @@ Linux forensic activity monitor. Authoritative design: `docs/DESIGN.md` (approve
 - `witness-cli/`: `witness` CLI. `witness-gui/`: Dioxus Desktop app. `rules/`: YAML rule pack. `xtask/`: build and packaging.
 
 ## Commands
-- Userspace build/test (stable): `cargo build --workspace --exclude witness-ebpf` / `cargo test --workspace --exclude witness-ebpf`
-- Lint: `cargo fmt --all --check` and `cargo clippy --workspace --exclude witness-ebpf --all-targets -- -D warnings`
+- Userspace build/test (stable): `cargo build --workspace --exclude witness-ebpf` / `cargo test --workspace --exclude witness-ebpf --all-features`
+- Lint: `cargo fmt --all --check` and `cargo clippy --workspace --exclude witness-ebpf --all-targets --all-features -- -D warnings`
 - eBPF object (nightly, Linux): `cargo xtask build-ebpf` (output is embedded into `witnessd` via `include_bytes!`)
 - Privileged integration tests (Linux VM, root only): `sudo -E cargo test -p witnessd --test integration -- --ignored`
 - Never run eBPF code on macOS; it only compiles there at best. Always state *compiled only* vs *verified on a real kernel*.

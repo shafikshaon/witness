@@ -4,6 +4,9 @@
 //! kernel side and userspace agree on the exact byte layout (DESIGN.md §4.3).
 #![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(feature = "schema")]
+pub mod schema;
+
 /// Bumped on any incompatible change to the wire structs below.
 pub const ABI_VERSION: u32 = 1;
 

@@ -9,6 +9,12 @@ license = "MIT OR Apache-2.0"
 [features]
 default = ["std"]
 std = []
+# Userspace event schema (serde). Off for the no_std eBPF build.
+schema = ["std", "dep:serde", "dep:serde_json"]
 
 [lints]
 workspace = true
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "=1.0.154", optional = true }

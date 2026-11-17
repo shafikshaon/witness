@@ -1,13 +1,16 @@
 //! `witness verify`: walks every segment and reports the first point where the chain breaks.
 
+use std::collections::HashMap;
 use std::io::{BufRead, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::anchor::Anchor;
 use crate::chain::{self, Hash, GENESIS};
 use crate::error::Result;
+use crate::seal::{self, TYPE_SEAL_MAC};
 use crate::segment::{self, SegmentInfo};
 use crate::{TYPE_OPEN, TYPE_SEAL};
 
@@ -35,6 +38,18 @@ pub enum BreakKind {
     SealCountMismatch { expected: u64, found: u64 },
     /// The file ends in the middle of a line (torn write or truncation).
     TornTail,
+    /// A seal record is structurally wrong (missing fields, wrong `covers_seq`).
+    BadSeal(String),
+    /// Seal epochs must be consecutive starting at 1; a gap means seals were removed.
+    SealEpochGap { expected: u64, found: u64 },
+    /// The seal MAC does not verify under the key derived from the verification key.
+    BadSealMac { epoch: u64 },
+    /// A seal was required (`--require-seals`) but the store contains none.
+    NoSeals,
+    /// A published anchor disagrees with the chain's hash at that seq.
+    AnchorMismatch { seq: u64 },
+    /// A published anchor names a seq beyond the end of the chain: the tail was truncated.
+    AnchorBeyondHead { anchor_seq: u64, head_seq: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,8 +74,27 @@ pub struct Report {
     /// True when the oldest segment on disk is not segment 1 (pruned/archived history):
     /// verification starts from that segment's recorded `prev_head` and cannot check it.
     pub partial_start: bool,
+    /// Number of seal records seen.
+    pub seals: u64,
+    pub last_seal_epoch: Option<u64>,
+    /// Records up to here are covered by a seal; later ones are the unsealed tail.
+    pub sealed_through_seq: Option<u64>,
+    /// True if seal MACs were checked against a verification key (not just structure).
+    pub macs_checked: bool,
+    pub anchors_checked: u64,
     /// `None` means the whole chain verified.
     pub broken: Option<Break>,
+}
+
+/// Optional inputs that strengthen verification beyond the bare hash chain.
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// The admin-held verification key `K_0`; enables seal MAC checks.
+    pub seal_key: Option<Hash>,
+    /// Anchors published outside the evidence files.
+    pub anchors: Vec<Anchor>,
+    /// Fail if the store has no seal records at all.
+    pub require_seals: bool,
 }
 
 impl Report {
@@ -74,15 +108,34 @@ struct Run {
     expected_seq: u64,
     records: u64,
     prev_seg_sha: Option<Hash>,
+    partial: bool,
+    seals: u64,
+    last_epoch: Option<u64>,
+    sealed_through: Option<u64>,
+    /// `(epoch, key)` of the evolving verification key.
+    key: Option<(u64, Hash)>,
+    anchors: HashMap<u64, Hash>,
+    anchors_checked: u64,
 }
 
 pub fn verify_dir(seg_dir: &Path) -> Result<Report> {
+    verify_with(seg_dir, &Options::default())
+}
+
+pub fn verify_with(seg_dir: &Path, opts: &Options) -> Result<Report> {
     let segs = segment::list_segments(seg_dir)?;
     let mut run = Run {
         prev: GENESIS,
         expected_seq: 1,
         records: 0,
         prev_seg_sha: Some(GENESIS),
+        partial: false,
+        seals: 0,
+        last_epoch: None,
+        sealed_through: None,
+        key: opts.seal_key.map(|k| (0, k)),
+        anchors: opts.anchors.iter().map(|a| (a.seq, a.hash)).collect(),
+        anchors_checked: 0,
     };
     let mut report = Report {
         segments: 0,
@@ -90,6 +143,11 @@ pub fn verify_dir(seg_dir: &Path) -> Result<Report> {
         head_seq: 0,
         head_hash: GENESIS,
         partial_start: false,
+        seals: 0,
+        last_seal_epoch: None,
+        sealed_through_seq: None,
+        macs_checked: false,
+        anchors_checked: 0,
         broken: None,
     };
     let mut prev_id: Option<u64> = None;
@@ -112,6 +170,7 @@ pub fn verify_dir(seg_dir: &Path) -> Result<Report> {
             }
         } else if seg.id != 1 {
             report.partial_start = true;
+            run.partial = true;
             run.prev_seg_sha = None;
             run.expected_seq = seg.first_seq;
         }
@@ -121,6 +180,10 @@ pub fn verify_dir(seg_dir: &Path) -> Result<Report> {
         report.records = run.records;
         report.head_seq = run.expected_seq.saturating_sub(1);
         report.head_hash = run.prev;
+        report.seals = run.seals;
+        report.last_seal_epoch = run.last_epoch;
+        report.sealed_through_seq = run.sealed_through;
+        report.anchors_checked = run.anchors_checked;
         match outcome {
             Ok(sha) => run.prev_seg_sha = Some(sha),
             Err(b) => {
@@ -129,7 +192,48 @@ pub fn verify_dir(seg_dir: &Path) -> Result<Report> {
             }
         }
     }
+    report.macs_checked = opts.seal_key.is_some() && run.seals > 0;
+    if report.broken.is_none() {
+        report.broken = final_checks(segs.last(), &run, opts, report.head_seq);
+    }
     Ok(report)
+}
+
+/// Checks that need the whole chain: truncation against anchors, and required seals.
+fn final_checks(
+    last: Option<&SegmentInfo>,
+    run: &Run,
+    opts: &Options,
+    head_seq: u64,
+) -> Option<Break> {
+    let at = |seq: Option<u64>, kind: BreakKind| Break {
+        segment: last.map(|s| s.path.clone()).unwrap_or_default(),
+        segment_id: last.map_or(0, |s| s.id),
+        seq,
+        line: 0,
+        offset: 0,
+        kind,
+    };
+    let mut beyond: Vec<u64> = run
+        .anchors
+        .keys()
+        .copied()
+        .filter(|&s| s > head_seq)
+        .collect();
+    beyond.sort_unstable();
+    if let Some(&anchor_seq) = beyond.first() {
+        return Some(at(
+            Some(anchor_seq),
+            BreakKind::AnchorBeyondHead {
+                anchor_seq,
+                head_seq,
+            },
+        ));
+    }
+    if opts.require_seals && run.seals == 0 {
+        return Some(at(None, BreakKind::NoSeals));
+    }
+    None
 }
 
 fn verify_segment(
@@ -225,6 +329,21 @@ fn verify_segment(
             return Err(brk(Some(seq), line_no, offset, BreakKind::BadHash));
         }
 
+        if let Some(want) = run.anchors.get(&seq) {
+            if *want != recorded {
+                return Err(brk(
+                    Some(seq),
+                    line_no,
+                    offset,
+                    BreakKind::AnchorMismatch { seq },
+                ));
+            }
+            run.anchors_checked += 1;
+        }
+        if v["type"] == TYPE_SEAL_MAC {
+            check_seal(&v, seq, run).map_err(|k| brk(Some(seq), line_no, offset, k))?;
+        }
+
         if line_no == 1 {
             check_open(&v, seg, seq, run).map_err(|k| brk(Some(seq), line_no, offset, k))?;
         } else if v["type"] == TYPE_SEAL {
@@ -281,4 +400,50 @@ fn check_open(
         Some(want) if want != claimed => Err(BreakKind::PrevSegmentHash),
         _ => Ok(()),
     }
+}
+
+fn check_seal(v: &Value, seq: u64, run: &mut Run) -> std::result::Result<(), BreakKind> {
+    let bad = |m: &str| BreakKind::BadSeal(m.to_string());
+    let epoch = v["epoch"].as_u64().ok_or_else(|| bad("missing epoch"))?;
+    let covers = v["covers_seq"]
+        .as_u64()
+        .ok_or_else(|| bad("missing covers_seq"))?;
+    let tag = v["mac"]
+        .as_str()
+        .and_then(|s| chain::from_hex(s.as_bytes()))
+        .ok_or_else(|| bad("missing or malformed mac"))?;
+    if covers + 1 != seq {
+        return Err(bad("covers_seq is not the preceding record"));
+    }
+    let expected = match run.last_epoch {
+        Some(e) => Some(e + 1),
+        None if run.partial => None,
+        None => Some(1),
+    };
+    if let Some(expected) = expected {
+        if epoch != expected {
+            return Err(BreakKind::SealEpochGap {
+                expected,
+                found: epoch,
+            });
+        }
+    }
+    if let Some((k_epoch, k)) = run.key {
+        if epoch < k_epoch {
+            return Err(BreakKind::SealEpochGap {
+                expected: k_epoch,
+                found: epoch,
+            });
+        }
+        let key = seal::evolve_to(&k, k_epoch, epoch);
+        // The head the MAC covers is the hash of the record just before this one.
+        if !seal::mac_ok(&key, epoch, covers, &run.prev, &tag) {
+            return Err(BreakKind::BadSealMac { epoch });
+        }
+        run.key = Some((epoch, key));
+    }
+    run.seals += 1;
+    run.last_epoch = Some(epoch);
+    run.sealed_through = Some(covers);
+    Ok(())
 }

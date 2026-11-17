@@ -5,3 +5,4 @@ pub mod cli;
 pub mod decode;
 #[cfg(target_os = "linux")]
 pub mod loader;
+pub mod pipeline;

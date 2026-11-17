@@ -755,6 +755,15 @@ pub struct SourceHealth {
     pub reason: Option<String>,
 }
 
+/// A torn tail removed when the store was reopened; the bytes are kept in `quarantined_to`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recovery {
+    pub segment: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub quarantined_to: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigChange {
     pub old_sha256: String,
@@ -913,6 +922,7 @@ bodies! {
     CaptureDrop(CaptureDrop),
     SourceHealth(SourceHealth),
     ConfigChange(ConfigChange),
+    Recovery(Recovery),
     RuleSetChange(RuleSetChange),
     Alert(Alert),
     TriageAction(TriageAction),

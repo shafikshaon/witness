@@ -23,10 +23,14 @@ anyhow = "=1.0.104"
 clap = { version = "=4.6.8", features = ["derive"] }
 rustix = { version = "=1.1.6", features = ["event", "time", "fs", "process"] }
 serde_json = "=1.0.154"
+sha2 = "=0.11.0"
+signal-hook = "=0.4.6"
 thiserror = "=2.0.21"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 witness-common = { path = "../witness-common", features = ["schema"] }
+witness-config = { path = "../witness-config" }
+witness-store = { path = "../witness-store" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = "=0.16.0"

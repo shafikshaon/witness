@@ -377,11 +377,22 @@ mod store_mode {
             let started = std::time::Instant::now();
             let out = child.wait_with_output().unwrap();
             let log = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                out.status.success(),
-                "delay {delay_ms} ms: exit {} \n{log}",
-                out.status
-            );
+            if !out.status.success() {
+                // The only acceptable failure: killed before `main` could block the signal
+                // (exec / loader / runtime init). Nothing has been written at that point.
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    out.status.signal(),
+                    Some(15),
+                    "delay {delay_ms} ms: {}\n{log}",
+                    out.status
+                );
+                assert!(
+                    !t.path().join("segments").exists() || records(t.path()).is_empty(),
+                    "delay {delay_ms} ms: killed after it had started writing\n{log}"
+                );
+                continue;
+            }
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(5),
                 "delay {delay_ms} ms: slow stop\n{log}"

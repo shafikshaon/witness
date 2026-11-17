@@ -161,6 +161,16 @@ Each source (every eBPF program group, each ring buffer, fanotify, D-Bus, journa
 - **Capabilities, measured:** capture works with only `CAP_BPF` + `CAP_PERFMON`; dropping either (with `CAP_SYS_PTRACE` alone) prevents startup. The unit keeps `CAP_SYS_PTRACE` (other users' `/proc/<pid>/exe`, `cwd`) and `CAP_DAC_READ_SEARCH` (hashing, M3) and **omits `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_AUDIT_READ`** until a tested feature needs them. The doc's earlier draft list (§6.1) was a starting point; this supersedes it.
 - **Bugs found only by real shutdowns, now fixed and regression-tested:** (1) systemd's SIGTERM interrupted `poll()` (`EINTR`) and the loop treated it as fatal, so every stop exited 1 and showed "Failed"; (2) a SIGTERM arriving during `signal-hook`'s own registration was silently swallowed and the daemon ran on. Both are gone: SIGTERM/SIGINT are blocked first thing (before any thread) and read from a `signalfd`, so a signal can neither be lost nor kill the process mid-startup. The only remaining window is before `main()` runs its first line, when nothing has been written yet.
 
+### 2.9 The baseline snapshot, as built and verified
+
+`witnessd/src/baseline.rs`, run right after `READY=1` (so it never delays services ordered after the daemon) and after the programs attach (so nothing falls between snapshot and live capture; duplicates are harmless). On the VM under the hardened unit: **270 records in 10 ms** (116 processes, 8 listening sockets, 1 session, 93 modules, 45 mounts, 2 block devices, 4 USB devices).
+
+- **Records:** `baseline` events (`src: baseline`, **P0 — never shed**) of kind `process` (with a full `actor`, so the tree can be rebuilt; `parent_puid` links it; kernel threads flagged), `listen_socket`, `session`, `module`, `mount`, `block_device`, `usb_device`, closed by a `summary` with counts.
+- **Identity across baseline and live capture (important):** `/proc/<pid>/stat` only exposes start time in 10 ms ticks, while the eBPF programs read exact nanoseconds. `puid` is therefore `<boot>-<pid>-<start ns / 10 ms>`, which is exactly what `/proc` reports, so the baseline record of a process that predates the daemon and the live `proc_exit` for it name it **identically**. Tested on the real kernel (a `sleep` started before the daemon, killed after baseline; same `puid`, and its parent link resolves). A pid cannot be reused twice within 10 ms.
+- **`discovered_in_gap`:** after a same-boot restart, processes that began after the last record before the gap are flagged: they started while nothing was watching.
+- **Deviations from the draft (§6.6), deliberately:** listening sockets come from `/proc/net/{tcp,tcp6,udp,udp6}` mapped to owners through `/proc/<pid>/fd` instead of `sock_diag` netlink (no new capability, trivially testable; UDP "listeners" are bound, unconnected sockets); sessions come from logind's state files in `/run/systemd/sessions/` instead of D-Bus (no D-Bus dependency yet; the file format is logind-internal, so utmp is the planned fallback in M5). Both are covered by fixture-tree tests, and `Roots` makes the paths injectable.
+- **Not captured yet:** a process's `tty`, `cwd`, and environment; established connections; open files.
+
 ## 3. Kernel side and daemon internals
 
 ### 3.1 Programs, maps, buffers

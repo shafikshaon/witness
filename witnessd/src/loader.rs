@@ -81,21 +81,31 @@ impl Collector {
         })
     }
 
-    /// Waits up to `timeout` for data, then calls `f` with each pending record.
-    pub fn poll(&mut self, timeout: Duration, mut f: impl FnMut(&[u8])) -> Result<usize> {
+    /// Waits up to `timeout` for ring-buffer data (or for any of `wake` to become readable,
+    /// e.g. a signalfd), then calls `f` with each pending record.
+    pub fn poll(
+        &mut self,
+        timeout: Duration,
+        wake: &[std::os::fd::BorrowedFd<'_>],
+        mut f: impl FnMut(&[u8]),
+    ) -> Result<usize> {
         let fd = self.ring.as_fd();
-        let mut fds = [rustix::event::PollFd::new(
+        let mut fds = vec![rustix::event::PollFd::new(
             &fd,
             rustix::event::PollFlags::IN,
         )];
+        fds.extend(
+            wake.iter()
+                .map(|w| rustix::event::PollFd::new(w, rustix::event::PollFlags::IN)),
+        );
         let ts = rustix::time::Timespec {
             tv_sec: timeout.as_secs() as _,
             tv_nsec: timeout.subsec_nanos() as _,
         };
         match rustix::event::poll(&mut fds, Some(&ts)) {
             Ok(_) => {}
-            // A signal (SIGTERM from systemd) interrupted the wait. That is not an error:
-            // return so the caller notices its shutdown flag; the data is read next round.
+            // A signal interrupted the wait. That is not an error: return and let the
+            // caller carry on; the data is read next round.
             Err(rustix::io::Errno::INTR) => return Ok(0),
             Err(e) => return Err(e).context("poll on the ring buffer"),
         }

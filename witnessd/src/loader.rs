@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use aya::maps::{MapData, PerCpuArray, RingBuf};
-use aya::programs::{BtfTracePoint, FExit, KProbe};
+use aya::programs::BtfTracePoint;
 use aya::{Btf as AyaBtf, EbpfLoader, VerifierLogLevel};
 use witness_common::{Offsets, UNAVAILABLE};
 
@@ -62,6 +62,29 @@ pub struct HookReport {
     pub hook: &'static str,
     /// `Err` carries why it is not active; capture continues without it.
     pub status: Result<(), String>,
+}
+
+/// Loads one hook program into the kernel (running the verifier) and attaches it.
+fn load_attach(
+    program: &mut aya::programs::Program,
+    func: &str,
+    kprobe: bool,
+    kbtf: &AyaBtf,
+) -> Result<(), String> {
+    use aya::programs::Program;
+    match (program, kprobe) {
+        (Program::KProbe(p), true) => {
+            p.load().map_err(|e| format!("load: {e}"))?;
+            p.attach(func, 0).map_err(|e| format!("attach: {e}"))?;
+            Ok(())
+        }
+        (Program::FExit(p), false) => {
+            p.load(func, kbtf).map_err(|e| format!("load: {e}"))?;
+            p.attach().map_err(|e| format!("attach: {e}"))?;
+            Ok(())
+        }
+        _ => Err("program type does not match the hook table".into()),
+    }
 }
 
 /// Offsets the file hooks need; if any is missing the whole file source is degraded.
@@ -158,15 +181,28 @@ impl Collector {
             prog.attach().with_context(|| format!("attaching {name}"))?;
         }
 
-        let mut reports = Vec::new();
+        // Pre-checks run first and only hooks that pass them are verified. Verification of each
+        // program is independent and CPU-bound (the kernel verifier walks every path), so the
+        // programs are loaded concurrently: serial loading took ~6 s on a 4-CPU VM, which would
+        // delay every service ordered after us at boot.
+        let mut reports: Vec<Option<HookReport>> = vec![None; FILE_HOOKS.len()];
         let missing = missing_file_offsets(&offsets);
         // Diagnostic: attach only the named hook (e.g. WITNESS_ONLY_HOOK=security_file_open).
         let only = std::env::var("WITNESS_ONLY_HOOK").ok();
-        for (prog_name, func, params, kprobe) in FILE_HOOKS {
+        let mut by_name: std::collections::HashMap<String, &mut aya::programs::Program> = ebpf
+            .programs_mut()
+            .map(|(n, p)| (n.to_string(), p))
+            .collect();
+        let mut jobs: Vec<(usize, &'static str, bool, &mut aya::programs::Program)> = Vec::new();
+        for (idx, (prog_name, func, params, kprobe)) in FILE_HOOKS.into_iter().enumerate() {
             if only.as_deref().is_some_and(|o| o != func) {
+                reports[idx] = Some(HookReport {
+                    hook: func,
+                    status: Err("skipped (WITNESS_ONLY_HOOK)".into()),
+                });
                 continue;
             }
-            let status: Result<(), String> = (|| {
+            let pre: Result<(), String> = (|| {
                 if !files {
                     return Err("file capture disabled in the configuration".into());
                 }
@@ -177,28 +213,56 @@ impl Collector {
                     return Err(why);
                 }
                 match btf.func_param_count(func) {
-                    None => return Err(format!("{func} is not in the kernel's BTF")),
+                    None => Err(format!("{func} is not in the kernel's BTF")),
                     Some(n) if n != params => {
-                        return Err(format!("{func} has {n} parameters, expected {params}"))
+                        Err(format!("{func} has {n} parameters, expected {params}"))
                     }
-                    Some(_) => {}
+                    Some(_) => Ok(()),
                 }
-                let program = ebpf
-                    .program_mut(prog_name)
-                    .ok_or_else(|| format!("program {prog_name} missing from the object"))?;
-                if kprobe {
-                    let prog: &mut KProbe = program.try_into().map_err(|e| format!("{e}"))?;
-                    prog.load().map_err(|e| format!("load: {e}"))?;
-                    prog.attach(func, 0).map_err(|e| format!("attach: {e}"))?;
-                } else {
-                    let prog: &mut FExit = program.try_into().map_err(|e| format!("{e}"))?;
-                    prog.load(func, &kbtf).map_err(|e| format!("load: {e}"))?;
-                    prog.attach().map_err(|e| format!("attach: {e}"))?;
-                }
-                Ok(())
             })();
-            reports.push(HookReport { hook: func, status });
+            match (pre, by_name.remove(prog_name)) {
+                (Err(e), _) => {
+                    reports[idx] = Some(HookReport {
+                        hook: func,
+                        status: Err(e),
+                    })
+                }
+                (Ok(()), None) => {
+                    reports[idx] = Some(HookReport {
+                        hook: func,
+                        status: Err(format!("program {prog_name} missing from the object")),
+                    })
+                }
+                (Ok(()), Some(prog)) => jobs.push((idx, func, kprobe, prog)),
+            }
         }
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8);
+        let kbtf_ref = &kbtf;
+        let mut outcomes: Vec<(usize, &'static str, Result<(), String>)> = Vec::new();
+        while !jobs.is_empty() {
+            let batch: Vec<_> = jobs.drain(..jobs.len().min(workers)).collect();
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = batch
+                    .into_iter()
+                    .map(|(idx, func, kprobe, prog)| {
+                        scope.spawn(move || (idx, func, load_attach(prog, func, kprobe, kbtf_ref)))
+                    })
+                    .collect();
+                for h in handles {
+                    match h.join() {
+                        Ok(o) => outcomes.push(o),
+                        Err(_) => tracing::error!("a hook loader thread panicked"),
+                    }
+                }
+            });
+        }
+        for (idx, func, status) in outcomes {
+            reports[idx] = Some(HookReport { hook: func, status });
+        }
+        let reports: Vec<HookReport> = reports.into_iter().flatten().collect();
 
         let take = |ebpf: &mut aya::Ebpf, n: &str| {
             ebpf.take_map(n).ok_or_else(|| anyhow!("map {n} missing"))

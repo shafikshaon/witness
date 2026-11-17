@@ -329,15 +329,29 @@ mod store_mode {
     fn sigterm_at_any_moment_is_a_clean_stop() {
         for delay_ms in [0u64, 20, 70, 130, 210, 333] {
             let t = tempfile::tempdir().unwrap();
-            let (mut child, _err) = spawn(t.path(), 60);
+            let (mut child, mut err) = spawn(t.path(), 60);
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let started = std::time::Instant::now();
             let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
             rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
             let status = child.wait().unwrap();
-            assert!(status.success(), "delay {delay_ms} ms: exit {status}");
+            let took = started.elapsed();
+            let mut log = String::new();
+            let _ = std::io::Read::read_to_string(&mut err, &mut log);
+            assert!(
+                status.success(),
+                "delay {delay_ms} ms: exit {status}\n{log}"
+            );
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "delay {delay_ms} ms: took {took:?} to stop after SIGTERM\n{log}"
+            );
             let recs = records(t.path());
             let stop = recs.iter().find(|v| v["type"] == "daemon_stop").unwrap();
-            assert_eq!(stop["data"]["reason"], "signal", "delay {delay_ms} ms");
+            assert_eq!(
+                stop["data"]["reason"], "signal",
+                "delay {delay_ms} ms\n{log}"
+            );
             verify(t.path());
         }
     }

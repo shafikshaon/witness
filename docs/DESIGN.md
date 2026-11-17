@@ -139,6 +139,16 @@ Each source (every eBPF program group, each ring buffer, fanotify, D-Bus, journa
 - `fork` events carry no parent `comm`; `cwd`, environment and `stdio` kinds are not captured yet.
 - Wall-clock time uses one offset sample per poll cycle, not the 100 ms sampling in §3.4.
 
+### 2.7 The storing daemon, as built (verified on Ubuntu 22.04 / 5.15.0-198 / aarch64)
+
+`witnessd run [--config F] [--data-dir D]` is the daemon; `witnessd tail` prints events without storing (debugging); `witnessd doctor` reports kernel support. The pipeline (`witnessd/src/pipeline.rs`) is kernel-independent and unit-tested with a fake clock.
+
+- **Start:** take the writer lock (a second daemon is refused with a clear message), repair a torn tail (bytes quarantined, a `recovery` record written), read what the previous run left, then write `capture_gap` (always, on any restart) and `daemon_start`. The previous run is classed **clean** only if a `daemon_stop{clean:true}` is among the last two records; otherwise **unclean**. The gap's start time comes from the last real event/daemon record. A different `boot_id` is `new_boot`; boot-relative times are not carried across boots.
+- **Run:** events are stored in arrival order through the disk-full policy (priority from the event type); kernel ring-buffer overflows become `capture_drop{reason:"ring_overflow"}` records; group commit (`storage.group_commit_ms`); a seal every `seal.interval_secs` (if enabled) and an anchor every `storage.anchor_interval_secs`, published to `anchors.log` and the optional admin command; the SQLite index is maintained by a separate thread that only reads the segments.
+- **Stop (SIGTERM/SIGINT):** detach from the kernel, final seal and anchor, `daemon_stop{clean:true, signal}`, seal the segment. `daemon_stop` is intentionally the last *data* record so the next start can recognise a clean shutdown. SIGKILL leaves no stop record; the next start records an `unclean` gap and the events already written survive (tested).
+- **Fixed along the way:** user search text was handed to FTS5 as query syntax, so a plain search for `job-77` failed (`-` is NOT); it is now quoted word by word (trailing `*` = prefix).
+- Not yet done (M6): systemd unit and `sd_notify`/watchdog, baseline snapshot, the API socket, and the journald anchor sink.
+
 ## 3. Kernel side and daemon internals
 
 ### 3.1 Programs, maps, buffers

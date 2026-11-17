@@ -61,6 +61,18 @@ pub fn list_segments(dir: &Path) -> Result<Vec<SegmentInfo>> {
     Ok(out)
 }
 
+/// Lists segments across several directories (live first, then archives), merged by id.
+/// When the same id appears more than once the earliest-listed directory wins.
+pub fn list_segments_in(dirs: &[PathBuf]) -> Result<Vec<SegmentInfo>> {
+    let mut by_id = std::collections::BTreeMap::new();
+    for d in dirs {
+        for s in list_segments(d)? {
+            by_id.entry(s.id).or_insert(s);
+        }
+    }
+    Ok(by_id.into_values().collect())
+}
+
 /// Opens a segment for line-oriented reading of its *uncompressed* bytes.
 pub fn open_reader(info: &SegmentInfo) -> io::Result<Box<dyn BufRead>> {
     let f = File::open(&info.path)?;

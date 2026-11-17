@@ -241,12 +241,22 @@ fn unsealed_middle_segment_is_detected() {
 }
 
 #[test]
-fn pruned_prefix_verifies_as_partial() {
+fn deleting_the_oldest_segment_without_a_record_is_flagged() {
     let t = tempfile::tempdir().unwrap();
     let dir = fill(t.path(), 100);
     let first = segs(&dir)[0].clone();
     fs::remove_file(&first.path).unwrap();
     let r = verify_dir(&dir).unwrap();
+    assert!(r.partial_start && !r.partial_explained);
+    let b = r.broken.unwrap();
+    assert!(matches!(b.kind, BreakKind::HistoryMissing { first_seq } if first_seq > 1));
+
+    // Verifying a slice on purpose is still possible.
+    let opts = witness_store::verify::Options {
+        allow_partial: true,
+        ..Default::default()
+    };
+    let r = witness_store::verify::verify_with(&dir, &opts).unwrap();
     assert!(r.is_ok(), "{:?}", r.broken);
     assert!(r.partial_start);
 }

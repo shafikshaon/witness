@@ -2,7 +2,7 @@
 //! ever disagree, the segments (the chain) win.
 
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, params_from_iter, types::Value as Sql, Connection, OptionalExtension};
 use serde_json::Value;
@@ -95,8 +95,13 @@ impl Index {
     /// Indexes everything after the current position. Verifies the hash chain as it goes
     /// and fails (without advancing past the problem) if the segments do not continue it.
     pub fn catch_up(&mut self, seg_dir: &Path) -> Result<u64> {
+        self.catch_up_dirs(&[seg_dir.to_path_buf()])
+    }
+
+    /// Like [`Index::catch_up`] over live data plus archive directories.
+    pub fn catch_up_dirs(&mut self, dirs: &[PathBuf]) -> Result<u64> {
         let (mut last, mut head) = self.position()?;
-        let segs = segment::list_segments(seg_dir)?;
+        let segs = segment::list_segments_in(dirs)?;
         let start = segs
             .iter()
             .rposition(|s| s.first_seq <= last + 1)
@@ -239,6 +244,11 @@ impl Index {
 
     /// Fetches the exact stored line for `seq`, straight from the segment.
     pub fn raw(&self, seg_dir: &Path, seq: u64) -> Result<Vec<u8>> {
+        self.raw_in(&[seg_dir.to_path_buf()], seq)
+    }
+
+    /// Like [`Index::raw`], searching live data and archive directories.
+    pub fn raw_in(&self, dirs: &[PathBuf], seq: u64) -> Result<Vec<u8>> {
         let (id, off, len): (i64, i64, i64) = self
             .conn
             .query_row(
@@ -247,7 +257,7 @@ impl Index {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .map_err(db)?;
-        let seg = segment::list_segments(seg_dir)?
+        let seg = segment::list_segments_in(dirs)?
             .into_iter()
             .find(|s| s.id == id as u64)
             .ok_or_else(|| StoreError::Corrupt(format!("segment {id} is missing")))?;

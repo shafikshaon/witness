@@ -46,6 +46,9 @@ pub enum BreakKind {
     BadSealMac { epoch: u64 },
     /// A seal was required (`--require-seals`) but the store contains none.
     NoSeals,
+    /// The oldest segments are gone and no `prune`/`archive` record in the chain accounts
+    /// for them: history was deleted without being logged.
+    HistoryMissing { first_seq: u64 },
     /// A published anchor disagrees with the chain's hash at that seq.
     AnchorMismatch { seq: u64 },
     /// A published anchor names a seq beyond the end of the chain: the tail was truncated.
@@ -74,6 +77,8 @@ pub struct Report {
     /// True when the oldest segment on disk is not segment 1 (pruned/archived history):
     /// verification starts from that segment's recorded `prev_head` and cannot check it.
     pub partial_start: bool,
+    /// True when a chained `prune`/`archive --move` record accounts for the missing prefix.
+    pub partial_explained: bool,
     /// Number of seal records seen.
     pub seals: u64,
     pub last_seal_epoch: Option<u64>,
@@ -95,6 +100,9 @@ pub struct Options {
     pub anchors: Vec<Anchor>,
     /// Fail if the store has no seal records at all.
     pub require_seals: bool,
+    /// Accept a store whose oldest segments are absent without an explaining
+    /// `prune`/`archive --move` record (e.g. verifying an arbitrary slice).
+    pub allow_partial: bool,
 }
 
 impl Report {
@@ -109,6 +117,8 @@ struct Run {
     records: u64,
     prev_seg_sha: Option<Hash>,
     partial: bool,
+    /// Highest seq that a `prune` or moving `archive` record says was removed.
+    removed_through: u64,
     seals: u64,
     last_epoch: Option<u64>,
     sealed_through: Option<u64>,
@@ -123,13 +133,19 @@ pub fn verify_dir(seg_dir: &Path) -> Result<Report> {
 }
 
 pub fn verify_with(seg_dir: &Path, opts: &Options) -> Result<Report> {
-    let segs = segment::list_segments(seg_dir)?;
+    verify_dirs(&[seg_dir.to_path_buf()], opts)
+}
+
+/// Verifies the chain across several directories (live data plus archives).
+pub fn verify_dirs(dirs: &[PathBuf], opts: &Options) -> Result<Report> {
+    let segs = segment::list_segments_in(dirs)?;
     let mut run = Run {
         prev: GENESIS,
         expected_seq: 1,
         records: 0,
         prev_seg_sha: Some(GENESIS),
         partial: false,
+        removed_through: 0,
         seals: 0,
         last_epoch: None,
         sealed_through: None,
@@ -143,6 +159,7 @@ pub fn verify_with(seg_dir: &Path, opts: &Options) -> Result<Report> {
         head_seq: 0,
         head_hash: GENESIS,
         partial_start: false,
+        partial_explained: false,
         seals: 0,
         last_seal_epoch: None,
         sealed_through_seq: None,
@@ -193,19 +210,19 @@ pub fn verify_with(seg_dir: &Path, opts: &Options) -> Result<Report> {
         }
     }
     report.macs_checked = opts.seal_key.is_some() && run.seals > 0;
+    report.partial_explained = report.partial_start
+        && segs
+            .first()
+            .is_some_and(|s| run.removed_through + 1 >= s.first_seq);
     if report.broken.is_none() {
-        report.broken = final_checks(segs.last(), &run, opts, report.head_seq);
+        report.broken = final_checks(segs.as_slice(), &run, opts, report.head_seq);
     }
     Ok(report)
 }
 
 /// Checks that need the whole chain: truncation against anchors, and required seals.
-fn final_checks(
-    last: Option<&SegmentInfo>,
-    run: &Run,
-    opts: &Options,
-    head_seq: u64,
-) -> Option<Break> {
+fn final_checks(segs: &[SegmentInfo], run: &Run, opts: &Options, head_seq: u64) -> Option<Break> {
+    let last = segs.last();
     let at = |seq: Option<u64>, kind: BreakKind| Break {
         segment: last.map(|s| s.path.clone()).unwrap_or_default(),
         segment_id: last.map_or(0, |s| s.id),
@@ -229,6 +246,21 @@ fn final_checks(
                 head_seq,
             },
         ));
+    }
+    if let Some(first) = segs.first() {
+        let explained = run.removed_through + 1 >= first.first_seq;
+        if run.partial && !explained && !opts.allow_partial {
+            return Some(Break {
+                segment: first.path.clone(),
+                segment_id: first.id,
+                seq: Some(first.first_seq),
+                line: 0,
+                offset: 0,
+                kind: BreakKind::HistoryMissing {
+                    first_seq: first.first_seq,
+                },
+            });
+        }
     }
     if opts.require_seals && run.seals == 0 {
         return Some(at(None, BreakKind::NoSeals));
@@ -339,6 +371,11 @@ fn verify_segment(
                 ));
             }
             run.anchors_checked += 1;
+        }
+        if v["type"] == "prune" || (v["type"] == "archive" && v["moved"] == true) {
+            if let Some(t) = v["through_seq"].as_u64() {
+                run.removed_through = run.removed_through.max(t);
+            }
         }
         if v["type"] == TYPE_SEAL_MAC {
             check_seal(&v, seq, run).map_err(|k| brk(Some(seq), line_no, offset, k))?;

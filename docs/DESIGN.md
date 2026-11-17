@@ -323,7 +323,7 @@ Decision: NDJSON. The active segment is plain text (so it is robust against part
 {"v":1,"seq":1042,"boot_id":"…","boot_ns":…,"wall_ns":…,"src":"ebpf","prio":0,"actor":{…},"type":"proc_exec","data":{…},"h":"<64 hex>"}
 ```
 
-`h` is always the last key, fixed width. The hashed payload `B` is the line with the `,"h":"<64 hex>"` suffix removed (a fixed 73-byte tail strip, then re-append `}`): `h_n = SHA256(h_{n-1} || B_n)`. Verification does not re-serialize anything; no canonical-JSON ambiguity. 
+`h` is always the last key, fixed width. The hashed payload `B` is the line with the `,"h":"<64 hex>"` suffix removed (a fixed 72-byte tail strip, then re-append `}`): `h_n = SHA256(h_{n-1} || B_n)`. Verification does not re-serialize anything; no canonical-JSON ambiguity. 
 
 **Segment layout** in `/var/lib/witness/segments/`:
 

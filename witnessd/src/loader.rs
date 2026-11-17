@@ -10,13 +10,12 @@ use aya::programs::BtfTracePoint;
 use aya::{Btf as AyaBtf, EbpfLoader};
 use witness_common::{Offsets, DROP_CLASS_CRITICAL};
 
-use crate::btf::Btf;
-
 /// The compiled eBPF object (empty placeholder if it was not built; see `build.rs`).
 static OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/witness-ebpf"));
 
 /// `Offsets` made loadable as a global.
 #[repr(transparent)]
+#[derive(Clone, Copy)]
 struct OffsetsPod(Offsets);
 
 // SAFETY: `Offsets` is `repr(C)`, made only of `u32` fields (no padding, no invalid bit
@@ -44,8 +43,8 @@ impl Collector {
         }
         let self_tgid = std::process::id();
         let mut ebpf = EbpfLoader::new()
-            .set_global("OFFSETS", &OffsetsPod(offsets), true)
-            .set_global("SELF_TGID", &self_tgid, true)
+            .override_global("OFFSETS", &OffsetsPod(offsets), true)
+            .override_global("SELF_TGID", &self_tgid, true)
             .map_max_entries("CRITICAL", ring_critical_bytes)
             .load(OBJECT)
             .context("loading the eBPF object")?;
@@ -78,10 +77,8 @@ impl Collector {
 
     /// Waits up to `timeout` for data, then calls `f` with each pending record.
     pub fn poll(&mut self, timeout: Duration, mut f: impl FnMut(&[u8])) -> Result<usize> {
-        let mut fds = [rustix::event::PollFd::new(
-            &self.ring.as_fd(),
-            rustix::event::PollFlags::IN,
-        )];
+        let fd = self.ring.as_fd();
+        let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
         let ts = rustix::time::Timespec {
             tv_sec: timeout.as_secs() as _,
             tv_nsec: timeout.subsec_nanos() as _,

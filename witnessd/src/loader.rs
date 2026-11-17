@@ -148,6 +148,9 @@ impl Collector {
         critical_bytes: u32,
         volume_bytes: u32,
         files: bool,
+        // Polled between batches of hook loads so a stop request during a slow start (the
+        // kernel verifier takes seconds for the file hooks) is honoured promptly.
+        interrupted: &dyn Fn() -> bool,
     ) -> Result<(Collector, Vec<HookReport>)> {
         if OBJECT.is_empty() {
             bail!("this build has no eBPF object (built off Linux or with WITNESS_SKIP_EBPF=1)");
@@ -243,6 +246,16 @@ impl Collector {
         let kbtf_ref = &kbtf;
         let mut outcomes: Vec<(usize, &'static str, Result<(), String>)> = Vec::new();
         while !jobs.is_empty() {
+            if interrupted() {
+                for (idx, func, _, _) in jobs.drain(..) {
+                    outcomes.push((
+                        idx,
+                        func,
+                        Err("startup interrupted by a stop request".into()),
+                    ));
+                }
+                break;
+            }
             let batch: Vec<_> = jobs.drain(..jobs.len().min(workers)).collect();
             std::thread::scope(|scope| {
                 let handles: Vec<_> = batch

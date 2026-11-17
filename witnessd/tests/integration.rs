@@ -288,6 +288,7 @@ mod store_mode {
         let hits = ix
             .query(&Filter {
                 text: Some(marker.clone()),
+                kinds: vec!["proc_exec".into()],
                 limit: 10,
                 ..Default::default()
             })

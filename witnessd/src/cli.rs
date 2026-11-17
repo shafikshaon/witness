@@ -102,7 +102,9 @@ pub fn tail(seconds: Option<u64>) -> Result<()> {
     let btf = Btf::from_sys_fs().context("reading kernel BTF")?;
     let offsets = btf.resolve_offsets()?.offsets;
     let (mut collector, hooks) =
-        Collector::start(offsets, &btf, RING_CRITICAL_BYTES, 32 << 20, true)?;
+        Collector::start(offsets, &btf, RING_CRITICAL_BYTES, 32 << 20, true, &|| {
+            false
+        })?;
     for h in &hooks {
         if let Err(why) = &h.status {
             tracing::warn!(hook = h.hook, %why, "hook not active");
@@ -147,6 +149,19 @@ pub fn tail(seconds: Option<u64>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a (blocked) signal is waiting on the signalfd, without consuming it.
+fn signal_pending(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    let mut fds = [rustix::event::PollFd::new(
+        &fd,
+        rustix::event::PollFlags::IN,
+    )];
+    let zero = rustix::time::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    matches!(rustix::event::poll(&mut fds, Some(&zero)), Ok(n) if n > 0)
 }
 
 /// Tells systemd; a missing `NOTIFY_SOCKET` (not run by systemd) is not an error.
@@ -260,6 +275,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         cfg.capture.ring_critical_mib << 20,
         cfg.capture.ring_volume_mib << 20,
         cfg.capture.files,
+        &|| signal_pending(sigfd.as_fd()),
     )?;
     let failed: Vec<String> = hooks
         .iter()

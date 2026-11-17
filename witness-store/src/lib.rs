@@ -1,5 +1,6 @@
 //! Tamper-evident append-only storage for Witness (DESIGN.md §5).
 pub mod anchor;
+pub mod archive;
 pub mod chain;
 pub mod disk;
 pub mod error;

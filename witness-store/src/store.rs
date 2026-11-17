@@ -811,7 +811,7 @@ fn is_full(e: &io::Error) -> bool {
     )
 }
 
-fn now_ns() -> u64 {
+pub(crate) fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -840,15 +840,15 @@ fn restrict_file(_: &Path) -> Result<()> {
     Ok(())
 }
 
-struct Tail {
-    last_line: Option<Vec<u8>>,
+pub(crate) struct Tail {
+    pub(crate) last_line: Option<Vec<u8>>,
     /// The complete line before `last_line`, if it lies within the scanned window.
     prev_line: Option<Vec<u8>>,
     /// `(offset, bytes)` of an unterminated tail, if any.
     torn: Option<(u64, Vec<u8>)>,
 }
 
-fn scan_plain_tail(path: &Path) -> Result<Tail> {
+pub(crate) fn scan_plain_tail(path: &Path) -> Result<Tail> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
     let base = len.saturating_sub(TAIL_WINDOW);
@@ -898,7 +898,7 @@ fn scan_plain_tail(path: &Path) -> Result<Tail> {
     })
 }
 
-fn last_line_streaming(info: &SegmentInfo) -> Result<Option<Vec<u8>>> {
+pub(crate) fn last_line_streaming(info: &SegmentInfo) -> Result<Option<Vec<u8>>> {
     use std::io::BufRead;
     let mut r = segment::open_reader(info)?;
     let mut last = None;

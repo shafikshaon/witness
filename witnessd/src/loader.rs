@@ -92,6 +92,24 @@ fn missing_file_offsets(o: &Offsets) -> Vec<&'static str> {
     .collect()
 }
 
+/// The kernel programs read `d_parent`/`d_name` and `mnt_parent`/`mnt_mountpoint` as
+/// contiguous blocks; refuse file capture on a kernel whose layout differs.
+fn layout_problem(o: &Offsets) -> Option<String> {
+    if o.dentry_d_name != o.dentry_d_parent.wrapping_add(8) {
+        return Some("dentry.d_name does not directly follow d_parent".into());
+    }
+    if o.qstr_len != 4 || o.qstr_name != 8 {
+        return Some(format!(
+            "qstr layout differs (len at {}, name at {}; expected 4 and 8)",
+            o.qstr_len, o.qstr_name
+        ));
+    }
+    if o.mount_mnt_mountpoint != o.mount_mnt_parent.wrapping_add(8) {
+        return Some("mount.mnt_mountpoint does not directly follow mnt_parent".into());
+    }
+    None
+}
+
 pub struct Collector {
     critical: RingBuf<MapData>,
     volume: RingBuf<MapData>,
@@ -140,6 +158,9 @@ impl Collector {
                 }
                 if !missing.is_empty() {
                     return Err(format!("kernel BTF lacks {}", missing.join(", ")));
+                }
+                if let Some(why) = layout_problem(&offsets) {
+                    return Err(why);
                 }
                 match btf.func_param_count(func) {
                     None => return Err(format!("{func} is not in the kernel's BTF")),

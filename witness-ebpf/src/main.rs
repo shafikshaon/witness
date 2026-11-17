@@ -279,8 +279,8 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) -> Result<(), ()> {
 const FMODE_WRITE: u32 = 0x2;
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
-/// Deepest directory nesting walked before the path is cut and flagged.
-const MAX_COMPONENTS: usize = 40;
+/// Deepest nesting (including mount crossings) walked before the path is cut and flagged.
+const MAX_COMPONENTS: usize = 24;
 
 /// Pseudo filesystems whose writes are not interesting host activity.
 #[inline(always)]
@@ -302,13 +302,48 @@ fn noisy_fs(magic: u64) -> bool {
     )
 }
 
+/// `d_parent`, then `d_name` (`hash`, `len`, `name`) as they sit in `struct dentry`. The
+/// loader refuses to enable file capture unless the running kernel's layout is exactly this
+/// (`d_name` right after `d_parent`, `qstr.len` at +4, `qstr.name` at +8), so one read per
+/// directory level replaces four branchy ones, which is what keeps the verifier's state
+/// space small enough to accept the walk.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DentryHead {
+    parent: u64,
+    hash: u32,
+    len: u32,
+    name: u64,
+}
+
+/// `mnt_parent` then `mnt_mountpoint` from `struct mount` (adjacent; checked by the loader).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MountHead {
+    parent: u64,
+    mountpoint: u64,
+}
+
+/// Reads `T` at `src` into zeroed memory; a failed read leaves zeros. Deliberately no
+/// branch on the helper's result: failure is handled by the zeros it leaves behind.
+#[inline(always)]
+unsafe fn read_or_zero<T: Copy>(src: *const u8) -> T {
+    let mut v: core::mem::MaybeUninit<T> = core::mem::MaybeUninit::zeroed();
+    let _ = generated::bpf_probe_read_kernel(
+        v.as_mut_ptr().cast(),
+        core::mem::size_of::<T>() as u32,
+        src.cast(),
+    );
+    v.assume_init()
+}
+
 /// Builds the absolute path of `dentry` under mount `mnt` (a `struct vfsmount *`) into
 /// `buf`, right-to-left, walking parents and stepping over mount points. Returns
 /// `(offset, truncated)`; the path is `buf[offset..PATH_CAP]`.
 ///
 /// Verifier notes: every dereference goes through `bpf_probe_read_kernel`; the write offset
-/// only ever decreases from `PATH_CAP`, and each copy is at most `COMP_CAP` bytes into a
-/// buffer with `PATH_SLACK` spare bytes, so `offset + length` is provably in range.
+/// is masked into `0..PATH_CAP` and each copy is at most `COMP_CAP` bytes into a buffer with
+/// `PATH_SLACK` spare bytes, so `offset + length` is provably in range.
 #[inline(always)]
 unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offsets) -> (u32, u32) {
     let mut off: usize = PATH_CAP;
@@ -319,27 +354,23 @@ unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offset
     let mut i = 0;
     while i < MAX_COMPONENTS {
         i += 1;
-        if dentry.is_null() {
-            break;
-        }
-        let parent: *const u8 = field(dentry, o.dentry_d_parent).unwrap_or(null());
-        if parent.is_null() || parent == dentry {
+        let head: DentryHead = read_or_zero(dentry.add(o.dentry_d_parent as usize));
+        if head.parent == dentry as u64 || head.parent == 0 {
             // Root of this filesystem: continue at its mount point in the parent mount.
-            if mnt.is_null() || o.mount_mnt == UNAVAILABLE {
+            if mnt.is_null() {
                 break;
             }
             let mount = mnt.sub(o.mount_mnt as usize);
-            let up: *const u8 = field(mount, o.mount_mnt_parent).unwrap_or(null());
-            if up.is_null() || up == mount {
+            let m: MountHead = read_or_zero(mount.add(o.mount_mnt_parent as usize));
+            if m.parent == 0 || m.parent == mount as u64 {
                 break; // the namespace root
             }
-            dentry = field(mount, o.mount_mnt_mountpoint).unwrap_or(null());
-            mnt = up.add(o.mount_mnt as usize);
+            dentry = m.mountpoint as *const u8;
+            mnt = (m.parent as *const u8).add(o.mount_mnt as usize);
             continue;
         }
-        let name: *const u8 = field(dentry, o.dentry_d_name + o.qstr_name).unwrap_or(null());
-        let mut len = field::<u32>(dentry, o.dentry_d_name + o.qstr_len).unwrap_or(0) as usize;
-        if name.is_null() || len == 0 {
+        let mut len = head.len as usize;
+        if len == 0 || head.name == 0 {
             break;
         }
         if len > COMP_CAP {
@@ -359,14 +390,14 @@ unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offset
         let _ = generated::bpf_probe_read_kernel(
             buf.add(off + 1).cast(),
             len as u32,
-            name.cast(),
+            (head.name as *const u8).cast(),
         );
-        dentry = parent;
+        dentry = head.parent as *const u8;
     }
     if i >= MAX_COMPONENTS {
         trunc = 1;
     }
-    if off == PATH_CAP && off > 0 {
+    if off == PATH_CAP {
         off -= 1;
         *buf.add(off) = b'/';
     }

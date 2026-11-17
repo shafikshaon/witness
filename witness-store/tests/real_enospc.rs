@@ -19,8 +19,11 @@ use witness_store::{Config, Store, StoreError};
 
 fn small_fs(name: &str) -> PathBuf {
     let base = PathBuf::from(std::env::var("WITNESS_SMALL_FS").expect("set WITNESS_SMALL_FS"));
+    // The mount is tiny: clear what earlier runs left behind.
+    for e in fs::read_dir(&base).unwrap().flatten() {
+        let _ = fs::remove_dir_all(e.path());
+    }
     let d = base.join(format!("{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
 }

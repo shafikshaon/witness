@@ -412,7 +412,7 @@ unsafe fn build_path(
         MAX_COMPONENTS
     };
     let mut off: usize = SCRATCH_LEN;
-    let mut trunc = 0u32;
+    let mut wide = 0u32;
     let mut dentry = dentry;
     let mut mnt = mnt;
 
@@ -437,11 +437,11 @@ unsafe fn build_path(
         if head.len == 0 || head.name == 0 {
             break;
         }
-        let mut len = head.len as usize;
-        if len > COMP_CAP {
-            len = COMP_CAP;
-            trunc = 1;
-        }
+        // NAME_MAX is 255, so masking changes nothing for any real name; it replaces a
+        // clamp branch whose two outcomes would both stay live through every later level.
+        // Oversized-name evidence is OR-ed into `wide` and tested once after the loop.
+        wide |= head.len >> 8;
+        let len = (head.len & 0xff) as usize;
         // Never actually wraps (see above); the mask is for the verifier.
         off = off.wrapping_sub(len + 1) & (SCRATCH_LEN - 1);
         *scratch.add(off) = b'/';
@@ -452,6 +452,7 @@ unsafe fn build_path(
         );
         dentry = head.parent as *const u8;
     }
+    let mut trunc = (wide != 0) as u32;
     if i >= max {
         trunc = 1;
     }

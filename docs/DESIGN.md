@@ -368,6 +368,13 @@ Restating §1.1: root can rewrite everything after seq N and recompute hashes. T
 2. **Anchors.** Every checkpoint (default 60 s, and at every seal/rotation/stop) emit `anchor {seq, head_h}` to: the chain itself, the system journal (`journald` entry with `SYSLOG_IDENTIFIER=witness-anchor`), `/var/lib/witness/anchors.log`, and an optional `anchor_command` hook in config (admin may send it to email/Git/etc.). `witness anchor` prints the current head for manual record-keeping.
 3. **Honest limits.** With sealing, a root attacker can still (a) delete/truncate the *tail after the last anchor/seal not held elsewhere*, (b) delete newest whole segments, (c) stop the daemon (visible as a gap), (d) forge/alter records *after* the compromise time (that's capture integrity, not storage integrity; and it's why the gap/baseline/clock records exist). Without a stored `K_0`, `verify` falls back to chain+anchor consistency only and prints that explicitly.
 
+**Implemented in M2 (as built; supersedes the sketch above where they differ):**
+- `witness init --seal` prints `K_0` once and persists only `K_1` at epoch 1, so `K_0` is never on the host. Epochs start at 1.
+- A `seal` record carries `epoch`, `covers_seq` and `mac = HMAC-SHA256(K_epoch, "witness-seal-v1" || epoch || covers_seq || head_hash)`. The seal is fsynced **before** the key is evolved and the old key is erased, so an epoch is never skipped. If the process dies in between, `enable_sealing` finds the seal in the chain tail and advances the key; a key file *older* than the chain (restored backup) is refused.
+- Epochs must be consecutive, so removing a seal is a `SealEpochGap` even **without** `K_0`; with `K_0`, any rewrite of sealed history is a `BadSealMac`. Records after the last seal are the *unsealed tail* and are reported as such.
+- Anchors: an `anchor` record in the chain plus published `(seq, hash)` of that record to sinks (`anchors.log`, an admin command with the anchor in `WITNESS_ANCHOR_SEQ`/`WITNESS_ANCHOR_HASH`, no shell). Sink failures are returned, never block evidence. `verify` reports `AnchorMismatch`, and an anchor *beyond* the chain head as proof of tail truncation. The journald sink is added with the daemon (M6).
+- Tests demonstrate both the limit and the fix: a consistent rewrite with recomputed hashes passes the bare chain but fails with `K_0`; a clean tail cut passes without anchors and fails with them.
+
 Decision needed from you: include sealing in v1 (my recommendation) or document it as future work.
 
 ### 5.5 SQLite query index (rebuildable)

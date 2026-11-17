@@ -13,6 +13,12 @@ use witness_common::{Offsets, DROP_CLASS_CRITICAL};
 /// The compiled eBPF object (empty placeholder if it was not built; see `build.rs`).
 static OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/witness-ebpf"));
 
+/// SHA-256 of the embedded eBPF object, recorded in `daemon_start`.
+pub fn object_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    witness_store::chain::to_hex(&Sha256::digest(OBJECT).into())
+}
+
 /// `Offsets` made loadable as a global.
 #[repr(transparent)]
 #[derive(Clone, Copy)]

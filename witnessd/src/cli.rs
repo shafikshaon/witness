@@ -1,14 +1,22 @@
 //! Command implementations for the `witnessd` binary (Linux).
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rustix::time::{clock_gettime, ClockId};
+use sha2::{Digest, Sha256};
+use witness_config::Config;
+use witness_store::anchor::{AnchorSink, CommandSink, FileSink};
+use witness_store::index::Index;
 
 use crate::btf::Btf;
 use crate::decode::Decoder;
 use crate::loader::Collector;
+use crate::pipeline::{Pipeline, Settings, SystemClock};
 
 /// Kernel functions the planned hooks attach to (DESIGN.md §2); `doctor` reports which
 /// exist on this kernel.
@@ -79,10 +87,11 @@ pub fn doctor() -> Result<()> {
     Ok(())
 }
 
-/// Ring buffer size for P0 events.
+/// Ring buffer size for P0 events when no config is loaded.
 const RING_CRITICAL_BYTES: u32 = 8 << 20;
 
-pub fn run(seconds: Option<u64>) -> Result<()> {
+/// Captures and prints one JSON event per line; stores nothing.
+pub fn tail(seconds: Option<u64>) -> Result<()> {
     let btf = Btf::from_sys_fs().context("reading kernel BTF")?;
     let offsets = btf.resolve_offsets()?.offsets;
     let mut collector = Collector::start(offsets, RING_CRITICAL_BYTES)?;
@@ -125,4 +134,194 @@ pub fn run(seconds: Option<u64>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    witness_store::chain::to_hex(&<[u8; 32]>::try_from(bytes).unwrap_or([0; 32]))
+}
+
+fn load_config(path: &Path) -> Result<(Config, String)> {
+    if path.exists() {
+        let (cfg, sha) =
+            Config::load(path).with_context(|| format!("loading {}", path.display()))?;
+        Ok((cfg, hex(&sha)))
+    } else {
+        tracing::warn!(path = %path.display(), "no config file; running on defaults");
+        Ok((Config::default(), hex(&Sha256::digest(b""))))
+    }
+}
+
+/// Runs the index in the background: it only reads the segments, never blocks capture, and
+/// can always be rebuilt (`witness reindex`).
+fn spawn_indexer(data_dir: PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let seg_dir = data_dir.join("segments");
+        let mut ix = match Index::open(&data_dir.join("index.db")) {
+            Ok(ix) => ix,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot open the index; search is unavailable");
+                return;
+            }
+        };
+        let mut last_err = Instant::now() - Duration::from_secs(3600);
+        loop {
+            let stopping = stop.load(Ordering::SeqCst);
+            if let Err(e) = ix.catch_up(&seg_dir) {
+                if last_err.elapsed() > Duration::from_secs(30) {
+                    tracing::error!(error = %e, "indexing failed (will retry)");
+                    last_err = Instant::now();
+                }
+            }
+            if stopping {
+                return;
+            }
+            for _ in 0..10 {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    })
+}
+
+/// The daemon: capture into the tamper-evident store until SIGTERM/SIGINT (or `seconds`).
+pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Result<()> {
+    let (cfg, config_sha) = load_config(config)?;
+    let data_dir = data_dir.unwrap_or_else(|| cfg.daemon.data_dir.clone());
+
+    let btf = Btf::from_sys_fs().context("reading kernel BTF")?;
+    let offsets = btf.resolve_offsets()?.offsets;
+
+    let mut sinks: Vec<Box<dyn AnchorSink>> =
+        vec![Box::new(FileSink::new(data_dir.join("anchors.log")))];
+    if let Some(cmd) = &cfg.storage.anchor_command {
+        if let Some((prog, args)) = cmd.split_first() {
+            sinks.push(Box::new(CommandSink::new(prog.clone(), args.to_vec())));
+        }
+    }
+    let settings = Settings {
+        boot_id: boot_id(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        kernel: kernel_release(),
+        btf: true,
+        pid: std::process::id(),
+        config_sha256: config_sha,
+        bpf_object_sha256: crate::loader::object_sha256(),
+        group_commit: Duration::from_millis(cfg.storage.group_commit_ms),
+        anchor_interval: Duration::from_secs(cfg.storage.anchor_interval_secs),
+        seal_interval: Duration::from_secs(cfg.seal.interval_secs),
+        sealing: cfg.seal.enabled,
+    };
+    let boot = settings.boot_id.clone();
+    let mut pipeline = Pipeline::open(
+        &data_dir,
+        cfg.store_config(),
+        sinks,
+        settings,
+        Box::new(SystemClock::default()),
+    )?;
+
+    let mut collector = Collector::start(offsets, cfg.capture.ring_critical_mib << 20)?;
+    tracing::info!(
+        kernel = %kernel_release(),
+        data_dir = %data_dir.display(),
+        "attached; capturing into the tamper-evident store"
+    );
+
+    let term = Arc::new(AtomicBool::new(false));
+    let mut signalled: Option<u8> = None;
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(sig, Arc::clone(&term))?;
+    }
+    let index_stop = Arc::new(AtomicBool::new(false));
+    let indexer = spawn_indexer(data_dir.clone(), Arc::clone(&index_stop));
+
+    let mut decoder = Decoder::new(boot);
+    let resolve = |pid: u32| {
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|p| p.as_os_str().as_bytes().to_vec())
+    };
+    let deadline = seconds.map(|s| Instant::now() + Duration::from_secs(s));
+    let clock = SystemClock::default();
+    let mut last_drops = 0u64;
+    let mut drops_since = crate::pipeline::Clock::boot_ns(&clock);
+    let mut failure: Option<anyhow::Error> = None;
+
+    'main: loop {
+        if term.load(Ordering::SeqCst) {
+            signalled = Some(signal_hook::consts::SIGTERM as u8);
+            break;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        decoder.set_clock_offset(clock_offset_ns());
+        let mut err: Option<anyhow::Error> = None;
+        let polled = collector.poll(Duration::from_millis(250), |rec| {
+            if err.is_some() {
+                return;
+            }
+            match decoder.decode(rec, &resolve) {
+                Ok(ev) => {
+                    if let Err(e) = pipeline.ingest(&ev) {
+                        err = Some(e);
+                    }
+                }
+                Err(e) => tracing::warn!("undecodable record: {e}"),
+            }
+        });
+        if let Err(e) = polled.and_then(|_| err.map_or(Ok(()), Err)) {
+            failure = Some(e);
+            break 'main;
+        }
+        let drops = collector.dropped()?;
+        if drops != last_drops {
+            let now = crate::pipeline::Clock::boot_ns(&clock);
+            tracing::warn!(
+                dropped = drops - last_drops,
+                "kernel ring buffer overflowed"
+            );
+            if let Err(e) = pipeline.kernel_drops(drops - last_drops, drops_since, now) {
+                failure = Some(e);
+                break 'main;
+            }
+            last_drops = drops;
+            drops_since = now;
+        }
+        match pipeline.tick() {
+            Ok(events) => {
+                for e in events {
+                    tracing::warn!(event = ?e, "disk policy");
+                }
+            }
+            Err(e) => {
+                failure = Some(e);
+                break 'main;
+            }
+        }
+    }
+
+    // Detach from the kernel first so nothing new arrives while we finish.
+    drop(collector);
+    let reason = match (&failure, signalled) {
+        (Some(_), _) => "error",
+        (None, Some(_)) => "signal",
+        (None, None) => "finished",
+    };
+    let stats = pipeline.stop(reason, signalled)?;
+    index_stop.store(true, Ordering::SeqCst);
+    let _ = indexer.join();
+    tracing::info!(
+        ingested = stats.ingested,
+        shed = stats.shed,
+        kernel_drops = stats.kernel_drops,
+        "stopped cleanly"
+    );
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }

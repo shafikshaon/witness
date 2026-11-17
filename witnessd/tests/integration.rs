@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! Real-kernel tests: they start `witnessd run` as root, generate activity, and assert on
+//! Real-kernel tests: they start `witnessd tail` as root, generate activity, and assert on
 //! the events the eBPF programs produced. Run privileged (see CLAUDE.md):
 //!
 //! ```sh
@@ -23,7 +23,7 @@ fn capture(seconds: u32, activity: impl FnOnce()) -> (Vec<Value>, u32) {
         "these tests load eBPF: run them with sudo"
     );
     let mut child = Command::new(env!("CARGO_BIN_EXE_witnessd"))
-        .args(["run", "--seconds", &seconds.to_string()])
+        .args(["tail", "--seconds", &seconds.to_string()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

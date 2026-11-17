@@ -12,9 +12,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Capture process activity and print one JSON event per line (M1).
+    /// Run the daemon: capture into the tamper-evident store until SIGTERM/SIGINT.
     Run {
-        /// Stop after this many seconds (default: run until interrupted).
+        #[arg(long, default_value = witness_config::DEFAULT_PATH)]
+        config: std::path::PathBuf,
+        /// Override `daemon.data_dir` from the config.
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
+        /// Stop after this many seconds (default: run until signalled).
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
+    /// Capture and print one JSON event per line, storing nothing (debugging).
+    Tail {
         #[arg(long)]
         seconds: Option<u64>,
     },
@@ -43,7 +53,12 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Doctor => witnessd::cli::doctor(),
-        Cmd::Run { seconds } => witnessd::cli::run(seconds),
+        Cmd::Run {
+            config,
+            data_dir,
+            seconds,
+        } => witnessd::cli::run(&config, data_dir, seconds),
+        Cmd::Tail { seconds } => witnessd::cli::tail(seconds),
     }
 }
 

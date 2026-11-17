@@ -212,6 +212,18 @@ impl Btf {
             .any(|r| r.kind == KIND_FUNC && self.name(r.name_off) == Some(name))
     }
 
+    /// Number of parameters of kernel function `name`, from its BTF prototype. Used to refuse
+    /// a hook whose signature differs from what the program reads (a wrong argument index
+    /// would silently read garbage).
+    pub fn func_param_count(&self, name: &str) -> Option<usize> {
+        let f = self
+            .recs
+            .iter()
+            .find(|r| r.kind == KIND_FUNC && self.name(r.name_off) == Some(name))?;
+        let proto = self.rec(f.size_or_type)?;
+        (proto.kind == KIND_FUNC_PROTO).then_some(proto.vlen as usize)
+    }
+
     /// Names of the requested functions that are missing from BTF.
     pub fn missing_funcs<'a>(&self, names: &[&'a str]) -> Vec<&'a str> {
         let have: std::collections::HashSet<&str> = self
@@ -290,6 +302,24 @@ impl Btf {
             signal_tty: opt("signal_struct", "tty"),
             tty_name: opt("tty_struct", "name"),
             binprm_filename: filename,
+            file_f_path: opt("file", "f_path"),
+            file_f_mode: opt("file", "f_mode"),
+            file_f_flags: opt("file", "f_flags"),
+            path_mnt: opt("path", "mnt"),
+            path_dentry: opt("path", "dentry"),
+            dentry_d_parent: opt("dentry", "d_parent"),
+            dentry_d_name: opt("dentry", "d_name"),
+            dentry_d_inode: opt("dentry", "d_inode"),
+            dentry_d_sb: opt("dentry", "d_sb"),
+            qstr_name: opt("qstr", "name"),
+            qstr_len: opt("qstr", "len"),
+            mount_mnt_parent: opt("mount", "mnt_parent"),
+            mount_mnt_mountpoint: opt("mount", "mnt_mountpoint"),
+            mount_mnt: opt("mount", "mnt"),
+            inode_i_mode: opt("inode", "i_mode"),
+            inode_i_ino: opt("inode", "i_ino"),
+            sb_s_dev: opt("super_block", "s_dev"),
+            sb_s_magic: opt("super_block", "s_magic"),
         };
         Ok(Resolved { offsets, notes })
     }
@@ -444,6 +474,23 @@ mod tests {
             btf.missing_funcs(&["vfs_open", "tcp_v4_connect", "security_path_unlink"]),
             vec!["tcp_v4_connect"]
         );
+    }
+
+    #[test]
+    fn function_parameter_counts() {
+        let mut b = B::new();
+        let int = b.int("int", 4);
+        // proto with 3 params: name_off(0) + type per param
+        let mut extra = Vec::new();
+        for _ in 0..3 {
+            extra.extend_from_slice(&0u32.to_le_bytes());
+            extra.extend_from_slice(&int.to_le_bytes());
+        }
+        let proto = b.push("", KIND_FUNC_PROTO, 3, false, int, &extra);
+        b.push("security_path_mkdir", KIND_FUNC, 0, false, proto, &[]);
+        let btf = Btf::parse(&b.build()).unwrap();
+        assert_eq!(btf.func_param_count("security_path_mkdir"), Some(3));
+        assert_eq!(btf.func_param_count("nope"), None);
     }
 
     #[test]

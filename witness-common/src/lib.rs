@@ -15,6 +15,25 @@ pub mod kind {
     pub const PROC_EXEC: u16 = 1;
     pub const PROC_FORK: u16 = 2;
     pub const PROC_EXIT: u16 = 3;
+    /// One-path file operation ([`super::FileEvent`]).
+    pub const FILE_OP: u16 = 10;
+    /// Two-path file operation: rename, link, symlink ([`super::FileTwoEvent`]).
+    pub const FILE_TWO: u16 = 11;
+}
+
+/// File operations carried in [`FileBody::op`] / [`FileTwoBody::op`].
+pub mod fop {
+    pub const OPEN_WRITE: u32 = 1;
+    pub const CREATE: u32 = 2;
+    pub const MKDIR: u32 = 3;
+    pub const UNLINK: u32 = 4;
+    pub const RMDIR: u32 = 5;
+    pub const CHMOD: u32 = 6;
+    pub const CHOWN: u32 = 7;
+    pub const TRUNCATE: u32 = 8;
+    pub const RENAME: u32 = 20;
+    pub const LINK: u32 = 21;
+    pub const SYMLINK: u32 = 22;
 }
 
 /// Marks an offset the running kernel does not provide (see [`Offsets`]).
@@ -50,6 +69,24 @@ pub struct Offsets {
     pub signal_tty: u32,
     pub tty_name: u32,
     pub binprm_filename: u32,
+    pub file_f_path: u32,
+    pub file_f_mode: u32,
+    pub file_f_flags: u32,
+    pub path_mnt: u32,
+    pub path_dentry: u32,
+    pub dentry_d_parent: u32,
+    pub dentry_d_name: u32,
+    pub dentry_d_inode: u32,
+    pub dentry_d_sb: u32,
+    pub qstr_name: u32,
+    pub qstr_len: u32,
+    pub mount_mnt_parent: u32,
+    pub mount_mnt_mountpoint: u32,
+    pub mount_mnt: u32,
+    pub inode_i_mode: u32,
+    pub inode_i_ino: u32,
+    pub sb_s_dev: u32,
+    pub sb_s_magic: u32,
 }
 
 impl Offsets {
@@ -73,6 +110,24 @@ impl Offsets {
             signal_tty: UNAVAILABLE,
             tty_name: UNAVAILABLE,
             binprm_filename: UNAVAILABLE,
+            file_f_path: UNAVAILABLE,
+            file_f_mode: UNAVAILABLE,
+            file_f_flags: UNAVAILABLE,
+            path_mnt: UNAVAILABLE,
+            path_dentry: UNAVAILABLE,
+            dentry_d_parent: UNAVAILABLE,
+            dentry_d_name: UNAVAILABLE,
+            dentry_d_inode: UNAVAILABLE,
+            dentry_d_sb: UNAVAILABLE,
+            qstr_name: UNAVAILABLE,
+            qstr_len: UNAVAILABLE,
+            mount_mnt_parent: UNAVAILABLE,
+            mount_mnt_mountpoint: UNAVAILABLE,
+            mount_mnt: UNAVAILABLE,
+            inode_i_mode: UNAVAILABLE,
+            inode_i_ino: UNAVAILABLE,
+            sb_s_dev: UNAVAILABLE,
+            sb_s_magic: UNAVAILABLE,
         }
     }
 }
@@ -112,6 +167,143 @@ pub struct ForkBody {
     pub child_start_boot_ns: u64,
     pub flags: u32,
     pub _pad: u32,
+}
+
+/// Longest path recorded; longer ones keep their tail (the leaf end) and set `trunc`.
+pub const PATH_CAP: usize = 1024;
+/// Slack after `PATH_CAP` so a bounded component copy can never run past the buffer; the
+/// verifier needs `offset + length` provably in range.
+pub const PATH_SLACK: usize = 256;
+pub const PATH_BUF: usize = PATH_CAP + PATH_SLACK;
+/// Longest single path component copied.
+pub const COMP_CAP: usize = 255;
+
+/// Body of a [`kind::FILE_OP`] record. The path is built right-to-left, so it occupies
+/// `path[path_off..PATH_CAP]`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileBody {
+    pub op: u32,
+    /// Return value of the security hook (0 = allowed, negative errno = denied).
+    pub result: i32,
+    /// `open` flags for opens; unused otherwise.
+    pub flags: u32,
+    /// Mode: new mode for create/mkdir/chmod.
+    pub mode: u32,
+    /// Previous mode (chmod): lets userspace see a newly set SUID/SGID bit.
+    pub old_mode: u32,
+    pub dev: u32,
+    pub new_uid: u32,
+    pub new_gid: u32,
+    pub ino: u64,
+    pub path_off: u32,
+    /// Non-zero if the path did not fit or the walk was cut short.
+    pub trunc: u32,
+    pub path: [u8; PATH_BUF],
+}
+
+/// Body of a [`kind::FILE_TWO`] record (rename, link, symlink): `old` and `new`, where for a
+/// symlink `new` is the link path and `old` holds the target string.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileTwoBody {
+    pub op: u32,
+    pub result: i32,
+    pub flags: u32,
+    pub dev: u32,
+    pub ino: u64,
+    pub old_off: u32,
+    pub new_off: u32,
+    pub trunc: u32,
+    pub _pad: u32,
+    pub old: [u8; PATH_BUF],
+    pub new: [u8; PATH_BUF],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileEvent {
+    pub hdr: RawHdr,
+    pub body: FileBody,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileTwoEvent {
+    pub hdr: RawHdr,
+    pub body: FileTwoBody,
+}
+
+/// Index of the high-volume ring's drop counter (`DROPS` map).
+pub const DROP_CLASS_VOLUME: u32 = 1;
+
+impl FileBody {
+    pub const SIZE: usize = 48 + PATH_BUF;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut ino = [0u8; 8];
+        ino.copy_from_slice(&b[32..40]);
+        let mut path = [0u8; PATH_BUF];
+        path.copy_from_slice(&b[48..Self::SIZE]);
+        Some(Self {
+            op: u32_at(0),
+            result: u32_at(4) as i32,
+            flags: u32_at(8),
+            mode: u32_at(12),
+            old_mode: u32_at(16),
+            dev: u32_at(20),
+            new_uid: u32_at(24),
+            new_gid: u32_at(28),
+            ino: u64::from_ne_bytes(ino),
+            path_off: u32_at(40),
+            trunc: u32_at(44),
+            path,
+        })
+    }
+
+    /// The recorded path bytes.
+    pub fn path_bytes(&self) -> &[u8] {
+        let off = (self.path_off as usize).min(PATH_CAP);
+        &self.path[off..PATH_CAP]
+    }
+}
+
+impl FileTwoBody {
+    pub const SIZE: usize = 40 + 2 * PATH_BUF;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut ino = [0u8; 8];
+        ino.copy_from_slice(&b[16..24]);
+        let mut old = [0u8; PATH_BUF];
+        old.copy_from_slice(&b[40..40 + PATH_BUF]);
+        let mut new = [0u8; PATH_BUF];
+        new.copy_from_slice(&b[40 + PATH_BUF..Self::SIZE]);
+        Some(Self {
+            op: u32_at(0),
+            result: u32_at(4) as i32,
+            flags: u32_at(8),
+            dev: u32_at(12),
+            ino: u64::from_ne_bytes(ino),
+            old_off: u32_at(24),
+            new_off: u32_at(28),
+            trunc: u32_at(32),
+            _pad: 0,
+            old,
+            new,
+        })
+    }
+
+    pub fn old_bytes(&self) -> &[u8] {
+        &self.old[(self.old_off as usize).min(PATH_CAP)..PATH_CAP]
+    }
+
+    pub fn new_bytes(&self) -> &[u8] {
+        &self.new[(self.new_off as usize).min(PATH_CAP)..PATH_CAP]
+    }
 }
 
 /// A complete exec record as written into the ring buffer.
@@ -206,7 +398,13 @@ impl ForkBody {
 const _: () = assert!(core::mem::size_of::<ExecBody>() == ExecBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ExitBody>() == ExitBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ForkBody>() == ForkBody::SIZE);
-const _: () = assert!(core::mem::size_of::<Offsets>() == 18 * 4);
+const _: () = assert!(core::mem::size_of::<Offsets>() == 36 * 4);
+const _: () = assert!(core::mem::size_of::<FileBody>() == FileBody::SIZE);
+const _: () = assert!(core::mem::size_of::<FileTwoBody>() == FileTwoBody::SIZE);
+const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBody::SIZE);
+const _: () = assert!(core::mem::size_of::<FileTwoEvent>() == RawHdr::SIZE + FileTwoBody::SIZE);
+const _: () = assert!(FileBody::SIZE % 8 == 0 && FileTwoBody::SIZE % 8 == 0);
+const _: () = assert!(PATH_CAP.is_power_of_two());
 const _: () = assert!(core::mem::size_of::<ExecEvent>() == RawHdr::SIZE + ExecBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ExitEvent>() == RawHdr::SIZE + ExitBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ForkEvent>() == RawHdr::SIZE + ForkBody::SIZE);

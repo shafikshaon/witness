@@ -14,7 +14,7 @@ Every technical claim carries a confidence tag. I could not run anything on a Li
 | ❓ | I am unsure. Treated as an open item; a spike is planned. |
 
 Verified this session (✅):
-- `aya` latest on docs.rs is **0.14.0**; an `aya-build` crate exists (build-script helper).
+- ~~`aya` latest is 0.14.0~~ — **superseded at M1**: crates.io actually had `aya` **0.16.0**, `aya-ebpf` 0.3.0, `aya-log` 0.4.0 (the web search had returned a stale page). M1 uses `aya` 0.16.0 + `aya-ebpf` 0.3.0.
 - Dioxus **0.7.x** is the current stable line (docs.rs showed `dioxus 0.7.9` and `dioxus-desktop 0.7.10`); `0.8.0-alpha.1` exists and is a pre-release. Desktop uses `wry` with the system webview (`os-webview`).
 - Search results did **not** confirm exact crates.io latest patch numbers, WebKitGTK package names, or `aya-ebpf` versions. Those are ❓ until M1.
 
@@ -119,6 +119,25 @@ Not captured: AF_UNIX, raw/packet sockets, ICMP, SCTP.
 Each source (every eBPF program group, each ring buffer, fanotify, D-Bus, journald, uevent, audit) reports `Active | Degraded(reason) | Unavailable(reason) | Disabled` and per-source counters (events, drops, last event time). Reported at startup (`witnessd doctor`), stored as `source_health` events on change, and shown in the GUI.
 
 ---
+
+### 2.6 M1 as built and verified (Ubuntu 22.04, kernel 5.15.0-198-generic, aarch64)
+
+**Spike A — CO-RE from Rust (resolved).** `aya`'s loader (`aya-obj`) implements CO-RE relocations and `bpf-linker` knows the LLVM `preserve_access_index` intrinsics, but `aya-ebpf` 0.3.0 offers Rust code **no way to emit a field access that carries a relocation** (no macro or helper), and `aya-obj` keeps BTF struct members private. So the design's fallback is what ships: `witnessd/src/btf.rs` parses `/sys/kernel/btf/vmlinux` itself and resolves 18 `(struct, field)` offsets (recursing into anonymous structs/unions, rejecting bitfields), passed to the programs as the read-only `OFFSETS` global; programs read with `bpf_probe_read_kernel`. All 18 resolved on this kernel with no gaps. Required fields missing → startup error; optional ones (`loginuid`, `sessionid`, `signal.tty`, `tty.name`) degrade individually.
+
+**Spike B — `fentry`/`fexit` targets (resolved for this kernel).** `witnessd doctor` checks BTF for every planned target. On 5.15.0-198 **all 22 exist**: `commit_creds`, `security_file_open`, `security_file_free`, `security_path_{mknod,mkdir,unlink,rmdir,rename,chmod,chown,link,symlink,truncate}`, `tcp_v4_connect`, `tcp_v6_connect`, `inet_csk_accept`, `tcp_{send,recv}msg`, `udp{,v6}_{send,recv}msg`. Not yet checked: other kernels/arch (Debian 12, Ubuntu 24.04, Fedora, x86_64) — `doctor` is the tool for that.
+
+**Programs (`witness-ebpf`):** `tp_btf` on `sched_process_exec`, `sched_process_fork`, `sched_process_exit`, writing fixed-size records into a P0 ring buffer; drops are counted in a per-CPU `DROPS` map and surfaced as a warning (not yet stored as a `capture_drop` event). The verifier accepted all three on the first load. Self-exclusion by `SELF_TGID`.
+
+**Build.** `witness-ebpf` is its own cargo workspace and is compiled by `witnessd/build.rs` with a pinned nightly (`nightly-2026-11-17`, `-Z build-std=core`, `bpf-linker` 0.13.0) and embedded with `include_bytes_aligned!`. `aya-build` was *not* used: it requires the eBPF crate to be a member of the main workspace, which would make `cargo clippy --workspace` try to build a `no_std` BPF binary for the host. Off Linux or with `WITNESS_SKIP_EBPF=1` an empty placeholder is embedded.
+
+**Verified on the real kernel** (`witnessd/tests/integration.rs`, root-only, `--ignored`): fork → exec → exit are linked by one process identity (`puid`) and ordered by kernel time; exit codes and death-by-signal; an 8 KB argument is truncated and flagged; the daemon's own processes are excluded; a burst of 500 execs loses none.
+
+**Known gaps (M1, to be closed):**
+- `argv` is capped at 3 KiB in a single record (flagged `argv_truncated`); the designed 64 KiB chunked records are not built yet.
+- `exe` is resolved by `readlink /proc/<pid>/exe` right after the event and falls back to the as-passed filename; this can race with a very short-lived process. A kernel-side dentry walk arrives with the file hooks (M3).
+- `exit` is emitted for the thread-group **leader** only; a multithreaded process whose leader exits first is reported at leader exit.
+- `fork` events carry no parent `comm`; `cwd`, environment and `stdio` kinds are not captured yet.
+- Wall-clock time uses one offset sample per poll cycle, not the 100 ms sampling in §3.4.
 
 ## 3. Kernel side and daemon internals
 

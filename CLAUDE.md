@@ -11,8 +11,9 @@ Linux forensic activity monitor. Authoritative design: `docs/DESIGN.md` (approve
 ## Commands
 - Userspace build/test (stable): `cargo build --workspace --exclude witness-ebpf` / `cargo test --workspace --exclude witness-ebpf --all-features`
 - Lint: `cargo fmt --all --check` and `cargo clippy --workspace --exclude witness-ebpf --all-targets --all-features -- -D warnings`
-- eBPF object (nightly, Linux): `cargo xtask build-ebpf` (output is embedded into `witnessd` via `include_bytes!`)
-- Privileged integration tests (Linux VM, root only): `sudo -E cargo test -p witnessd --test integration -- --ignored`
+- eBPF object: built automatically by `witnessd/build.rs` on Linux (needs `rustup` nightly `nightly-2026-11-17` with `rust-src`, and `bpf-linker` on PATH). Skip with `WITNESS_SKIP_EBPF=1` (e.g. on macOS or for clippy).
+- Privileged integration tests (Linux VM, root only): build as the normal user, run the binary with sudo: `T=$(cargo test -p witnessd --test integration --no-run 2>&1 | sed -n 's/.*(\(target[^)]*\)).*/\1/p' | head -1); sudo $T --ignored --test-threads=1 --nocapture`
+- Kernel capability check: `target/debug/witnessd doctor` (BTF, resolved offsets, which `fentry` targets exist).
 - Never run eBPF code on macOS; it only compiles there at best. Always state *compiled only* vs *verified on a real kernel*.
 
 ## Conventions

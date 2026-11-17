@@ -10,8 +10,8 @@ use core::ptr::{addr_of_mut, null, read_volatile};
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_ktime_get_boot_ns, bpf_probe_read_kernel,
+        bpf_get_current_cgroup_id, bpf_get_current_pid_tgid,
+        bpf_get_current_uid_gid, bpf_ktime_get_boot_ns,
         bpf_probe_read_kernel_str_bytes, generated,
     },
     macros::{btf_tracepoint, fexit, kprobe, map},

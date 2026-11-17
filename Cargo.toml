@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["witness-common"]
+members = ["witness-common", "witness-store"]
 # witness-ebpf is a separate workspace (nightly, bpfel-unknown-none); see docs/DESIGN.md §1.2.
 
 [workspace.package]

@@ -17,9 +17,9 @@ use witness_store::store::Append;
 use witness_store::verify::verify_dir;
 use witness_store::{Config, Store, StoreError};
 
-fn small_fs() -> PathBuf {
+fn small_fs(name: &str) -> PathBuf {
     let base = PathBuf::from(std::env::var("WITNESS_SMALL_FS").expect("set WITNESS_SMALL_FS"));
-    let d = base.join(format!("t{}", std::process::id()));
+    let d = base.join(format!("{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
@@ -58,7 +58,7 @@ fn open(root: &std::path::Path, p: DiskPolicy) -> Store {
 #[test]
 #[ignore = "needs WITNESS_SMALL_FS pointing at a ~1 MiB filesystem"]
 fn shed_mode_survives_a_really_full_disk() {
-    let root = small_fs();
+    let root = small_fs("shed");
     let filler = root.join("filler.bin");
     let mut s = open(&root, policy(OnFull::Shed));
     assert!(
@@ -115,7 +115,7 @@ fn shed_mode_survives_a_really_full_disk() {
 #[test]
 #[ignore = "needs WITNESS_SMALL_FS pointing at a ~1 MiB filesystem"]
 fn stop_mode_records_a_gap_on_a_really_full_disk() {
-    let root = small_fs();
+    let root = small_fs("stop");
     let filler = root.join("filler.bin");
     let mut s = open(&root, policy(OnFull::Stop));
     fs::write(&filler, vec![0u8; 600 * 1024]).unwrap();

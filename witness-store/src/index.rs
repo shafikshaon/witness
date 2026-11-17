@@ -251,25 +251,8 @@ impl Index {
             .into_iter()
             .find(|s| s.id == id as u64)
             .ok_or_else(|| StoreError::Corrupt(format!("segment {id} is missing")))?;
-        read_range(&seg, off as u64, len as usize)
+        segment::read_range(&seg, off as u64, len as usize)
     }
-}
-
-fn read_range(seg: &SegmentInfo, off: u64, len: usize) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    if !seg.compressed {
-        let mut f = std::fs::File::open(&seg.path)?;
-        f.seek(SeekFrom::Start(off))?;
-        let mut out = vec![0u8; len];
-        f.read_exact(&mut out)?;
-        return Ok(out);
-    }
-    // Compressed segments: sequential decode (a frame offset table is a later optimization).
-    let mut r = segment::open_reader(seg)?;
-    std::io::copy(&mut (&mut r).take(off), &mut std::io::sink())?;
-    let mut out = vec![0u8; len];
-    r.read_exact(&mut out)?;
-    Ok(out)
 }
 
 fn save_position(tx: &rusqlite::Transaction<'_>, seq: u64, head: &Hash) -> Result<()> {

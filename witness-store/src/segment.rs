@@ -107,15 +107,26 @@ pub fn compress_segment(info: &SegmentInfo) -> Result<SegmentInfo> {
     let mut src = File::open(&info.path)?;
     let mut out = File::create(&tmp)?;
     let mut buf = vec![0u8; FRAME_BYTES];
-    loop {
-        let n = read_full(&mut src, &mut buf)?;
-        if n == 0 {
-            break;
+    let mut frames: Vec<(u64, u64)> = Vec::new();
+    let mut pos = 0u64;
+    let packed_result: io::Result<()> = (|| {
+        loop {
+            let n = read_full(&mut src, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let enc = zstd::encode_all(&buf[..n], ZST_LEVEL)?;
+            out.write_all(&enc)?;
+            frames.push((pos, enc.len() as u64));
+            pos += enc.len() as u64;
         }
-        out.write_all(&zstd::encode_all(&buf[..n], ZST_LEVEL)?)?;
-    }
-    out.sync_all()?;
+        out.sync_all()
+    })();
     drop(out);
+    if let Err(e) = packed_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
 
     let packed = SegmentInfo {
         compressed: true,
@@ -129,6 +140,8 @@ pub fn compress_segment(info: &SegmentInfo) -> Result<SegmentInfo> {
         ));
     }
     fs::rename(&tmp, &dest)?;
+    // The frame table is derived data: failing to write it only costs speed later.
+    let _ = write_fidx(&dest, &frames);
     sync_dir(dir)?;
     fs::remove_file(&info.path)?;
     sync_dir(dir)?;
@@ -137,6 +150,88 @@ pub fn compress_segment(info: &SegmentInfo) -> Result<SegmentInfo> {
         compressed: true,
         ..info.clone()
     })
+}
+
+/// Path of the frame-offset sidecar for a compressed segment.
+pub fn fidx_path(zst: &Path) -> PathBuf {
+    let mut s = zst.as_os_str().to_owned();
+    s.push(".fidx");
+    PathBuf::from(s)
+}
+
+fn write_fidx(zst: &Path, frames: &[(u64, u64)]) -> io::Result<()> {
+    let mut text = String::new();
+    for (off, len) in frames {
+        text.push_str(&format!("{off} {len}\n"));
+    }
+    fs::write(fidx_path(zst), text)
+}
+
+fn read_fidx(zst: &Path) -> Option<Vec<(u64, u64)>> {
+    let text = fs::read_to_string(fidx_path(zst)).ok()?;
+    text.lines()
+        .map(|l| {
+            let (a, b) = l.split_once(' ')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Rebuilds the frame table by walking the zstd frame headers.
+fn scan_frames(zst: &Path) -> io::Result<Vec<(u64, u64)>> {
+    let data = fs::read(zst)?;
+    let mut frames = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let size = zstd::zstd_safe::find_frame_compressed_size(&data[pos..])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad zstd frame"))?;
+        frames.push((pos as u64, size as u64));
+        pos += size;
+    }
+    Ok(frames)
+}
+
+/// Reads `len` bytes at uncompressed offset `off` without decoding the whole segment.
+/// Uses the `.fidx` frame table, rebuilding it (and caching it) if it is missing.
+pub fn read_range(info: &SegmentInfo, off: u64, len: usize) -> Result<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if !info.compressed {
+        let mut f = File::open(&info.path)?;
+        f.seek(SeekFrom::Start(off))?;
+        let mut out = vec![0u8; len];
+        f.read_exact(&mut out)?;
+        return Ok(out);
+    }
+    let frames = match read_fidx(&info.path) {
+        Some(f) => f,
+        None => {
+            let f = scan_frames(&info.path)?;
+            let _ = write_fidx(&info.path, &f);
+            f
+        }
+    };
+    let frame = FRAME_BYTES as u64;
+    let (first, last) = (off / frame, (off + len as u64 - 1) / frame);
+    let mut file = File::open(&info.path)?;
+    let mut plain = Vec::new();
+    for k in first..=last {
+        let (co, cl) = frames
+            .get(k as usize)
+            .copied()
+            .ok_or_else(|| StoreError::Corrupt("offset is beyond the segment".into()))?;
+        file.seek(SeekFrom::Start(co))?;
+        let mut comp = vec![0u8; cl as usize];
+        file.read_exact(&mut comp)?;
+        plain.extend_from_slice(&zstd::decode_all(&comp[..])?);
+    }
+    let start = (off - first * frame) as usize;
+    plain
+        .get(start..start + len)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| StoreError::Corrupt("offset is beyond the segment".into()))
 }
 
 fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {

@@ -60,13 +60,34 @@ fn offsets() -> Offsets {
     unsafe { read_volatile(&OFFSETS) }
 }
 
-/// Reads a `T` at `base + off`, or `None` if the offset is unavailable or the read fails.
+/// Reads a `T` at `base + off`; `default` if the read fails.
+///
+/// Deliberately **branch-free**: `default` is stored first and the helper overwrites it on
+/// success, and nothing tests the helper's result. A conditional here would leave two live
+/// outcomes (read, or default) per call whose register values differ, so the verifier could
+/// never merge them; a dozen reads in a row would multiply into thousands of distinct paths,
+/// each re-verifying all the code after it. An unavailable offset (`UNAVAILABLE`) just makes
+/// the read fault harmlessly and yield `default`.
 #[inline(always)]
-unsafe fn field<T>(base: *const u8, off: u32) -> Option<T> {
-    if base.is_null() || off == UNAVAILABLE {
-        return None;
+unsafe fn rd_or<T: Copy>(base: *const u8, off: u32, default: T) -> T {
+    let mut v = default;
+    let _ = generated::bpf_probe_read_kernel(
+        (&mut v as *mut T).cast(),
+        core::mem::size_of::<T>() as u32,
+        base.wrapping_add(off as usize).cast(),
+    );
+    v
+}
+
+/// `comm` of the current task; zeros on failure (no branch on the helper's result).
+#[inline(always)]
+fn comm_or_zero() -> [u8; 16] {
+    let mut c = [0u8; 16];
+    // SAFETY: `c` is a valid 16-byte buffer for the helper to fill.
+    unsafe {
+        let _ = generated::bpf_get_current_comm(c.as_mut_ptr().cast(), 16);
     }
-    bpf_probe_read_kernel::<T>(base.add(off as usize).cast()).ok()
+    c
 }
 
 #[inline(always)]
@@ -92,9 +113,9 @@ unsafe fn fill_hdr(h: *mut RawHdr, kind: u16, len: usize, task: *const u8, o: &O
     let uid = uid_gid as u32;
     let gid = (uid_gid >> 32) as u32;
 
-    let parent: *const u8 = field(task, o.task_real_parent).unwrap_or(null());
-    let cred: *const u8 = field(task, o.task_cred).unwrap_or(null());
-    let leader: *const u8 = field(task, o.task_group_leader).unwrap_or(null());
+    let parent: *const u8 = rd_or(task, o.task_real_parent, null());
+    let cred: *const u8 = rd_or(task, o.task_cred, null());
+    let leader: *const u8 = rd_or(task, o.task_group_leader, null());
 
     (*h).kind = kind;
     (*h).flags = 0;
@@ -102,16 +123,16 @@ unsafe fn fill_hdr(h: *mut RawHdr, kind: u16, len: usize, task: *const u8, o: &O
     (*h).boot_ns = bpf_ktime_get_boot_ns();
     (*h).pid = (pid_tgid >> 32) as u32;
     (*h).tid = pid_tgid as u32;
-    (*h).ppid = field::<u32>(parent, o.task_tgid).unwrap_or(0);
+    (*h).ppid = rd_or::<u32>(parent, o.task_tgid, 0);
     (*h)._pad0 = 0;
     (*h).uid = uid;
     (*h).gid = gid;
-    (*h).euid = field::<u32>(cred, o.cred_euid).unwrap_or(uid);
-    (*h).egid = field::<u32>(cred, o.cred_egid).unwrap_or(gid);
-    (*h).auid = field::<u32>(task, o.task_loginuid).unwrap_or(u32::MAX);
-    (*h).ses = field::<u32>(task, o.task_sessionid).unwrap_or(u32::MAX);
+    (*h).euid = rd_or::<u32>(cred, o.cred_euid, uid);
+    (*h).egid = rd_or::<u32>(cred, o.cred_egid, gid);
+    (*h).auid = rd_or::<u32>(task, o.task_loginuid, u32::MAX);
+    (*h).ses = rd_or::<u32>(task, o.task_sessionid, u32::MAX);
     (*h).cgroup_id = bpf_get_current_cgroup_id();
-    (*h).start_boot_ns = field::<u64>(leader, o.task_start_boottime).unwrap_or(0);
+    (*h).start_boot_ns = rd_or::<u64>(leader, o.task_start_boottime, 0);
 }
 
 #[btf_tracepoint(function = "sched_process_exec")]
@@ -144,10 +165,10 @@ unsafe fn try_exec(ctx: &BtfTracePointContext) -> Result<(), ()> {
     );
 
     let body = addr_of_mut!((*ev).body);
-    (*body).comm = bpf_get_current_comm().unwrap_or([0; 16]);
+    (*body).comm = comm_or_zero();
 
     // Program path as passed to execve (resolved path comes from userspace for now).
-    let fname: *const u8 = field(bprm, o.binprm_filename).unwrap_or(null());
+    let fname: *const u8 = rd_or(bprm, o.binprm_filename, null());
     (*body).filename_len = 0;
     if !fname.is_null() {
         let dst = core::slice::from_raw_parts_mut(
@@ -161,8 +182,8 @@ unsafe fn try_exec(ctx: &BtfTracePointContext) -> Result<(), ()> {
 
     // Controlling terminal: task->signal->tty->name.
     (*body).tty_len = 0;
-    let signal: *const u8 = field(task, o.task_signal).unwrap_or(null());
-    let tty: *const u8 = field(signal, o.signal_tty).unwrap_or(null());
+    let signal: *const u8 = rd_or(task, o.task_signal, null());
+    let tty: *const u8 = rd_or(signal, o.signal_tty, null());
     if !tty.is_null() && o.tty_name != UNAVAILABLE {
         let dst =
             core::slice::from_raw_parts_mut(addr_of_mut!((*body).tty).cast::<u8>(), TTY_LEN);
@@ -174,9 +195,9 @@ unsafe fn try_exec(ctx: &BtfTracePointContext) -> Result<(), ()> {
     // Arguments: the new mm's [arg_start, arg_end) holds NUL-separated argv.
     (*body).argv_len = 0;
     (*body).argv_total = 0;
-    let mm: *const u8 = field(task, o.task_mm).unwrap_or(null());
-    let start: u64 = field(mm, o.mm_arg_start).unwrap_or(0);
-    let end: u64 = field(mm, o.mm_arg_end).unwrap_or(0);
+    let mm: *const u8 = rd_or(task, o.task_mm, null());
+    let start: u64 = rd_or(mm, o.mm_arg_start, 0);
+    let end: u64 = rd_or(mm, o.mm_arg_end, 0);
     if end > start {
         let total = end - start;
         let mut n = total;
@@ -230,9 +251,9 @@ unsafe fn try_exit(ctx: &BtfTracePointContext) -> Result<(), ()> {
         task,
         &o,
     );
-    (*ev).body.exit_code = field::<i32>(task, o.task_exit_code).unwrap_or(0);
+    (*ev).body.exit_code = rd_or::<i32>(task, o.task_exit_code, 0);
     (*ev).body.flags = 0;
-    (*ev).body.comm = bpf_get_current_comm().unwrap_or([0; 16]);
+    (*ev).body.comm = comm_or_zero();
     entry.submit(0);
     Ok(())
 }
@@ -252,7 +273,7 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) -> Result<(), ()> {
     let parent: *const u8 = ctx.arg(0);
     let child: *const u8 = ctx.arg(1);
     let o = offsets();
-    let child_tgid = field::<u32>(child, o.task_tgid).unwrap_or(0);
+    let child_tgid = rd_or::<u32>(child, o.task_tgid, 0);
     // New threads are counted elsewhere, not stored (DESIGN.md §2.1).
     if child_tgid == (bpf_get_current_pid_tgid() >> 32) as u32 {
         return Ok(());
@@ -269,9 +290,9 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) -> Result<(), ()> {
         parent,
         &o,
     );
-    (*ev).body.child_pid = field::<u32>(child, o.task_pid).unwrap_or(0);
+    (*ev).body.child_pid = rd_or::<u32>(child, o.task_pid, 0);
     (*ev).body.child_tgid = child_tgid;
-    (*ev).body.child_start_boot_ns = field::<u64>(child, o.task_start_boottime).unwrap_or(0);
+    (*ev).body.child_start_boot_ns = rd_or::<u64>(child, o.task_start_boottime, 0);
     (*ev).body.flags = if child_tgid == 0 { FORK_THREAD } else { 0 };
     (*ev).body._pad = 0;
     entry.submit(0);
@@ -452,16 +473,16 @@ unsafe fn build_path(
     (n as u32, trunc)
 }
 
-/// True if the file's filesystem should be ignored; also returns `(dev, ino, i_mode)`.
+/// `(noisy filesystem, dev, ino, i_mode)` for a dentry; zeros if a read fails.
 #[inline(always)]
-unsafe fn file_identity(dentry: *const u8, o: &Offsets) -> Option<(bool, u32, u64, u32)> {
-    let inode: *const u8 = field(dentry, o.dentry_d_inode)?;
-    let sb: *const u8 = field(dentry, o.dentry_d_sb)?;
-    let magic: u64 = field(sb, o.sb_s_magic)?;
-    let dev: u32 = field(sb, o.sb_s_dev).unwrap_or(0);
-    let ino: u64 = field(inode, o.inode_i_ino).unwrap_or(0);
-    let mode: u16 = field(inode, o.inode_i_mode).unwrap_or(0);
-    Some((noisy_fs(magic), dev, ino, mode as u32))
+unsafe fn file_identity(dentry: *const u8, o: &Offsets) -> (bool, u32, u64, u32) {
+    let inode: *const u8 = rd_or(dentry, o.dentry_d_inode, null());
+    let sb: *const u8 = rd_or(dentry, o.dentry_d_sb, null());
+    let magic: u64 = rd_or(sb, o.sb_s_magic, 0);
+    let dev: u32 = rd_or(sb, o.sb_s_dev, 0);
+    let ino: u64 = rd_or(inode, o.inode_i_ino, 0);
+    let mode: u16 = rd_or(inode, o.inode_i_mode, 0);
+    (noisy_fs(magic), dev, ino, mode as u32)
 }
 
 /// Emits a one-path file operation. `old_mode` is read from the inode when the caller
@@ -482,9 +503,7 @@ unsafe fn emit_file(
         return;
     }
     let o = offsets();
-    let Some((noisy, dev, ino, cur_mode)) = file_identity(dentry, &o) else {
-        return;
-    };
+    let (noisy, dev, ino, cur_mode) = file_identity(dentry, &o);
     if noisy {
         return;
     }
@@ -543,9 +562,7 @@ unsafe fn emit_two(
         return;
     }
     let o = offsets();
-    let Some((noisy, dev, ino, _)) = file_identity(new_dentry, &o) else {
-        return;
-    };
+    let (noisy, dev, ino, _) = file_identity(new_dentry, &o);
     if noisy {
         return;
     }
@@ -608,8 +625,8 @@ unsafe fn emit_two(
 #[inline(always)]
 unsafe fn path_parts(path: *const u8, o: &Offsets) -> (*const u8, *const u8) {
     (
-        field(path, o.path_mnt).unwrap_or(null()),
-        field(path, o.path_dentry).unwrap_or(null()),
+        rd_or(path, o.path_mnt, null()),
+        rd_or(path, o.path_dentry, null()),
     )
 }
 
@@ -621,20 +638,18 @@ pub fn file_open(ctx: FExitContext) -> i32 {
         let file: *const u8 = ctx.arg(0);
         let ret: i32 = ctx.arg(1);
         let o = offsets();
-        let mode: u32 = field(file, o.file_f_mode).unwrap_or(0);
+        let mode: u32 = rd_or(file, o.file_f_mode, 0);
         if mode & FMODE_WRITE == 0 {
             return 0;
         }
-        let flags: u32 = field(file, o.file_f_flags).unwrap_or(0);
+        let flags: u32 = rd_or(file, o.file_f_flags, 0);
         let fpath = file.add(o.file_f_path as usize);
         let (mnt, dentry) = path_parts(fpath, &o);
         if dentry.is_null() {
             return 0;
         }
         // Regular files only: directories, devices and sockets are not file writes.
-        let Some((_, _, _, imode)) = file_identity(dentry, &o) else {
-            return 0;
-        };
+        let (_, _, _, imode) = file_identity(dentry, &o);
         if imode & S_IFMT != S_IFREG {
             return 0;
         }

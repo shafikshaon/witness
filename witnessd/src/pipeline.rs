@@ -7,8 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use witness_common::schema::{
-    Body, CaptureDrop, CaptureGap, DaemonStart, DaemonStop, Event, Priority as EvPriority,
-    Recovery, Source, SCHEMA_VERSION,
+    Body, CaptureDrop, CaptureGap, DaemonStart, DaemonStop, Event, Recovery, Source, SCHEMA_VERSION,
 };
 use witness_store::anchor::AnchorSink;
 use witness_store::disk::Priority;
@@ -137,12 +136,13 @@ pub struct Pipeline {
     pub stats: Stats,
 }
 
-fn disk_priority(p: EvPriority) -> Priority {
+/// The event's own priority (set by the decoder, possibly lowered by the file policy).
+fn priority_of(p: u8) -> Priority {
     match p {
-        EvPriority::P0 => Priority::P0,
-        EvPriority::P1 => Priority::P1,
-        EvPriority::P2 => Priority::P2,
-        EvPriority::P3 => Priority::P3,
+        0 => Priority::P0,
+        1 => Priority::P1,
+        2 => Priority::P2,
+        _ => Priority::P3,
     }
 }
 
@@ -279,7 +279,7 @@ impl Pipeline {
         let fields = ev.to_fields()?;
         match self
             .store
-            .append_prio(disk_priority(ev.body.priority()), fields)
+            .append_prio(priority_of(ev.prio), fields)
             .context("storing an event")?
         {
             Append::Written(_) => self.dirty = true,

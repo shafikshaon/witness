@@ -1,10 +1,29 @@
 //! Turns raw ring-buffer records from the kernel programs into schema [`Event`]s.
 
+use std::collections::HashMap;
+
 use witness_common::schema::{
-    puid, Actor, Body, Event, OsBytes, Priority, ProcExec, ProcExit, ProcFork, Source,
-    SCHEMA_VERSION,
+    puid, Actor, AttrOp, Body, Event, FileAttr, FileLink, FileOp, FileRename, HookResult, LinkKind,
+    OsBytes, Priority, ProcExec, ProcExit, ProcFork, Source, SCHEMA_VERSION,
 };
-use witness_common::{flags, kind, ExecBody, ExitBody, ForkBody, RawHdr};
+use witness_common::{
+    flags, fop, kind, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody, RawHdr,
+};
+
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
+const S_IFDIR: u32 = 0o040000;
+/// Processes remembered for attributing later events; cleared wholesale if exceeded.
+const PROC_TABLE_CAP: usize = 200_000;
+
+/// What we know about a running process, for enriching events that only carry its identity.
+#[derive(Clone)]
+struct ProcInfo {
+    comm: String,
+    exe: Option<OsBytes>,
+    cmdline: Option<Vec<OsBytes>>,
+    tty: Option<String>,
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DecodeError {
@@ -14,11 +33,100 @@ pub enum DecodeError {
     UnknownKind(u16),
 }
 
+fn hook_result(r: i32) -> HookResult {
+    if r == 0 {
+        HookResult::Allowed
+    } else {
+        HookResult::Denied
+    }
+}
+
+fn file_op(b: &FileBody, mode: Option<u32>, flags: Option<u32>) -> FileOp {
+    FileOp {
+        path: OsBytes(b.path_bytes().to_vec()),
+        path_resolved: true,
+        path_truncated: b.trunc != 0,
+        dev: u64::from(b.dev),
+        ino: b.ino,
+        mode,
+        flags,
+        result: hook_result(b.result),
+    }
+}
+
+fn file_body(b: &FileBody) -> Body {
+    match b.op {
+        fop::OPEN_WRITE => Body::FileOpenWrite(file_op(b, None, Some(b.flags))),
+        fop::CREATE => Body::FileCreate(file_op(b, Some(b.mode), None)),
+        fop::MKDIR => Body::FileCreate(file_op(b, Some(b.mode | S_IFDIR), None)),
+        fop::UNLINK => Body::FileDelete(file_op(b, None, None)),
+        fop::RMDIR => Body::FileDelete(file_op(b, Some(S_IFDIR), None)),
+        fop::TRUNCATE => Body::FileTruncate(file_op(b, None, None)),
+        fop::CHMOD => {
+            let (old, new) = (b.old_mode & 0o7777, b.mode & 0o7777);
+            Body::FileAttr(FileAttr {
+                op: AttrOp::Chmod,
+                path: OsBytes(b.path_bytes().to_vec()),
+                old_mode: Some(old),
+                new_mode: Some(new),
+                new_uid: None,
+                new_gid: None,
+                suid_set: new & S_ISUID != 0 && old & S_ISUID == 0,
+                sgid_set: new & S_ISGID != 0 && old & S_ISGID == 0,
+                result: hook_result(b.result),
+            })
+        }
+        fop::CHOWN => Body::FileAttr(FileAttr {
+            op: AttrOp::Chown,
+            path: OsBytes(b.path_bytes().to_vec()),
+            old_mode: Some(b.old_mode & 0o7777),
+            new_mode: None,
+            // (uid_t)-1 means "leave unchanged"
+            new_uid: (b.new_uid != u32::MAX).then_some(b.new_uid),
+            new_gid: (b.new_gid != u32::MAX).then_some(b.new_gid),
+            suid_set: false,
+            sgid_set: false,
+            result: hook_result(b.result),
+        }),
+        // Unknown operation from a newer kernel program: keep it visible rather than dropping it.
+        _ => Body::FileTruncate(file_op(b, None, Some(b.op))),
+    }
+}
+
+fn file_two_body(b: &FileTwoBody) -> Body {
+    match b.op {
+        fop::RENAME => Body::FileRename(FileRename {
+            old: OsBytes(b.old_bytes().to_vec()),
+            new: OsBytes(b.new_bytes().to_vec()),
+            dev: u64::from(b.dev),
+            ino: b.ino,
+            result: hook_result(b.result),
+        }),
+        fop::LINK => Body::FileLink(FileLink {
+            kind: LinkKind::Hard,
+            path: OsBytes(b.new_bytes().to_vec()),
+            target: OsBytes(b.old_bytes().to_vec()),
+            result: hook_result(b.result),
+        }),
+        _ => {
+            // Symlink: the target is a NUL-terminated string at the start of `old`.
+            let end = b.old.iter().position(|&c| c == 0).unwrap_or(b.old.len());
+            Body::FileLink(FileLink {
+                kind: LinkKind::Symbolic,
+                path: OsBytes(b.new_bytes().to_vec()),
+                target: OsBytes(b.old[..end].to_vec()),
+                result: hook_result(b.result),
+            })
+        }
+    }
+}
+
 /// Context needed to turn kernel records into events.
 pub struct Decoder {
     boot_id: String,
     /// `CLOCK_REALTIME - CLOCK_BOOTTIME`, refreshed by the caller (DESIGN.md §3.4).
     clock_offset_ns: i64,
+    procs: HashMap<String, ProcInfo>,
 }
 
 fn cstr(buf: &[u8], len: u32) -> Vec<u8> {
@@ -35,6 +143,49 @@ impl Decoder {
         Decoder {
             boot_id: boot_id.into(),
             clock_offset_ns: 0,
+            procs: HashMap::new(),
+        }
+    }
+
+    fn remember(&mut self, a: &Actor) {
+        if self.procs.len() >= PROC_TABLE_CAP {
+            self.procs.clear();
+        }
+        self.procs.insert(
+            a.puid.clone(),
+            ProcInfo {
+                comm: a.comm.clone(),
+                exe: a.exe.clone(),
+                cmdline: a.cmdline.clone(),
+                tty: a.tty.clone(),
+            },
+        );
+    }
+
+    /// Learns a process from an event decoded elsewhere (the baseline snapshot).
+    pub fn learn(&mut self, ev: &Event) {
+        if let Some(a) = &ev.actor {
+            if matches!(ev.body, Body::Baseline(_) | Body::ProcExec(_)) {
+                self.remember(a);
+            }
+        }
+    }
+
+    /// Fills in what the kernel record did not carry from what we know of the process.
+    fn enrich(&self, a: &mut Actor) {
+        if let Some(i) = self.procs.get(&a.puid) {
+            if a.comm.is_empty() {
+                a.comm = i.comm.clone();
+            }
+            if a.exe.is_none() {
+                a.exe = i.exe.clone();
+            }
+            if a.cmdline.is_none() {
+                a.cmdline = i.cmdline.clone();
+            }
+            if a.tty.is_none() {
+                a.tty = i.tty.clone();
+            }
         }
     }
 
@@ -48,7 +199,7 @@ impl Decoder {
 
     /// `resolve_exe(pid)` returns the resolved executable path if it can still be found.
     pub fn decode(
-        &self,
+        &mut self,
         rec: &[u8],
         resolve_exe: &dyn Fn(u32) -> Option<Vec<u8>>,
     ) -> Result<Event, DecodeError> {
@@ -98,6 +249,7 @@ impl Decoder {
                 actor.exe = Some(exe.clone());
                 actor.cmdline = Some(argv.clone());
                 actor.tty = (!tty.is_empty()).then(|| tty.clone());
+                self.remember(&actor);
                 Body::ProcExec(ProcExec {
                     filename,
                     exe,
@@ -112,6 +264,8 @@ impl Decoder {
             kind::PROC_EXIT => {
                 let b = ExitBody::parse(body).ok_or(DecodeError::Short)?;
                 actor.comm = String::from_utf8_lossy(&cstr(&b.comm, 16)).into_owned();
+                self.enrich(&mut actor);
+                self.procs.remove(&actor.puid);
                 let code = b.exit_code;
                 let signal = (code & 0x7f) as u8;
                 Body::ProcExit(ProcExit {
@@ -124,11 +278,36 @@ impl Decoder {
             }
             kind::PROC_FORK => {
                 let b = ForkBody::parse(body).ok_or(DecodeError::Short)?;
+                // Until it execs, the child is its parent's image.
+                self.enrich(&mut actor);
+                let child = puid(&self.boot_id, b.child_tgid, b.child_start_boot_ns);
+                if let Some(parent) = self.procs.get(&actor.puid).cloned() {
+                    if self.procs.len() >= PROC_TABLE_CAP {
+                        self.procs.clear();
+                    }
+                    self.procs.insert(child, parent);
+                }
                 Body::ProcFork(ProcFork {
                     child_pid: b.child_tgid,
                     child_puid: puid(&self.boot_id, b.child_tgid, b.child_start_boot_ns),
                     is_thread: b.flags & witness_common::FORK_THREAD != 0,
                 })
+            }
+            kind::FILE_OP => {
+                let b = FileBody::parse(body).ok_or(DecodeError::Short)?;
+                self.enrich(&mut actor);
+                if actor.exe.is_none() {
+                    actor.exe = resolve_exe(hdr.pid).map(OsBytes);
+                }
+                file_body(&b)
+            }
+            kind::FILE_TWO => {
+                let b = FileTwoBody::parse(body).ok_or(DecodeError::Short)?;
+                self.enrich(&mut actor);
+                if actor.exe.is_none() {
+                    actor.exe = resolve_exe(hdr.pid).map(OsBytes);
+                }
+                file_two_body(&b)
             }
             other => return Err(DecodeError::UnknownKind(other)),
         };
@@ -304,7 +483,7 @@ mod tests {
 
     #[test]
     fn bad_records_are_errors_not_panics() {
-        let d = dec();
+        let mut d = dec();
         assert_eq!(
             d.decode(&[0u8; 10], &|_| None).unwrap_err(),
             DecodeError::Short
@@ -317,5 +496,303 @@ mod tests {
             d.decode(&rec, &|_| None).unwrap_err(),
             DecodeError::UnknownKind(99)
         );
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+    use witness_common::{PATH_BUF, PATH_CAP};
+
+    fn hdr(kind: u16, len: usize, pid: u32) -> RawHdr {
+        RawHdr {
+            kind,
+            flags: 0,
+            len: len as u32,
+            boot_ns: 9_000_000_000,
+            pid,
+            tid: pid,
+            ppid: 1,
+            _pad0: 0,
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
+            auid: 1000,
+            ses: 3,
+            cgroup_id: 1,
+            start_boot_ns: 50_000_000,
+        }
+    }
+
+    /// A FILE_OP record whose path is right-aligned, as the kernel writes it.
+    fn file_rec(
+        pid: u32,
+        op: u32,
+        path: &str,
+        mode: u32,
+        old_mode: u32,
+        result: i32,
+        uid_gid: (u32, u32),
+    ) -> Vec<u8> {
+        let mut body = vec![0u8; FileBody::SIZE];
+        body[0..4].copy_from_slice(&op.to_ne_bytes());
+        body[4..8].copy_from_slice(&result.to_ne_bytes());
+        body[8..12].copy_from_slice(&0o101u32.to_ne_bytes()); // flags
+        body[12..16].copy_from_slice(&mode.to_ne_bytes());
+        body[16..20].copy_from_slice(&old_mode.to_ne_bytes());
+        body[20..24].copy_from_slice(&259u32.to_ne_bytes()); // dev
+        body[24..28].copy_from_slice(&uid_gid.0.to_ne_bytes());
+        body[28..32].copy_from_slice(&uid_gid.1.to_ne_bytes());
+        body[32..40].copy_from_slice(&777u64.to_ne_bytes());
+        let off = PATH_CAP - path.len();
+        body[40..44].copy_from_slice(&(off as u32).to_ne_bytes());
+        body[48 + off..48 + PATH_CAP].copy_from_slice(path.as_bytes());
+        let mut rec = hdr(kind::FILE_OP, RawHdr::SIZE + body.len(), pid)
+            .to_bytes()
+            .to_vec();
+        rec.extend(body);
+        rec
+    }
+
+    fn two_rec(op: u32, old: &str, new: &str, symlink: bool) -> Vec<u8> {
+        let mut body = vec![0u8; FileTwoBody::SIZE];
+        body[0..4].copy_from_slice(&op.to_ne_bytes());
+        body[12..16].copy_from_slice(&259u32.to_ne_bytes());
+        let (o_off, n_off) = (PATH_CAP - old.len(), PATH_CAP - new.len());
+        let old_at = 40;
+        let new_at = 40 + PATH_BUF;
+        if symlink {
+            body[old_at..old_at + old.len()].copy_from_slice(old.as_bytes());
+            body[24..28].copy_from_slice(&0u32.to_ne_bytes());
+        } else {
+            body[24..28].copy_from_slice(&(o_off as u32).to_ne_bytes());
+            body[old_at + o_off..old_at + PATH_CAP].copy_from_slice(old.as_bytes());
+        }
+        body[28..32].copy_from_slice(&(n_off as u32).to_ne_bytes());
+        body[new_at + n_off..new_at + PATH_CAP].copy_from_slice(new.as_bytes());
+        let mut rec = hdr(kind::FILE_TWO, RawHdr::SIZE + body.len(), 55)
+            .to_bytes()
+            .to_vec();
+        rec.extend(body);
+        rec
+    }
+
+    fn dec() -> Decoder {
+        Decoder::new("4f2a9c1e-0000-0000-0000-000000000000")
+    }
+
+    #[test]
+    fn open_for_write_is_attributed_to_the_known_process() {
+        let mut d = dec();
+        // The process is known from an earlier exec.
+        let mut exec_body = vec![0u8; ExecBody::SIZE];
+        exec_body[0..4].copy_from_slice(&5u32.to_ne_bytes());
+        exec_body[8..12].copy_from_slice(&8u32.to_ne_bytes());
+        exec_body[16..20].copy_from_slice(b"vim\0");
+        exec_body[48..56].copy_from_slice(b"/bin/vim");
+        exec_body[48 + witness_common::FILENAME_CAP..48 + witness_common::FILENAME_CAP + 5]
+            .copy_from_slice(b"vim\0x");
+        let mut rec = hdr(kind::PROC_EXEC, RawHdr::SIZE + exec_body.len(), 321)
+            .to_bytes()
+            .to_vec();
+        rec.extend(exec_body);
+        d.decode(&rec, &|_| Some(b"/usr/bin/vim".to_vec())).unwrap();
+
+        let e = d
+            .decode(
+                &file_rec(321, fop::OPEN_WRITE, "/etc/passwd", 0, 0, 0, (0, 0)),
+                &|_| None,
+            )
+            .unwrap();
+        let a = e.actor.as_ref().unwrap();
+        assert_eq!(a.comm, "vim");
+        assert_eq!(a.exe, Some(OsBytes::from("/usr/bin/vim")));
+        assert!(a.cmdline.is_some());
+        assert_eq!(a.auid, Some(1000));
+        match e.body {
+            Body::FileOpenWrite(f) => {
+                assert_eq!(f.path, OsBytes::from("/etc/passwd"));
+                assert_eq!(
+                    (f.dev, f.ino, f.flags, f.result),
+                    (259, 777, Some(0o101), HookResult::Allowed)
+                );
+                assert!(f.path_resolved && !f.path_truncated);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_process_falls_back_to_the_resolver() {
+        let mut d = dec();
+        let e = d
+            .decode(
+                &file_rec(999, fop::CREATE, "/tmp/x", 0o100755, 0, 0, (0, 0)),
+                &|pid| (pid == 999).then(|| b"/usr/bin/curl".to_vec()),
+            )
+            .unwrap();
+        assert_eq!(e.actor.unwrap().exe, Some(OsBytes::from("/usr/bin/curl")));
+        let Body::FileCreate(f) = e.body else {
+            panic!()
+        };
+        assert_eq!(f.mode, Some(0o100755));
+    }
+
+    #[test]
+    fn chmod_reports_a_newly_set_suid_bit_but_not_an_existing_one() {
+        let mut d = dec();
+        let new_suid = d
+            .decode(
+                &file_rec(1, fop::CHMOD, "/tmp/p", 0o4755, 0o100755, 0, (0, 0)),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::FileAttr(a) = new_suid.body else {
+            panic!()
+        };
+        assert!(a.suid_set && !a.sgid_set);
+        assert_eq!((a.old_mode, a.new_mode), (Some(0o0755), Some(0o4755)));
+        let already = d
+            .decode(
+                &file_rec(1, fop::CHMOD, "/tmp/p", 0o4711, 0o104755, 0, (0, 0)),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::FileAttr(a) = already.body else {
+            panic!()
+        };
+        assert!(!a.suid_set, "SUID was already set");
+        let sgid = d
+            .decode(
+                &file_rec(1, fop::CHMOD, "/tmp/p", 0o2755, 0o100755, 0, (0, 0)),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::FileAttr(a) = sgid.body else {
+            panic!()
+        };
+        assert!(a.sgid_set && !a.suid_set);
+    }
+
+    #[test]
+    fn chown_treats_minus_one_as_unchanged_and_denied_results_are_kept() {
+        let mut d = dec();
+        let e = d
+            .decode(
+                &file_rec(1, fop::CHOWN, "/etc/x", 0, 0o100644, 0, (0, u32::MAX)),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::FileAttr(a) = e.body else { panic!() };
+        assert_eq!((a.new_uid, a.new_gid), (Some(0), None));
+        let denied = d
+            .decode(
+                &file_rec(1, fop::UNLINK, "/etc/shadow", 0, 0, -13, (0, 0)),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::FileDelete(f) = denied.body else {
+            panic!()
+        };
+        assert_eq!(f.result, HookResult::Denied);
+    }
+
+    #[test]
+    fn rename_link_and_symlink() {
+        let mut d = dec();
+        let e = d
+            .decode(
+                &two_rec(fop::RENAME, "/tmp/a", "/etc/cron.d/a", false),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::FileRename(r) = e.body else {
+            panic!()
+        };
+        assert_eq!(
+            (r.old, r.new),
+            (OsBytes::from("/tmp/a"), OsBytes::from("/etc/cron.d/a"))
+        );
+        let e = d
+            .decode(&two_rec(fop::LINK, "/etc/shadow", "/tmp/s", false), &|_| {
+                None
+            })
+            .unwrap();
+        let Body::FileLink(l) = e.body else { panic!() };
+        assert_eq!(l.kind, LinkKind::Hard);
+        assert_eq!(
+            (l.path, l.target),
+            (OsBytes::from("/tmp/s"), OsBytes::from("/etc/shadow"))
+        );
+        let e = d
+            .decode(
+                &two_rec(fop::SYMLINK, "../../etc/passwd", "/tmp/link", true),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::FileLink(l) = e.body else { panic!() };
+        assert_eq!(l.kind, LinkKind::Symbolic);
+        assert_eq!(l.target, OsBytes::from("../../etc/passwd"));
+    }
+
+    #[test]
+    fn a_forked_child_inherits_its_parents_identity_until_it_execs() {
+        let mut d = dec();
+        d.decode(
+            &{
+                let mut body = vec![0u8; ExecBody::SIZE];
+                body[8..12].copy_from_slice(&5u32.to_ne_bytes());
+                body[16..20].copy_from_slice(b"bash");
+                body[48..53].copy_from_slice(b"/bash");
+                let mut r = hdr(kind::PROC_EXEC, RawHdr::SIZE + body.len(), 100)
+                    .to_bytes()
+                    .to_vec();
+                r.extend(body);
+                r
+            },
+            &|_| None,
+        )
+        .unwrap();
+        let mut fb = vec![0u8; ForkBody::SIZE];
+        fb[0..4].copy_from_slice(&200u32.to_ne_bytes());
+        fb[4..8].copy_from_slice(&200u32.to_ne_bytes());
+        fb[8..16].copy_from_slice(&70_000_000u64.to_ne_bytes());
+        let mut fr = hdr(kind::PROC_FORK, RawHdr::SIZE + fb.len(), 100)
+            .to_bytes()
+            .to_vec();
+        fr.extend(fb);
+        d.decode(&fr, &|_| None).unwrap();
+        // The child (pid 200, start 70_000_000) writes before exec'ing.
+        let mut rec = file_rec(200, fop::OPEN_WRITE, "/tmp/f", 0, 0, 0, (0, 0));
+        rec[64..72].copy_from_slice(&70_000_000u64.to_ne_bytes()); // header start_boot_ns
+        let e = d.decode(&rec, &|_| None).unwrap();
+        assert_eq!(e.actor.unwrap().comm, "bash");
+    }
+
+    #[test]
+    fn exit_forgets_the_process() {
+        let mut d = dec();
+        d.decode(
+            &{
+                let mut body = vec![0u8; ExecBody::SIZE];
+                body[16..19].copy_from_slice(b"foo");
+                let mut r = hdr(kind::PROC_EXEC, RawHdr::SIZE + body.len(), 7)
+                    .to_bytes()
+                    .to_vec();
+                r.extend(body);
+                r
+            },
+            &|_| None,
+        )
+        .unwrap();
+        let mut xb = vec![0u8; ExitBody::SIZE];
+        xb[8..11].copy_from_slice(b"foo");
+        let mut xr = hdr(kind::PROC_EXIT, RawHdr::SIZE + xb.len(), 7)
+            .to_bytes()
+            .to_vec();
+        xr.extend(xb);
+        d.decode(&xr, &|_| None).unwrap();
+        assert!(d.procs.is_empty());
     }
 }

@@ -169,17 +169,20 @@ pub struct ForkBody {
     pub _pad: u32,
 }
 
-/// Longest path recorded; longer ones keep their tail (the leaf end) and set `trunc`.
+/// Longest path recorded; a longer one keeps its tail (the leaf end) and sets `trunc`.
 pub const PATH_CAP: usize = 1024;
-/// Slack after `PATH_CAP` so a bounded component copy can never run past the buffer; the
-/// verifier needs `offset + length` provably in range.
-pub const PATH_SLACK: usize = 256;
-pub const PATH_BUF: usize = PATH_CAP + PATH_SLACK;
 /// Longest single path component copied.
 pub const COMP_CAP: usize = 255;
+/// Deepest nesting (directories plus mount crossings) walked before the path is cut.
+pub const MAX_COMPONENTS: usize = 24;
+/// The per-CPU buffer the kernel walks paths into, right to left. Large enough that
+/// `MAX_COMPONENTS` components of `COMP_CAP + 1` bytes can never wrap it, which is what lets
+/// the walk avoid any overflow bookkeeping the verifier would have to track per path.
+pub const SCRATCH_LEN: usize = 8192;
+/// `SCRATCH_LEN` plus slack so the final bounded copy is provably in range.
+pub const SCRATCH_BUF: usize = SCRATCH_LEN + PATH_CAP;
 
-/// Body of a [`kind::FILE_OP`] record. The path is built right-to-left, so it occupies
-/// `path[path_off..PATH_CAP]`.
+/// Body of a [`kind::FILE_OP`] record. The path is `path[..path_len]`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FileBody {
@@ -190,16 +193,16 @@ pub struct FileBody {
     pub flags: u32,
     /// Mode: new mode for create/mkdir/chmod.
     pub mode: u32,
-    /// Previous mode (chmod): lets userspace see a newly set SUID/SGID bit.
+    /// Mode of the file before the operation (chmod): lets userspace see a newly set SUID/SGID bit.
     pub old_mode: u32,
     pub dev: u32,
     pub new_uid: u32,
     pub new_gid: u32,
     pub ino: u64,
-    pub path_off: u32,
-    /// Non-zero if the path did not fit or the walk was cut short.
+    pub path_len: u32,
+    /// Non-zero if the path or a component was cut, or the walk hit its depth limit.
     pub trunc: u32,
-    pub path: [u8; PATH_BUF],
+    pub path: [u8; PATH_CAP],
 }
 
 /// Body of a [`kind::FILE_TWO`] record (rename, link, symlink): `old` and `new`, where for a
@@ -212,12 +215,12 @@ pub struct FileTwoBody {
     pub flags: u32,
     pub dev: u32,
     pub ino: u64,
-    pub old_off: u32,
-    pub new_off: u32,
+    pub old_len: u32,
+    pub new_len: u32,
     pub trunc: u32,
     pub _pad: u32,
-    pub old: [u8; PATH_BUF],
-    pub new: [u8; PATH_BUF],
+    pub old: [u8; PATH_CAP],
+    pub new: [u8; PATH_CAP],
 }
 
 #[repr(C)]
@@ -238,14 +241,14 @@ pub struct FileTwoEvent {
 pub const DROP_CLASS_VOLUME: u32 = 1;
 
 impl FileBody {
-    pub const SIZE: usize = 48 + PATH_BUF;
+    pub const SIZE: usize = 48 + PATH_CAP;
 
     pub fn parse(buf: &[u8]) -> Option<Self> {
         let b = buf.get(..Self::SIZE)?;
         let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let mut ino = [0u8; 8];
         ino.copy_from_slice(&b[32..40]);
-        let mut path = [0u8; PATH_BUF];
+        let mut path = [0u8; PATH_CAP];
         path.copy_from_slice(&b[48..Self::SIZE]);
         Some(Self {
             op: u32_at(0),
@@ -257,7 +260,7 @@ impl FileBody {
             new_uid: u32_at(24),
             new_gid: u32_at(28),
             ino: u64::from_ne_bytes(ino),
-            path_off: u32_at(40),
+            path_len: u32_at(40),
             trunc: u32_at(44),
             path,
         })
@@ -265,31 +268,30 @@ impl FileBody {
 
     /// The recorded path bytes.
     pub fn path_bytes(&self) -> &[u8] {
-        let off = (self.path_off as usize).min(PATH_CAP);
-        &self.path[off..PATH_CAP]
+        &self.path[..(self.path_len as usize).min(PATH_CAP)]
     }
 }
 
 impl FileTwoBody {
-    pub const SIZE: usize = 40 + 2 * PATH_BUF;
+    pub const SIZE: usize = 40 + 2 * PATH_CAP;
 
     pub fn parse(buf: &[u8]) -> Option<Self> {
         let b = buf.get(..Self::SIZE)?;
         let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let mut ino = [0u8; 8];
         ino.copy_from_slice(&b[16..24]);
-        let mut old = [0u8; PATH_BUF];
-        old.copy_from_slice(&b[40..40 + PATH_BUF]);
-        let mut new = [0u8; PATH_BUF];
-        new.copy_from_slice(&b[40 + PATH_BUF..Self::SIZE]);
+        let mut old = [0u8; PATH_CAP];
+        old.copy_from_slice(&b[40..40 + PATH_CAP]);
+        let mut new = [0u8; PATH_CAP];
+        new.copy_from_slice(&b[40 + PATH_CAP..Self::SIZE]);
         Some(Self {
             op: u32_at(0),
             result: u32_at(4) as i32,
             flags: u32_at(8),
             dev: u32_at(12),
             ino: u64::from_ne_bytes(ino),
-            old_off: u32_at(24),
-            new_off: u32_at(28),
+            old_len: u32_at(24),
+            new_len: u32_at(28),
             trunc: u32_at(32),
             _pad: 0,
             old,
@@ -298,11 +300,11 @@ impl FileTwoBody {
     }
 
     pub fn old_bytes(&self) -> &[u8] {
-        &self.old[(self.old_off as usize).min(PATH_CAP)..PATH_CAP]
+        &self.old[..(self.old_len as usize).min(PATH_CAP)]
     }
 
     pub fn new_bytes(&self) -> &[u8] {
-        &self.new[(self.new_off as usize).min(PATH_CAP)..PATH_CAP]
+        &self.new[..(self.new_len as usize).min(PATH_CAP)]
     }
 }
 
@@ -405,6 +407,8 @@ const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBo
 const _: () = assert!(core::mem::size_of::<FileTwoEvent>() == RawHdr::SIZE + FileTwoBody::SIZE);
 const _: () = assert!(FileBody::SIZE % 8 == 0 && FileTwoBody::SIZE % 8 == 0);
 const _: () = assert!(PATH_CAP.is_power_of_two());
+const _: () = assert!(MAX_COMPONENTS * (COMP_CAP + 1) <= SCRATCH_LEN);
+const _: () = assert!(SCRATCH_LEN.is_power_of_two());
 const _: () = assert!(core::mem::size_of::<ExecEvent>() == RawHdr::SIZE + ExecBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ExitEvent>() == RawHdr::SIZE + ExitBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ForkEvent>() == RawHdr::SIZE + ForkBody::SIZE);

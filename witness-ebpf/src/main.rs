@@ -21,7 +21,7 @@ use aya_ebpf::{
 use witness_common::{
     fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
     ARGV_CAP, COMP_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
-    PATH_CAP, TTY_LEN, UNAVAILABLE,
+    MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
 };
 
 /// P0 events: process lifecycle. Sized by the loader (`map_max_entries`).
@@ -32,6 +32,10 @@ static CRITICAL: RingBuf = RingBuf::with_byte_size(8 << 20, 0);
 /// never evict process lifecycle records.
 #[map]
 static VOLUME: RingBuf = RingBuf::with_byte_size(32 << 20, 0);
+
+/// Where paths are assembled before the final bounded copy into a record (one per CPU).
+#[map]
+static SCRATCH: PerCpuArray<[u8; SCRATCH_BUF]> = PerCpuArray::with_max_entries(1, 0);
 
 /// Events lost because the ring buffer was full, per class. Never blocks the kernel side.
 #[map]
@@ -279,9 +283,6 @@ unsafe fn try_fork(ctx: &BtfTracePointContext) -> Result<(), ()> {
 const FMODE_WRITE: u32 = 0x2;
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
-/// Deepest nesting (including mount crossings) walked before the path is cut and flagged.
-const MAX_COMPONENTS: usize = 24;
-
 /// Pseudo filesystems whose writes are not interesting host activity.
 #[inline(always)]
 fn noisy_fs(magic: u64) -> bool {
@@ -358,20 +359,24 @@ unsafe fn read_mount_head(src: *const u8) -> MountHead {
     v
 }
 
-/// Builds the absolute path of `dentry` under mount `mnt` (a `struct vfsmount *`) into
-/// `buf`, right-to-left, walking parents and stepping over mount points. Returns
-/// `(offset, truncated)`; the path is `buf[offset..PATH_CAP]`.
+/// Builds the absolute path of `dentry` under mount `mnt` (a `struct vfsmount *`) and copies
+/// it into `dst` (`PATH_CAP` bytes), left-aligned. Returns `(length, truncated)`.
 ///
-/// Verifier notes: every dereference goes through `bpf_probe_read_kernel`; the write offset
-/// is masked into `0..PATH_CAP` and each copy is at most `COMP_CAP` bytes into a buffer with
-/// `PATH_SLACK` spare bytes, so `offset + length` is provably in range.
+/// The walk assembles the path right-to-left in the per-CPU `scratch` buffer. The buffer is
+/// sized so `MAX_COMPONENTS` components can never wrap it, so the loop needs no overflow
+/// bookkeeping: the offset is only masked, never compared with another variable range, which
+/// is what lets the verifier prune equivalent states instead of exploring every path. One
+/// bounded copy at the end moves at most `PATH_CAP` trailing bytes (the leaf end of a path
+/// that is too long) into the record.
 #[inline(always)]
-unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offsets) -> (u32, u32) {
-    let mut off: usize = PATH_CAP;
-    // Total bytes consumed, compared once after the loop. Comparing two *ranged* values inside
-    // the loop (offset vs length) makes each branch refine them differently, so no two paths
-    // look alike and the verifier cannot prune; wrapping inside a mask avoids that.
-    let mut total: usize = 0;
+unsafe fn build_path(
+    scratch: *mut u8,
+    dst: *mut u8,
+    mnt: *const u8,
+    dentry: *const u8,
+    o: &Offsets,
+) -> (u32, u32) {
+    let mut off: usize = SCRATCH_LEN;
     let mut trunc = 0u32;
     let mut dentry = dentry;
     let mut mnt = mnt;
@@ -402,30 +407,35 @@ unsafe fn build_path(buf: *mut u8, mnt: *const u8, dentry: *const u8, o: &Offset
             len = COMP_CAP;
             trunc = 1;
         }
-        total += len + 1;
-        // Always in `0..PATH_CAP`; if the path is longer than the buffer the writes wrap and
-        // `total` (checked below) says so.
-        off = off.wrapping_sub(len + 1) & (PATH_CAP - 1);
-        *buf.add(off) = b'/';
-        // `off + 1 + len` is at most PATH_CAP - 1 + 1 + COMP_CAP < PATH_BUF.
+        // Never actually wraps (see above); the mask is for the verifier.
+        off = off.wrapping_sub(len + 1) & (SCRATCH_LEN - 1);
+        *scratch.add(off) = b'/';
         let _ = generated::bpf_probe_read_kernel(
-            buf.add(off + 1).cast(),
+            scratch.add(off + 1).cast(),
             len as u32,
             (head.name as *const u8).cast(),
         );
         dentry = head.parent as *const u8;
     }
-    if i >= MAX_COMPONENTS || total > PATH_CAP {
+    if i >= MAX_COMPONENTS {
         trunc = 1;
     }
-    if total > PATH_CAP {
-        // The buffer wrapped, so its contents are not a usable path: report it empty.
-        off = PATH_CAP;
-    } else if total == 0 {
-        off = PATH_CAP - 1;
-        *buf.add(off) = b'/';
+    let mut n = SCRATCH_LEN - off;
+    if n == 0 {
+        // Nothing but the root.
+        *scratch.add(SCRATCH_LEN - 1) = b'/';
+        n = 1;
     }
-    (off as u32, trunc)
+    if n > PATH_CAP {
+        n = PATH_CAP;
+        trunc = 1;
+    }
+    let _ = generated::bpf_probe_read_kernel(
+        dst.cast(),
+        n as u32,
+        scratch.add(SCRATCH_LEN - n).cast(),
+    );
+    (n as u32, trunc)
 }
 
 /// True if the file's filesystem should be ignored; also returns `(dev, ino, i_mode)`.
@@ -464,6 +474,9 @@ unsafe fn emit_file(
     if noisy {
         return;
     }
+    let Some(scratch) = SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
     let Some(mut entry) = VOLUME.reserve::<FileEvent>(0) else {
         count_drop(DROP_CLASS_VOLUME);
         return;
@@ -487,8 +500,14 @@ unsafe fn emit_file(
     (*b).new_uid = uid;
     (*b).new_gid = gid;
     (*b).ino = ino;
-    let (off, trunc) = build_path(addr_of_mut!((*b).path).cast::<u8>(), mnt, dentry, &o);
-    (*b).path_off = off;
+    let (len, trunc) = build_path(
+        scratch.cast(),
+        addr_of_mut!((*b).path).cast::<u8>(),
+        mnt,
+        dentry,
+        &o,
+    );
+    (*b).path_len = len;
     (*b).trunc = trunc;
     entry.submit(0);
 }
@@ -516,6 +535,9 @@ unsafe fn emit_two(
     if noisy {
         return;
     }
+    let Some(scratch) = SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
     let Some(mut entry) = VOLUME.reserve::<FileTwoEvent>(0) else {
         count_drop(DROP_CLASS_VOLUME);
         return;
@@ -537,19 +559,34 @@ unsafe fn emit_two(
     (*b).ino = ino;
     (*b)._pad = 0;
     let mut trunc = 0;
+    (*b).old_len = 0;
     if op == fop::SYMLINK {
-        (*b).old_off = 0;
+        // The link target is a plain string: copy it as-is.
         let dst = core::slice::from_raw_parts_mut(addr_of_mut!((*b).old).cast::<u8>(), PATH_CAP);
-        if target.is_null() || bpf_probe_read_kernel_str_bytes(target, dst).is_err() {
-            dst[0] = 0;
+        if !target.is_null() {
+            if let Ok(t) = bpf_probe_read_kernel_str_bytes(target, dst) {
+                (*b).old_len = t.len() as u32;
+            }
         }
     } else {
-        let (off, t) = build_path(addr_of_mut!((*b).old).cast::<u8>(), old_mnt, old_dentry, &o);
-        (*b).old_off = off;
+        let (len, t) = build_path(
+            scratch.cast(),
+            addr_of_mut!((*b).old).cast::<u8>(),
+            old_mnt,
+            old_dentry,
+            &o,
+        );
+        (*b).old_len = len;
         trunc |= t;
     }
-    let (off, t) = build_path(addr_of_mut!((*b).new).cast::<u8>(), new_mnt, new_dentry, &o);
-    (*b).new_off = off;
+    let (len, t) = build_path(
+        scratch.cast(),
+        addr_of_mut!((*b).new).cast::<u8>(),
+        new_mnt,
+        new_dentry,
+        &o,
+    );
+    (*b).new_len = len;
     (*b).trunc = trunc | t;
     entry.submit(0);
 }

@@ -109,12 +109,11 @@ fn file_two_body(b: &FileTwoBody) -> Body {
             result: hook_result(b.result),
         }),
         _ => {
-            // Symlink: the target is a NUL-terminated string at the start of `old`.
-            let end = b.old.iter().position(|&c| c == 0).unwrap_or(b.old.len());
+            // Symlink: `old` holds the link target string.
             Body::FileLink(FileLink {
                 kind: LinkKind::Symbolic,
                 path: OsBytes(b.new_bytes().to_vec()),
-                target: OsBytes(b.old[..end].to_vec()),
+                target: OsBytes(b.old_bytes().to_vec()),
                 result: hook_result(b.result),
             })
         }
@@ -502,7 +501,7 @@ mod tests {
 #[cfg(test)]
 mod file_tests {
     use super::*;
-    use witness_common::{PATH_BUF, PATH_CAP};
+    use witness_common::PATH_CAP;
 
     fn hdr(kind: u16, len: usize, pid: u32) -> RawHdr {
         RawHdr {
@@ -545,9 +544,8 @@ mod file_tests {
         body[24..28].copy_from_slice(&uid_gid.0.to_ne_bytes());
         body[28..32].copy_from_slice(&uid_gid.1.to_ne_bytes());
         body[32..40].copy_from_slice(&777u64.to_ne_bytes());
-        let off = PATH_CAP - path.len();
-        body[40..44].copy_from_slice(&(off as u32).to_ne_bytes());
-        body[48 + off..48 + PATH_CAP].copy_from_slice(path.as_bytes());
+        body[40..44].copy_from_slice(&(path.len() as u32).to_ne_bytes());
+        body[48..48 + path.len()].copy_from_slice(path.as_bytes());
         let mut rec = hdr(kind::FILE_OP, RawHdr::SIZE + body.len(), pid)
             .to_bytes()
             .to_vec();
@@ -555,22 +553,15 @@ mod file_tests {
         rec
     }
 
-    fn two_rec(op: u32, old: &str, new: &str, symlink: bool) -> Vec<u8> {
+    fn two_rec(op: u32, old: &str, new: &str) -> Vec<u8> {
         let mut body = vec![0u8; FileTwoBody::SIZE];
         body[0..4].copy_from_slice(&op.to_ne_bytes());
         body[12..16].copy_from_slice(&259u32.to_ne_bytes());
-        let (o_off, n_off) = (PATH_CAP - old.len(), PATH_CAP - new.len());
-        let old_at = 40;
-        let new_at = 40 + PATH_BUF;
-        if symlink {
-            body[old_at..old_at + old.len()].copy_from_slice(old.as_bytes());
-            body[24..28].copy_from_slice(&0u32.to_ne_bytes());
-        } else {
-            body[24..28].copy_from_slice(&(o_off as u32).to_ne_bytes());
-            body[old_at + o_off..old_at + PATH_CAP].copy_from_slice(old.as_bytes());
-        }
-        body[28..32].copy_from_slice(&(n_off as u32).to_ne_bytes());
-        body[new_at + n_off..new_at + PATH_CAP].copy_from_slice(new.as_bytes());
+        let (old_at, new_at) = (40, 40 + PATH_CAP);
+        body[old_at..old_at + old.len()].copy_from_slice(old.as_bytes());
+        body[new_at..new_at + new.len()].copy_from_slice(new.as_bytes());
+        body[24..28].copy_from_slice(&(old.len() as u32).to_ne_bytes());
+        body[28..32].copy_from_slice(&(new.len() as u32).to_ne_bytes());
         let mut rec = hdr(kind::FILE_TWO, RawHdr::SIZE + body.len(), 55)
             .to_bytes()
             .to_vec();
@@ -702,10 +693,7 @@ mod file_tests {
     fn rename_link_and_symlink() {
         let mut d = dec();
         let e = d
-            .decode(
-                &two_rec(fop::RENAME, "/tmp/a", "/etc/cron.d/a", false),
-                &|_| None,
-            )
+            .decode(&two_rec(fop::RENAME, "/tmp/a", "/etc/cron.d/a"), &|_| None)
             .unwrap();
         let Body::FileRename(r) = e.body else {
             panic!()
@@ -715,9 +703,7 @@ mod file_tests {
             (OsBytes::from("/tmp/a"), OsBytes::from("/etc/cron.d/a"))
         );
         let e = d
-            .decode(&two_rec(fop::LINK, "/etc/shadow", "/tmp/s", false), &|_| {
-                None
-            })
+            .decode(&two_rec(fop::LINK, "/etc/shadow", "/tmp/s"), &|_| None)
             .unwrap();
         let Body::FileLink(l) = e.body else { panic!() };
         assert_eq!(l.kind, LinkKind::Hard);
@@ -727,7 +713,7 @@ mod file_tests {
         );
         let e = d
             .decode(
-                &two_rec(fop::SYMLINK, "../../etc/passwd", "/tmp/link", true),
+                &two_rec(fop::SYMLINK, "../../etc/passwd", "/tmp/link"),
                 &|_| None,
             )
             .unwrap();

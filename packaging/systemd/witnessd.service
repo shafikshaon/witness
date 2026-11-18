@@ -26,7 +26,9 @@ RestartSec=1
 # The main loop pings only while the pipeline is healthy; a stall gets us restarted.
 WatchdogSec=30
 TimeoutStartSec=60
-TimeoutStopSec=30
+# A stop during a slow startup waits for in-flight kernel verifier jobs (seconds, tens of
+# seconds on a saturated CPU); 60 s avoids SIGKILLing a daemon that is stopping cleanly.
+TimeoutStopSec=60
 OOMScoreAdjust=-900
 LimitMEMLOCK=infinity
 MemoryHigh=384M

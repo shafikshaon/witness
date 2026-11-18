@@ -507,8 +507,12 @@ mod store_mode {
                 );
                 continue;
             }
+            // A stop during startup waits for the kernel verifier jobs already in flight (they
+            // cannot be interrupted): about 2-4 s on an idle machine, around 30 s when the CPUs
+            // are saturated (reproduced with six busy loops on four CPUs). This bound only
+            // catches a hang; the property under test is that the signal is not lost.
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
+                started.elapsed() < std::time::Duration::from_secs(45),
                 "delay {delay_ms} ms: slow stop\n{log}"
             );
             let recs = records(t.path());

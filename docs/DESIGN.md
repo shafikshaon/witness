@@ -230,6 +230,8 @@ Userspace sources run on their own threads (`witnessd/src/sources.rs`) and are s
 
 Deviations and gaps from §2.4: **no systemd D-Bus/logind source** (service start/stop, session open/close, `PrepareForShutdown`), so `service_change`, `logout` and shutdown reasons are not produced; login events come from sshd's message only (`session_id` is 0); the sshd/sudo parsers are regexes over free text and keep the raw line; sudo escapes newlines as `#012` and that is left as is. A real-journal test found sudo left-pads messages with spaces; that is now handled and covered by a regression test.
 
+**Startup and stop.** All 24 programs load in about 4-5 s on an idle 4-CPU VM (work queue, heaviest verifier jobs first). A SIGTERM during startup is honoured between jobs but cannot interrupt a verifier run already in flight, so a stop during startup takes a few seconds when idle and roughly 30 s with the CPUs saturated (measured); the unit's `TimeoutStopSec` is 60 s for that reason. Nothing is written before attach, so a kill in this window loses no evidence.
+
 ### 2.13 The rule engine, as built
 
 `witness-rules` implements §8 with these differences, all deliberate:

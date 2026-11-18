@@ -1243,7 +1243,7 @@ mod auth {
         ));
         std::thread::sleep(std::time::Duration::from_secs(4));
         sh(&format!(
-            "usermod -s /bin/bash {user}; passwd -l {user} >/dev/null 2>&1"
+            "usermod -s /bin/bash -p '$6$witnesssalt$notarealhashnotarealhash' {user}"
         ));
         std::thread::sleep(std::time::Duration::from_secs(4));
         sh(&format!("userdel -r {user} 2>/dev/null"));

@@ -1290,4 +1290,42 @@ mod auth {
             "a password hash leaked"
         );
     }
+
+    #[test]
+    #[ignore = "needs root and loop devices"]
+    fn block_device_attach_and_detach_are_recorded() {
+        let t = tempfile::tempdir().unwrap();
+        let img = t.path().join("disk.img");
+        let f = std::fs::File::create(&img).unwrap();
+        f.set_len(8 << 20).unwrap();
+        drop(f);
+        let (mut child, _err) = spawn(&t.path().join("data"), 14);
+        let out = Command::new("losetup")
+            .args(["-f", "--show"])
+            .arg(&img)
+            .output()
+            .unwrap();
+        let dev = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert!(dev.starts_with("/dev/loop"), "losetup said {dev:?}");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        Command::new("losetup").args(["-d", &dev]).status().unwrap();
+        let _ = child.wait();
+
+        let name = dev.trim_start_matches("/dev/");
+        let ev = records(&t.path().join("data"));
+        verify(&t.path().join("data"));
+        let blocks: Vec<_> = ev
+            .iter()
+            .filter(|e| e["type"] == "block_device" && e["data"]["name"] == name)
+            .collect();
+        // A loop device only becomes a "disk" uevent when its size is set; accept either order
+        // of events but require both an attach and a detach.
+        let attached = blocks.iter().find(|e| e["data"]["action"] == "add");
+        assert!(attached.is_some(), "block events: {blocks:?}");
+        assert!(
+            blocks.iter().any(|e| e["data"]["action"] == "remove"),
+            "block events: {blocks:?}"
+        );
+        assert_eq!(attached.unwrap()["data"]["size_bytes"], 8 << 20);
+    }
 }

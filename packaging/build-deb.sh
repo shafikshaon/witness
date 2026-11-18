@@ -12,8 +12,8 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
 ARCH=$(dpkg --print-architecture)
 mkdir -p "$OUT"
 
-stage() { # stage <dir> : fresh DEBIAN tree
-    rm -rf "$1"; mkdir -p "$1/DEBIAN"
+stage() { # stage <dir> : fresh DEBIAN tree (0755 root dir, as dpkg expects)
+    rm -rf "$1"; mkdir -p "$1/DEBIAN"; chmod 0755 "$1"
 }
 
 # ---- witness (daemon + CLI + rules) ----
@@ -42,7 +42,6 @@ Version: $VERSION
 Architecture: $ARCH
 Maintainer: Witness contributors <noreply@example.invalid>
 Depends: libc6, systemd
-Recommends: systemd-journal-remote
 Installed-Size: $SIZE
 Section: admin
 Priority: optional

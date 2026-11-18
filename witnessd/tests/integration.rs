@@ -1014,3 +1014,143 @@ mod files {
         );
     }
 }
+
+// ---- network events --------------------------------------------------------------------
+
+mod net {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::Value;
+
+    use super::capture;
+
+    fn mine<'a>(ev: &'a [Value], t: &str) -> Vec<&'a Value> {
+        ev.iter()
+            .filter(|e| e["type"] == t && e["actor"]["pid"] == std::process::id())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn tcp_connection_lifecycle_is_attributed_with_byte_counts() {
+        let ports = Arc::new(Mutex::new((0u16, 0u16)));
+        let p2 = Arc::clone(&ports);
+        let (ev, _) = capture(8, move || {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let srv = std::thread::spawn(move || {
+                let (mut s, _) = l.accept().unwrap();
+                let mut buf = [0u8; 5];
+                s.read_exact(&mut buf).unwrap();
+                s.write_all(b"world!!!").unwrap();
+            });
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"hello").unwrap();
+            let mut b = [0u8; 8];
+            c.read_exact(&mut b).unwrap();
+            drop(c);
+            srv.join().unwrap();
+            // A port nobody listens on: the connection is refused.
+            let closed = TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            TcpStream::connect(("127.0.0.1", closed)).unwrap_err();
+            *p2.lock().unwrap() = (port, closed);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        let (port, closed) = *ports.lock().unwrap();
+        assert!(port != 0 && closed != 0);
+        let port = u64::from(port);
+        let closed = u64::from(closed);
+
+        let listens = mine(&ev, "net_listen");
+        assert!(
+            listens.iter().any(|e| e["data"]["port"] == port),
+            "the server's listen()"
+        );
+
+        let connects = mine(&ev, "net_connect");
+        let ok = connects
+            .iter()
+            .find(|e| e["data"]["rport"] == port && e["data"]["outcome"] == "established")
+            .expect("the established connection");
+        assert_eq!(ok["data"]["raddr"], "127.0.0.1");
+        assert_eq!(ok["data"]["proto"], "tcp");
+        assert!(ok["actor"]["exe"]
+            .as_str()
+            .is_some_and(|x| x.contains("integration")));
+        assert_eq!(ok["actor"]["uid"], 0);
+
+        let failed = connects
+            .iter()
+            .find(|e| e["data"]["rport"] == closed)
+            .expect("the refused connection is recorded");
+        assert_eq!(failed["data"]["outcome"], "failed");
+
+        let accepts = mine(&ev, "net_accept");
+        let acc = accepts
+            .iter()
+            .find(|e| e["data"]["lport"] == port)
+            .expect("the accept");
+        assert_eq!(acc["data"]["raddr"], "127.0.0.1");
+
+        // Closes carry the byte counts: the client sent 5 and received 8; the server the reverse.
+        let closes = mine(&ev, "net_close");
+        let client = closes
+            .iter()
+            .find(|e| e["data"]["conn"]["rport"] == port && e["data"]["bytes_sent"] == 5)
+            .expect("the client's close");
+        assert_eq!(client["data"]["bytes_recv"], 8);
+        assert!(client["data"]["duration_ns"].as_u64().unwrap() > 0);
+        let server = closes
+            .iter()
+            .find(|e| e["data"]["conn"]["lport"] == port && e["data"]["bytes_sent"] == 8)
+            .expect("the server's close");
+        assert_eq!(server["data"]["bytes_recv"], 5);
+
+        assert!(
+            !mine(&ev, "net_listen_close").is_empty(),
+            "the listener closed when the test dropped it"
+        );
+    }
+
+    /// A connection is attributed to the process that made it, not to whoever happened to be
+    /// running when the kernel reported the state change.
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn a_child_processs_connection_is_attributed_to_the_child() {
+        let port = Arc::new(Mutex::new(0u16));
+        let p2 = Arc::clone(&port);
+        let (ev, _) = capture(8, move || {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let pt = l.local_addr().unwrap().port();
+            *p2.lock().unwrap() = pt;
+            let st = Command::new("/bin/bash")
+                .args([
+                    "-c",
+                    &format!("exec 3<>/dev/tcp/127.0.0.1/{pt}; echo hi >&3"),
+                ])
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let _ = l.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        let port = u64::from(*port.lock().unwrap());
+        let conn = ev
+            .iter()
+            .find(|e| e["type"] == "net_connect" && e["data"]["rport"] == port)
+            .expect("the child's connect");
+        assert_eq!(conn["actor"]["comm"], "bash");
+        assert_ne!(conn["actor"]["pid"], std::process::id(), "not the parent");
+        assert_eq!(conn["actor"]["ppid"], std::process::id());
+        assert!(conn["actor"]["exe"]
+            .as_str()
+            .is_some_and(|x| x.ends_with("bash")));
+    }
+}

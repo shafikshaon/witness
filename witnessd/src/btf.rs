@@ -330,6 +330,20 @@ impl Btf {
             tcp_bytes_sent: opt("tcp_sock", "bytes_sent"),
             tcp_bytes_received: opt("tcp_sock", "bytes_received"),
             sock_sk_shutdown: opt("sock", "sk_shutdown"),
+            msghdr_msg_name: opt("msghdr", "msg_name"),
+            msghdr_msg_namelen: opt("msghdr", "msg_namelen"),
+            msghdr_msg_iter: opt("msghdr", "msg_iter"),
+            // The iterator kind field was `type` before it became `iter_type`.
+            iov_iter_type: self
+                .field_offset("iov_iter", "iter_type")
+                .or_else(|| self.field_offset("iov_iter", "type"))
+                .unwrap_or(UNAVAILABLE),
+            iov_iter_iov: self
+                .field_offset("iov_iter", "iov")
+                .or_else(|| self.field_offset("iov_iter", "__iov"))
+                .unwrap_or(UNAVAILABLE),
+            // Present only on kernels with ITER_UBUF (6.0+).
+            iov_iter_ubuf: self.field_offset("iov_iter", "ubuf").unwrap_or(UNAVAILABLE),
         };
         Ok(Resolved { offsets, notes })
     }

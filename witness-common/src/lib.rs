@@ -21,6 +21,8 @@ pub mod kind {
     pub const FILE_TWO: u16 = 11;
     /// TCP connection lifecycle ([`super::NetEvent`]).
     pub const NET_TCP: u16 = 20;
+    /// A DNS packet over UDP ([`super::DnsEvent`]).
+    pub const DNS: u16 = 21;
 }
 
 /// File operations carried in [`FileBody::op`] / [`FileTwoBody::op`].
@@ -101,6 +103,12 @@ pub struct Offsets {
     pub tcp_bytes_sent: u32,
     pub tcp_bytes_received: u32,
     pub sock_sk_shutdown: u32,
+    pub msghdr_msg_name: u32,
+    pub msghdr_msg_namelen: u32,
+    pub msghdr_msg_iter: u32,
+    pub iov_iter_type: u32,
+    pub iov_iter_iov: u32,
+    pub iov_iter_ubuf: u32,
 }
 
 impl Offsets {
@@ -152,6 +160,12 @@ impl Offsets {
             tcp_bytes_sent: UNAVAILABLE,
             tcp_bytes_received: UNAVAILABLE,
             sock_sk_shutdown: UNAVAILABLE,
+            msghdr_msg_name: UNAVAILABLE,
+            msghdr_msg_namelen: UNAVAILABLE,
+            msghdr_msg_iter: UNAVAILABLE,
+            iov_iter_type: UNAVAILABLE,
+            iov_iter_iov: UNAVAILABLE,
+            iov_iter_ubuf: UNAVAILABLE,
         }
     }
 }
@@ -471,6 +485,78 @@ impl NetBody {
     }
 }
 
+/// DNS packet direction carried in [`DnsBody::dir`].
+pub const DNS_QUERY: u32 = 1;
+pub const DNS_RESPONSE: u32 = 2;
+/// Bytes of each DNS packet copied out of the kernel (a typical response fits; larger ones are
+/// flagged truncated).
+pub const DNS_CAP: usize = 512;
+
+/// Body of a [`kind::DNS`] record: the raw packet; parsing happens in userspace.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsBody {
+    pub dir: u32,
+    pub family: u32,
+    pub lport: u16,
+    pub rport: u16,
+    /// Bytes of `payload` that are valid.
+    pub len: u32,
+    pub laddr: [u8; 16],
+    pub raddr: [u8; 16],
+    pub payload: [u8; DNS_CAP],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsEvent {
+    pub hdr: RawHdr,
+    pub body: DnsBody,
+}
+
+impl DnsBody {
+    pub const SIZE: usize = 48 + DNS_CAP;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u16_at = |o: usize| u16::from_ne_bytes([b[o], b[o + 1]]);
+        let mut laddr = [0u8; 16];
+        laddr.copy_from_slice(&b[16..32]);
+        let mut raddr = [0u8; 16];
+        raddr.copy_from_slice(&b[32..48]);
+        let mut payload = [0u8; DNS_CAP];
+        payload.copy_from_slice(&b[48..Self::SIZE]);
+        Some(Self {
+            dir: u32_at(0),
+            family: u32_at(4),
+            lport: u16_at(8),
+            rport: u16_at(10),
+            len: u32_at(12),
+            laddr,
+            raddr,
+            payload,
+        })
+    }
+
+    pub fn packet(&self) -> &[u8] {
+        &self.payload[..(self.len as usize).min(DNS_CAP)]
+    }
+}
+
+/// What `udp_recvmsg` was asked to fill, remembered at entry: by the time it returns the
+/// kernel has advanced the iterator past the data, so the buffer must be saved up front.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RecvCtx {
+    pub sk: u64,
+    pub msg_name: u64,
+    pub buf: u64,
+    pub buf_len: u64,
+}
+
+pub const RECV_MAX: u32 = 4096;
+
 /// Capacity of the socket-owner map.
 pub const CONNS_MAX: u32 = 65_536;
 
@@ -566,13 +652,15 @@ impl ForkBody {
 const _: () = assert!(core::mem::size_of::<ExecBody>() == ExecBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ExitBody>() == ExitBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ForkBody>() == ForkBody::SIZE);
-const _: () = assert!(core::mem::size_of::<Offsets>() == 46 * 4);
+const _: () = assert!(core::mem::size_of::<Offsets>() == 52 * 4);
 const _: () = assert!(core::mem::size_of::<FileBody>() == FileBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileTwoBody>() == FileTwoBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileTwoEvent>() == RawHdr::SIZE + FileTwoBody::SIZE);
 const _: () = assert!(FileBody::SIZE % 8 == 0 && FileTwoBody::SIZE % 8 == 0);
 const _: () = assert!(core::mem::size_of::<InodeKey>() == 16);
+const _: () = assert!(core::mem::size_of::<DnsBody>() == DnsBody::SIZE);
+const _: () = assert!(core::mem::size_of::<DnsEvent>() == RawHdr::SIZE + DnsBody::SIZE);
 const _: () = assert!(core::mem::size_of::<NetAddrs>() == 40);
 const _: () = assert!(core::mem::size_of::<NetBody>() == NetBody::SIZE);
 const _: () = assert!(core::mem::size_of::<NetEvent>() == RawHdr::SIZE + NetBody::SIZE);

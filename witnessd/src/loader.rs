@@ -198,6 +198,13 @@ const HOOKS: [Hook; 16] = [
         Attach::BtfTp,
         Group::Net,
     ),
+    hook(
+        "tcp_listen",
+        "inet_sock_set_state",
+        None,
+        Attach::BtfTp,
+        Group::Net,
+    ),
 ];
 
 /// Outcome of attaching one optional hook.

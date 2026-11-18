@@ -77,7 +77,12 @@ fn net_body(b: &NetBody) -> Body {
         _ => Body::NetClose(NetClose {
             conn: net_conn(b, ConnOutcome::Established),
             bytes_sent: Some(b.bytes_sent),
-            bytes_recv: Some(b.bytes_recv),
+            // The kernel counts in sequence space: a received FIN is one extra "byte".
+            bytes_recv: Some(if b.flags & witness_common::NET_PEER_FIN != 0 {
+                b.bytes_recv.saturating_sub(1)
+            } else {
+                b.bytes_recv
+            }),
             duration_ns: b.duration_ns,
         }),
     }
@@ -969,6 +974,31 @@ mod net_tests {
             (Some(1200), Some(56000), 3_000_000_000)
         );
         assert_eq!(c.conn.rport, 443);
+    }
+
+    #[test]
+    fn a_received_fin_is_not_counted_as_a_byte() {
+        let mut d = dec();
+        let mut r = rec(
+            nop::CLOSE,
+            AF_INET,
+            (v4([10, 0, 0, 5]), 1),
+            (v4([10, 0, 0, 6]), 2),
+            5,
+            9,
+            1,
+        );
+        // flags live right after the two ports, at body offset 12 (header is 72 bytes)
+        r[72 + 12..72 + 16].copy_from_slice(&witness_common::NET_PEER_FIN.to_ne_bytes());
+        let Body::NetClose(c) = d.decode(&r, &|_| None).unwrap().body else {
+            panic!()
+        };
+        assert_eq!(c.bytes_recv, Some(8));
+        r[72 + 12..72 + 16].copy_from_slice(&0u32.to_ne_bytes());
+        let Body::NetClose(c) = d.decode(&r, &|_| None).unwrap().body else {
+            panic!()
+        };
+        assert_eq!(c.bytes_recv, Some(9), "no FIN seen: the counter is exact");
     }
 
     #[test]

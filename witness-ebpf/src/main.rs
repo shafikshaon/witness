@@ -909,7 +909,8 @@ unsafe fn emit_net(op: u32, sk: *const u8, owner: &ConnInfo, old: i32, new: i32,
     (*b).family = family;
     (*b).lport = rd_or::<u16>(sk, o.sock_skc_num, 0);
     (*b).rport = u16::from_be(rd_or::<u16>(sk, o.sock_skc_dport, 0));
-    (*b)._pad = 0;
+    // Bit 0 of `sk_shutdown` is RCV_SHUTDOWN: set when the peer's FIN arrives.
+    (*b).flags = (rd_or::<u8>(sk, o.sock_sk_shutdown, 0) & 1) as u32;
     // Read the IPv6 pair unconditionally, then overwrite the first four bytes for IPv4.
     (*b).laddr = rd_or::<[u8; 16]>(sk, o.sock_skc_v6_rcv_saddr, [0; 16]);
     (*b).raddr = rd_or::<[u8; 16]>(sk, o.sock_skc_v6_daddr, [0; 16]);

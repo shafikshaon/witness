@@ -329,6 +329,7 @@ impl Btf {
             sock_skc_v6_rcv_saddr: opt("sock_common", "skc_v6_rcv_saddr"),
             tcp_bytes_sent: opt("tcp_sock", "bytes_sent"),
             tcp_bytes_received: opt("tcp_sock", "bytes_received"),
+            sock_sk_shutdown: opt("sock", "sk_shutdown"),
         };
         Ok(Resolved { offsets, notes })
     }

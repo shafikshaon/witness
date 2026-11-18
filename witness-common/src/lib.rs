@@ -100,6 +100,7 @@ pub struct Offsets {
     pub sock_skc_v6_rcv_saddr: u32,
     pub tcp_bytes_sent: u32,
     pub tcp_bytes_received: u32,
+    pub sock_sk_shutdown: u32,
 }
 
 impl Offsets {
@@ -150,6 +151,7 @@ impl Offsets {
             sock_skc_v6_rcv_saddr: UNAVAILABLE,
             tcp_bytes_sent: UNAVAILABLE,
             tcp_bytes_received: UNAVAILABLE,
+            sock_sk_shutdown: UNAVAILABLE,
         }
     }
 }
@@ -347,6 +349,9 @@ impl FileTwoBody {
     }
 }
 
+/// [`NetBody::flags`]: the peer's FIN had been received.
+pub const NET_PEER_FIN: u32 = 1;
+
 /// TCP operations carried in [`NetBody::op`].
 pub mod nop {
     /// Outbound connection established (SYN_SENT -> ESTABLISHED).
@@ -386,7 +391,9 @@ pub struct NetBody {
     pub family: u32,
     pub lport: u16,
     pub rport: u16,
-    pub _pad: u32,
+    /// Bit 0: the peer's FIN had been received. The kernel's `bytes_received` counts in
+    /// sequence space, so it includes one for that FIN; userspace corrects for it.
+    pub flags: u32,
     pub laddr: [u8; 16],
     pub raddr: [u8; 16],
     pub bytes_sent: u64,
@@ -427,7 +434,7 @@ impl NetBody {
             family: u32_at(4),
             lport: u16_at(8),
             rport: u16_at(10),
-            _pad: 0,
+            flags: u32_at(12),
             laddr,
             raddr,
             bytes_sent: u64_at(48),
@@ -535,7 +542,7 @@ impl ForkBody {
 const _: () = assert!(core::mem::size_of::<ExecBody>() == ExecBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ExitBody>() == ExitBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ForkBody>() == ForkBody::SIZE);
-const _: () = assert!(core::mem::size_of::<Offsets>() == 45 * 4);
+const _: () = assert!(core::mem::size_of::<Offsets>() == 46 * 4);
 const _: () = assert!(core::mem::size_of::<FileBody>() == FileBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileTwoBody>() == FileTwoBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBody::SIZE);

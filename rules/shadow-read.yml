@@ -24,6 +24,18 @@ match:
           - /usr/sbin/vipw
           - /usr/lib/systemd/systemd-logind
           - /usr/sbin/cron
+          - /usr/bin/newgrp
+          - /usr/bin/gpasswd
+          - /usr/bin/chsh
+          - /usr/bin/chfn
+          - /usr/bin/login
+          - /usr/sbin/groupadd
+          - /usr/sbin/groupmod
+          - /usr/sbin/groupdel
+          - /usr/sbin/chpasswd
+          - /usr/sbin/newusers
+          - /usr/sbin/pwconv
+          - /usr/sbin/pwunconv
 alert:
   fields: [actor.exe, actor.user, actor.cmdline]
   suppress: 5m

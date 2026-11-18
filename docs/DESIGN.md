@@ -198,6 +198,22 @@ Eleven kernel hooks report create, mkdir, open-for-write, unlink, rmdir, chmod, 
 
 **Not done:** no `close`-after-write event (a write is a write-open followed, once quiet, by a hash); extended-attribute changes; the real hook result on x86_64; `files.sensitive_read` takes literal paths, not globs; the 60-second per-directory summaries are unit-tested but not yet observed end to end; x86_64 and other kernels are unverified (`witnessd doctor` is the tool).
 
+### 2.11 TCP and DNS events, as built and verified (Ubuntu 22.04 / 5.15.0-198 / aarch64)
+
+**TCP lifecycle.** `tcp_v4_connect`/`tcp_v6_connect` (kprobe) record the owner (pid, comm) in an LRU map keyed by `struct sock *`; `inet_csk_accept` (kretprobe) records accepted sockets; `inet_sock_set_state` (tp_btf, two programs: `tcp_state` for ESTABLISHED/CLOSE, `tcp_listen` for LISTEN) emits `net_connect`, `net_connect_failed`, `net_accept`, `net_listen`, `net_close`, `net_listen_close`. Sockets are attributed to the process that created them, not to whichever context runs the close (often a softirq).
+
+Lessons, all hit on the real kernel:
+- **The kernel clears `skc_num` (local port) when a socket closes.** Addresses are therefore snapshotted into the map record while the socket is live (`NetAddrs`) and the close event uses the snapshot.
+- **BPF stack is 512 bytes.** The 136-byte owner record cannot be copied around; it is filled in place (`fill_owner`, `read_addrs_into`) or used through `get_ptr_mut`. Every byte must be initialised before `insert`, or the verifier rejects the read of uninitialised stack. One program with listen + established + close exceeded the limit, hence the split.
+- **`tcp_bytes_received` includes the peer's FIN.** The kernel records `sk_shutdown & RCV_SHUTDOWN` in `flags`; userspace subtracts one byte. Verified: client 5 sent / 8 recv, server 8 / 5.
+- **Two rings are not ordered.** Exit records (critical ring) and network/file records (volume ring) are merged per poll batch by kernel timestamp, and the decoder keeps exited processes for a 30 s grace so late events still carry exe/cmdline.
+
+**UDP and DNS.** `udp_sendmsg`/`udpv6_sendmsg` (kprobe) capture the first iovec when the destination port is 53 (taken from `msg_name` or the connected socket). For answers, `udp_recvmsg`/`udpv6_recvmsg` kprobes save the receive buffer address in a map keyed by `pid_tgid` at entry, and the kretprobes copy the returned bytes (the iterator has moved on by then). Up to 512 bytes of each packet are copied (`DNS_CAP`); the wire format is parsed in userspace (`witnessd/src/dns.rs`: compression pointers with a hop limit, total on malformed input, tested against truncation at every length). `iov_iter` handling covers both the pre-6.0 layout (`ITER_IOVEC = 0`) and 6.0+ (`ITER_UBUF` first); only the 5.15 layout is **verified on a real kernel**, the 6.x path is *compiled only*.
+
+Not done: TCP/53 and DoT/DoH (not visible this way), per-flow UDP summaries for non-DNS traffic, per-process connection history views.
+
+**Measured.** All 22 programs verify on 5.15.0-198 aarch64 with no rejections. Startup with every hook is about 4.9 s since loading uses a work queue (heaviest verifier jobs first) instead of fixed batches (was 6.8 s); `security_path_rename` alone takes about 3.7 s in the verifier. Privileged suite: 23 tests pass, including TCP lifecycle with byte counts, child-process attribution and DNS query/response with parsed answers. x86_64 is still unverified.
+
 ## 3. Kernel side and daemon internals
 
 ### 3.1 Programs, maps, buffers

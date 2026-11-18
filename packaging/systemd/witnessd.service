@@ -1,6 +1,6 @@
 [Unit]
 Description=Witness forensic activity monitor
-Documentation=https://github.com/witness-project/witness
+Documentation=https://github.com/shafikshaon/witness
 # Start as early as practical. DefaultDependencies=no lets us order before the network and
 # login services; the matching Conflicts/Before=shutdown.target makes us stop *after* them.
 DefaultDependencies=no
@@ -39,12 +39,14 @@ User=root
 # Measured, not guessed (DESIGN.md §6.3): capture works with just CAP_BPF + CAP_PERFMON.
 # CAP_SYS_PTRACE reads other users' /proc/<pid>/exe and cwd; CAP_DAC_READ_SEARCH is for
 # hashing files. CAP_SYS_ADMIN / CAP_NET_ADMIN / CAP_AUDIT_READ are deliberately absent until
-# a feature that needs them lands and is tested.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+# a feature that needs them lands and is tested. CAP_CHOWN is only for giving the API socket
+# to the `witness` group.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN
 AmbientCapabilities=
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/witness /run/witness
+# /etc/witness/rules.d is writable so the API can save rules (tier 2 callers only).
+ReadWritePaths=/var/lib/witness /run/witness /etc/witness/rules.d
 ProtectHome=read-only
 PrivateTmp=yes
 ProtectKernelModules=yes

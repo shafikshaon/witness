@@ -1,0 +1,98 @@
+# Witness
+
+A Linux forensic activity monitor. It records what happens on one machine (processes,
+files, network and DNS, logins, devices, modules) into a **tamper-evident** store, runs
+detection rules over it, and lets you search it from a CLI or a desktop app.
+
+**It detects tampering. It does not prevent it.** Someone with root can stop the daemon or
+rewrite the files; what Witness gives you is evidence of that, through a SHA-256 hash chain,
+forward-secure sealing and anchors you keep elsewhere. Read [Threat model](#threat-model)
+before relying on it.
+
+## What it records
+
+| Area | Events | Source |
+|---|---|---|
+| Processes | exec (argv, exe, cwd), fork, exit | eBPF `sched_process_*` |
+| Files | create, open (write), delete, rename, link, chmod/chown, truncate, sensitive reads, SHA-256 of critical files | eBPF kprobes |
+| Network | TCP connect/accept/listen/close with byte counts, attributed to the owning process | eBPF kprobes + `inet_sock_set_state` |
+| DNS | queries and answers over UDP/53, parsed | eBPF kprobes |
+| Auth | sshd logins and failures, sudo/su decisions | journald |
+| System | account and `authorized_keys` changes, package installs, USB and block devices, kernel module load/unload, clock steps | passwd/shadow diffs, dpkg log, uevent netlink, eBPF, clock watch |
+| Daemon | start/stop, capture gaps and drops, source health, rule changes, API access, triage | the daemon |
+
+## Install (Debian/Ubuntu)
+
+```sh
+sudo apt install ./witness_0.1.0_arm64.deb          # daemon, CLI, rule pack
+sudo apt install ./witness-gui_0.1.0_arm64.deb      # optional desktop viewer
+sudo usermod -aG witness "$USER"                    # allow reading activity data
+```
+
+The service starts at boot, before networking and SSH. Evidence lives in
+`/var/lib/witness` and is **never deleted automatically**, not even by `apt purge`.
+
+## Use
+
+```sh
+witness show --last 20                       # recent records
+witness show --type alert --last 10
+sudo witness verify --dir /var/lib/witness   # check the hash chain
+witness anchor                               # print the head to store off-host
+witness rules lint                           # check /etc/witness/rules.d
+witness rules test rules/exec-from-tmp.yml   # replay stored events through a rule
+witness-gui                                  # desktop app
+```
+
+The API is JSON over HTTP on `/run/witness/witness.sock` (`curl --unix-socket … /v1/status`).
+Members of group `witness` can read and triage; `witness-admin` (or root) can change rules.
+
+## Rules
+
+YAML, Sigma-inspired but **not** Sigma-compatible. Field names are Witness's own: the same
+dotted paths you see in stored records (`actor.exe`, `data.path`, …). Operators: `eq ne in
+contains startswith endswith regex glob cidr gt gte lt lte exists`; correlation by `count`
+and `sequence`. A bad rule file is rejected with `file:line:col` and the others still load.
+The built-in pack (17 rules) is in [`rules/`](rules/). Edits are picked up without a restart.
+
+## Threat model
+
+- **In scope:** detecting modification, deletion, reordering or truncation of evidence on
+  disk; detecting that capture stopped or lost events (`capture_gap`, `capture_drop`).
+- **Not in scope:** preventing a root attacker from disabling capture, or from rewriting
+  the chain *and* its seals before you take an anchor elsewhere. Run `witness anchor` from
+  another machine, or configure an anchor sink, to make rewrites provable.
+- **Blind spots:** activity before the daemon started; events dropped by a full kernel
+  ring (reported, not recovered); processes that exit faster than `/proc` can be read may
+  lack `exe`; file events are *attempted* operations, not confirmed results; DNS over
+  TCP/TLS/HTTPS is not seen.
+- **Privacy:** members of `witness` can read every user's command lines, including secrets
+  typed as arguments. Treat the group as root-equivalent for confidentiality.
+
+## Build from source
+
+```sh
+rustup toolchain install nightly-2026-11-17 --component rust-src   # eBPF object
+cargo install bpf-linker --locked
+cargo build --release -p witnessd -p witness-cli                   # builds the eBPF object too
+cargo build --release -p witness-gui    # Linux needs libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev
+packaging/build-deb.sh                  # writes dist/*.deb
+```
+
+Linux 5.15+ with BTF (`/sys/kernel/btf/vmlinux`). eBPF code never runs on macOS; set
+`WITNESS_SKIP_EBPF=1` to build the userspace crates there. See [CLAUDE.md](CLAUDE.md) for
+the test workflow and [docs/DESIGN.md](docs/DESIGN.md) for the design, deviations and
+measurements.
+
+## Status
+
+See "What is verified" in [docs/DESIGN.md](docs/DESIGN.md) §14. In short: verified on Ubuntu
+22.04, kernel 5.15.0-198, **aarch64** only. **x86_64 is not verified.**
+
+## License
+
+Userspace: `MIT OR Apache-2.0` ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
+The eBPF programs declare `Dual MIT/GPL`; `witness-ebpf` source is `MIT OR GPL-2.0-only`
+(the GPL-2.0 text is available at <https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt>;
+a copy is not yet bundled). The compiled BPF object embedded in the binary is available
+under `GPL-2.0-only` or `MIT`. This is engineering guidance, not legal advice.

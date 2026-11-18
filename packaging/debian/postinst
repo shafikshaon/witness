@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+case "$1" in
+configure)
+    getent group witness >/dev/null || groupadd --system witness
+    getent group witness-admin >/dev/null || groupadd --system witness-admin
+    # Evidence directory: root only. Never removed by this package.
+    install -d -m 0700 /var/lib/witness
+    install -d -m 0755 /etc/witness/rules.d
+    if [ -x /bin/systemctl ] && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        systemctl enable witnessd.service || true
+        if [ -n "$2" ]; then
+            systemctl restart witnessd.service || true
+        else
+            systemctl start witnessd.service || true
+        fi
+    fi
+    cat <<MSG
+Witness is installed and capturing.
+  Status:   witness show --last 5
+  Verify:   sudo witness verify --dir /var/lib/witness
+  Access:   add a user to the 'witness' group to let them read activity data.
+            Members can read every user's command lines: treat the group as sensitive.
+MSG
+    ;;
+esac
+exit 0

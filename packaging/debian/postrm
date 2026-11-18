@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if [ "$1" = purge ]; then
+    # Evidence is never deleted automatically, not even on purge.
+    if [ -d /var/lib/witness ]; then
+        echo "witness: /var/lib/witness (the evidence store) was left in place; remove it yourself if you are sure."
+    fi
+fi
+exit 0

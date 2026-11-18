@@ -110,6 +110,7 @@ pub fn tail(seconds: Option<u64>) -> Result<()> {
         32 << 20,
         true,
         true,
+        true,
         &|| false,
     )?;
     for h in &hooks {

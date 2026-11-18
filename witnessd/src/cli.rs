@@ -103,10 +103,15 @@ const RING_CRITICAL_BYTES: u32 = 8 << 20;
 pub fn tail(seconds: Option<u64>) -> Result<()> {
     let btf = Btf::from_sys_fs().context("reading kernel BTF")?;
     let offsets = btf.resolve_offsets()?.offsets;
-    let (mut collector, hooks) =
-        Collector::start(offsets, &btf, RING_CRITICAL_BYTES, 32 << 20, true, &|| {
-            false
-        })?;
+    let (mut collector, hooks) = Collector::start(
+        offsets,
+        &btf,
+        RING_CRITICAL_BYTES,
+        32 << 20,
+        true,
+        true,
+        &|| false,
+    )?;
     for h in &hooks {
         if let Err(why) = &h.status {
             tracing::warn!(hook = h.hook, %why, "hook not active");

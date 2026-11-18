@@ -511,13 +511,15 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                         status,
                         note,
                         uid,
-                    } => Body::TriageAction(witness_common::schema::TriageAction {
-                        alert_seq,
-                        status,
-                        note,
-                        actor_uid: uid,
-                    }),
-                    crate::api::ApiCmd::Access(a) => Body::ApiAccess(a),
+                    } => witness_common::schema::Body::TriageAction(
+                        witness_common::schema::TriageAction {
+                            alert_seq,
+                            status,
+                            note,
+                            actor_uid: uid,
+                        },
+                    ),
+                    crate::api::ApiCmd::Access(a) => witness_common::schema::Body::ApiAccess(a),
                 };
                 if let Err(e) = pipeline.record(body) {
                     failure = Some(e);

@@ -1207,3 +1207,87 @@ mod net {
         assert_eq!(resp["data"]["answers"][0]["ttl"], 300);
     }
 }
+
+mod auth {
+    use std::process::Command;
+
+    use super::store_mode::{records, spawn, verify};
+
+    fn sh(cmd: &str) {
+        let _ = Command::new("sh").args(["-c", cmd]).status();
+    }
+
+    #[test]
+    #[ignore = "needs root, journald and sshd"]
+    fn auth_and_account_activity_is_recorded_from_real_sources() {
+        let t = tempfile::tempdir().unwrap();
+        let user = format!("wt{}", std::process::id() % 100_000);
+        sh(&format!("userdel -r {user} 2>/dev/null"));
+        let (mut child, _err) = spawn(t.path(), 25);
+        // Give the journal follower time to reach the end of the journal.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        // sudo policy decision, logged by sudo itself.
+        sh("sudo -n /usr/bin/id -u >/dev/null 2>&1");
+        // A failed ssh login against the local sshd.
+        sh(
+            "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=5 witness-no-such-user@127.0.0.1 true >/dev/null 2>&1",
+        );
+        // An account and an authorized key appear, then the key changes, then the user goes.
+        sh(&format!("useradd -m {user}"));
+        sh(&format!(
+            "mkdir -p /home/{user}/.ssh && echo 'ssh-ed25519 \
+             AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl x' \
+             > /home/{user}/.ssh/authorized_keys"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        sh(&format!(
+            "usermod -s /bin/sh {user}; passwd -l {user} >/dev/null 2>&1"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        sh(&format!("userdel -r {user} 2>/dev/null"));
+        let _ = child.wait();
+
+        let ev = records(t.path());
+        verify(t.path());
+        let of = |ty: &str| -> Vec<&serde_json::Value> {
+            ev.iter().filter(|e| e["type"] == ty).collect()
+        };
+        let sudo = of("sudo");
+        assert!(
+            sudo.iter()
+                .any(|e| e["data"]["command"] == "/usr/bin/id -u"),
+            "sudo events: {sudo:?}"
+        );
+        let fails = of("auth_fail");
+        assert!(
+            fails
+                .iter()
+                .any(|e| e["data"]["user"] == "witness-no-such-user"),
+            "auth_fail events: {fails:?}"
+        );
+        let acct = of("account_change");
+        assert!(acct
+            .iter()
+            .any(|e| e["data"]["name"] == user.as_str() && e["data"]["change"] == "created"));
+        assert!(acct
+            .iter()
+            .any(|e| e["data"]["name"] == user.as_str() && e["data"]["password_changed"] == true));
+        assert!(acct
+            .iter()
+            .any(|e| e["data"]["name"] == user.as_str() && e["data"]["change"] == "deleted"));
+        let keys = of("authorized_key_change");
+        assert!(
+            keys.iter().any(|e| e["data"]["user"] == user.as_str()
+                && e["data"]["change"] == "created"
+                && e["data"]["fingerprint"]
+                    == "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"),
+            "key events: {keys:?}"
+        );
+        assert!(
+            !serde_json::to_string(&acct).unwrap().contains("$6$"),
+            "a password hash leaked"
+        );
+    }
+}

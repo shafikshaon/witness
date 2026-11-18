@@ -301,6 +301,24 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         _ => ("degraded", Some(failed.join("; "))),
     };
     pipeline.source_health("ebpf.files", status, reason)?;
+    let sources = cfg
+        .capture
+        .auth
+        .then(|| crate::sources::Sources::start(crate::sources::Roots::default(), true));
+    match &sources {
+        Some(s) if s.unavailable.is_empty() => pipeline.source_health("auth", "active", None)?,
+        Some(s) => {
+            let why = s
+                .unavailable
+                .iter()
+                .map(|(n, e)| format!("{n}: {e}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            tracing::warn!(reason = %why, "auth source degraded");
+            pipeline.source_health("auth", "degraded", Some(why))?
+        }
+        None => pipeline.source_health("auth", "disabled", None)?,
+    }
     tracing::info!(
         kernel = %kernel_release(),
         data_dir = %data_dir.display(),
@@ -445,6 +463,18 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                 break 'main;
             }
         }
+        if let Some(s) = &sources {
+            let (b, w) = (
+                crate::pipeline::Clock::boot_ns(&clock),
+                crate::pipeline::Clock::wall_ns(&clock),
+            );
+            for ev in s.drain(&boot, b, w) {
+                if let Err(e) = pipeline.ingest(&ev) {
+                    failure = Some(e);
+                    break 'main;
+                }
+            }
+        }
         if last_summary.elapsed() >= summary_every {
             let interval = last_summary.elapsed().as_nanos() as u64;
             last_summary = Instant::now();
@@ -485,6 +515,9 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
 
     // Detach from the kernel first so nothing new arrives while we finish.
     drop(collector);
+    if let Some(s) = sources {
+        s.stop();
+    }
     let reason = match (&failure, signalled) {
         (Some(_), _) => "error",
         (None, Some(_)) => "signal",

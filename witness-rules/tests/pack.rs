@@ -63,6 +63,16 @@ fn every_pack_rule_loads_and_the_obvious_cases_fire() {
             ),
             "witness.file.shadow-read",
         ),
+        // An interpreter run by hand is still reported.
+        (
+            ev_cmd(
+                "file_open_read",
+                "/usr/bin/perl",
+                &["perl", "-e", "print <>", "/etc/shadow"],
+                json!({"path": "/etc/shadow"}),
+            ),
+            "witness.file.shadow-read",
+        ),
         (
             ev(
                 "file_attr",
@@ -166,6 +176,25 @@ fn ordinary_activity_is_quiet() {
         ev(
             "file_open_read",
             "/usr/sbin/sshd",
+            json!({"path": "/etc/shadow"}),
+        ),
+        // `sg` is newgrp, which reads shadow for group passwords (seen on Ubuntu 22.04).
+        ev(
+            "file_open_read",
+            "/usr/bin/newgrp",
+            json!({"path": "/etc/shadow"}),
+        ),
+        // Routine root-run scripts that look users up (seen during apt runs and at boot).
+        ev_cmd(
+            "file_open_read",
+            "/usr/bin/perl",
+            &["/usr/bin/perl", "-w", "/usr/share/debconf/frontend", "x"],
+            json!({"path": "/etc/shadow"}),
+        ),
+        ev_cmd(
+            "file_open_read",
+            "/usr/bin/python3.10",
+            &["/usr/bin/python3", "/usr/bin/cloud-init", "init"],
             json!({"path": "/etc/shadow"}),
         ),
         ev(

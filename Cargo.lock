@@ -1048,6 +1048,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "witness-config",
+ "witness-rules",
  "witness-store",
 ]
 

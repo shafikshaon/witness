@@ -125,10 +125,37 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Check rules and try them against stored evidence.
+    Rules {
+        #[command(subcommand)]
+        cmd: RulesCmd,
+    },
     /// Print the current chain head to record somewhere the host cannot rewrite.
     Anchor {
         #[arg(long, default_value = DEFAULT_DIR)]
         dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum RulesCmd {
+    /// Compile every rule file and report errors (file:line:col). Exit 1 if any are rejected.
+    Lint {
+        #[arg(default_value = "/etc/witness/rules.d")]
+        dir: PathBuf,
+    },
+    /// Replay stored events through rules and print what would have alerted. Writes nothing.
+    Test {
+        /// A rule file or a directory of rules.
+        rules: PathBuf,
+        #[arg(long, default_value = DEFAULT_DIR)]
+        dir: PathBuf,
+        /// Also read segments from this archive directory (repeatable).
+        #[arg(long = "include")]
+        include: Vec<PathBuf>,
+        /// Stop after this many alerts.
+        #[arg(long, default_value_t = 100)]
+        max_alerts: usize,
     },
 }
 
@@ -199,6 +226,7 @@ fn run() -> Result<ExitCode> {
             last,
             json,
         } => cmd_show(&dir, &include, &types, last, json),
+        Cmd::Rules { cmd } => cmd_rules(cmd),
         Cmd::Anchor { dir } => {
             let (seq, head) = read_head(&dir.join("segments"))
                 .with_context(|| format!("reading {}", dir.display()))?;
@@ -465,6 +493,90 @@ fn cmd_show(
             println!("{}", summarize(v));
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_rules(cmd: RulesCmd) -> Result<ExitCode> {
+    match cmd {
+        RulesCmd::Lint { dir } => {
+            let r = witness_rules::load_dir(&dir)
+                .with_context(|| format!("reading {}", dir.display()))?;
+            for e in &r.errors {
+                eprintln!("rejected: {e}");
+            }
+            println!(
+                "{} rules ok, {} rejected (set {})",
+                r.set.rules.len(),
+                r.errors.len(),
+                &r.set.sha256[..16.min(r.set.sha256.len())]
+            );
+            Ok(if r.errors.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        RulesCmd::Test {
+            rules,
+            dir,
+            include,
+            max_alerts,
+        } => cmd_rules_test(&rules, &dir, &include, max_alerts),
+    }
+}
+
+fn cmd_rules_test(
+    rules: &Path,
+    dir: &Path,
+    include: &[PathBuf],
+    max_alerts: usize,
+) -> Result<ExitCode> {
+    use std::io::BufRead;
+    let loaded = if rules.is_dir() {
+        witness_rules::load_dir(rules)?
+    } else {
+        let text =
+            fs::read_to_string(rules).with_context(|| format!("reading {}", rules.display()))?;
+        let name = rules
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        witness_rules::load_str([(name.as_str(), text.as_str())])
+    };
+    for e in &loaded.errors {
+        eprintln!("rejected: {e}");
+    }
+    if !loaded.errors.is_empty() {
+        return Ok(ExitCode::from(1));
+    }
+    let mut engine = witness_rules::Engine::new(loaded.set);
+    let mut dirs = vec![dir.join("segments")];
+    dirs.extend(include.iter().map(|d| d.join("segments")));
+    let (mut events, mut alerts) = (0u64, 0usize);
+    'all: for seg in witness_store::segment::list_segments_in(&dirs)? {
+        for line in witness_store::segment::open_reader(&seg)?.lines() {
+            let line = line?;
+            let (body, _) = chain::decode_line(line.as_bytes())?;
+            let v: serde_json::Value = serde_json::from_slice(&body)?;
+            // The engine's own output is not input to it.
+            if matches!(v["type"].as_str(), Some("alert" | "rule_set_change")) {
+                continue;
+            }
+            events += 1;
+            let seq = v["seq"].as_u64().unwrap_or(0);
+            for a in engine.process_value(seq, &v) {
+                alerts += 1;
+                println!(
+                    "{:?} {} (rule {}) seqs={:?} {}",
+                    a.severity, a.title, a.rule_id, a.trigger_seqs, a.detail
+                );
+                if alerts >= max_alerts {
+                    break 'all;
+                }
+            }
+        }
+    }
+    println!("{events} events replayed, {alerts} alerts (nothing was written)");
     Ok(ExitCode::SUCCESS)
 }
 

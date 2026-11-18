@@ -1023,6 +1023,8 @@ unsafe fn on_state(ctx: &BtfTracePointContext) {
     let key = sk as u64;
     let o = offsets();
 
+    // The owner record is read through the map's own memory: copying a 136-byte record onto
+    // the 512-byte BPF stack, more than once, overflows it.
     if new == TCP_LISTEN {
         // listen() runs in the owning process.
         if is_self() {
@@ -1033,12 +1035,9 @@ unsafe fn on_state(ctx: &BtfTracePointContext) {
         let _ = CONNS.insert(&key, &info, 0);
         emit_net(nop::LISTEN, sk, &info, &info.net, old, new, &o);
     } else if new == TCP_CLOSE {
-        // Copy the owner out of the map before removing it.
-        let Some(found) = CONNS.get(&key) else {
+        let Some(owner) = CONNS.get_ptr(&key) else {
             return;
         };
-        let owner = *found;
-        let _ = CONNS.remove(&key);
         let op = if old == TCP_SYN_SENT {
             nop::CONNECT_FAILED
         } else if old == TCP_LISTEN {
@@ -1048,20 +1047,19 @@ unsafe fn on_state(ctx: &BtfTracePointContext) {
         };
         // A failed connect never got a snapshot; everything else did, and the live socket has
         // already lost its local port by now.
-        let addrs = if owner.net.family == 0 {
-            read_addrs(sk, &o)
+        if (*owner).net.family == 0 {
+            let live = read_addrs(sk, &o);
+            emit_net(op, sk, &*owner, &live, old, new, &o);
         } else {
-            owner.net
-        };
-        emit_net(op, sk, &owner, &addrs, old, new, &o);
+            emit_net(op, sk, &*owner, &(*owner).net, old, new, &o);
+        }
+        let _ = CONNS.remove(&key);
     } else if new == TCP_ESTABLISHED && old == TCP_SYN_SENT {
-        let Some(found) = CONNS.get(&key) else {
+        let Some(owner) = CONNS.get_ptr_mut(&key) else {
             return;
         };
-        let mut owner = *found;
-        owner.net = read_addrs(sk, &o);
-        let _ = CONNS.insert(&key, &owner, 0);
-        emit_net(nop::CONNECT, sk, &owner, &owner.net, old, new, &o);
+        (*owner).net = read_addrs(sk, &o);
+        emit_net(nop::CONNECT, sk, &*owner, &(*owner).net, old, new, &o);
     }
 }
 

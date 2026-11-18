@@ -423,25 +423,113 @@ fn clock_offset_ns() -> i128 {
 /// Steps smaller than this are scheduler noise or NTP slewing, not tampering.
 const CLOCK_STEP_NS: i128 = 500_000_000;
 
+fn clock_event(delta: i128, tx: &Sender<Pending>) -> bool {
+    tx.send(Pending {
+        src: Source::Daemon,
+        body: Body::ClockChange(ClockChange {
+            kind: ClockKind::Step,
+            delta_ns: delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+            syscall: None,
+        }),
+        wall_ns: None,
+    })
+    .is_ok()
+}
+
+/// A `timerfd` on `CLOCK_REALTIME` with `TFD_TIMER_CANCEL_ON_SET` is cancelled (`ECANCELED`)
+/// every time the clock is *set* (settimeofday, clock_settime, ADJ_SETOFFSET), but not by NTP
+/// slewing. Unlike polling, it also sees a step that is undone moments later (time
+/// synchronisation on a VM can revert one within milliseconds), because each set wakes us.
+#[cfg(target_os = "linux")]
+fn clock_timerfd() -> std::io::Result<std::os::fd::OwnedFd> {
+    use rustix::time::{timerfd_create, TimerfdClockId, TimerfdFlags};
+    Ok(timerfd_create(
+        TimerfdClockId::Realtime,
+        TimerfdFlags::CLOEXEC | TimerfdFlags::NONBLOCK,
+    )?)
+}
+
+#[cfg(target_os = "linux")]
+fn arm_on_set(fd: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    use rustix::time::{timerfd_settime, Itimerspec, TimerfdTimerFlags, Timespec};
+    // Absolute and far in the future: it never expires, it only reports clock sets.
+    let never = Timespec {
+        tv_sec: i64::MAX / 4,
+        tv_nsec: 0,
+    };
+    let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    timerfd_settime(
+        fd,
+        TimerfdTimerFlags::ABSTIME | TimerfdTimerFlags::CANCEL_ON_SET,
+        &Itimerspec {
+            it_interval: zero,
+            it_value: never,
+        },
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn clock_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>) {
+    use rustix::event::{poll, PollFd, PollFlags};
+    let fd = match clock_timerfd().and_then(|fd| arm_on_set(&fd).map(|()| fd)) {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::warn!(error = %e, "timerfd clock watch unavailable; polling instead");
+            return clock_poll_loop(tx, stop);
+        }
+    };
+    let mut last = clock_offset_ns();
+    while !stop.load(Ordering::SeqCst) {
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+        match poll(
+            &mut fds,
+            Some(&rustix::time::Timespec {
+                tv_sec: 0,
+                tv_nsec: 250_000_000,
+            }),
+        ) {
+            Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+            Ok(_) => {}
+            Err(_) => return clock_poll_loop(tx, stop),
+        }
+        let mut buf = [0u8; 8];
+        // ECANCELED is the signal; anything else readable is not a clock set.
+        if matches!(
+            rustix::io::read(&fd, &mut buf),
+            Err(rustix::io::Errno::CANCELED)
+        ) {
+            // Re-arm first so a second set (the revert) is not missed, then measure.
+            if arm_on_set(&fd).is_err() {
+                return clock_poll_loop(tx, stop);
+            }
+            let now = clock_offset_ns();
+            if !clock_event(now - last, &tx) {
+                return;
+            }
+            last = now;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clock_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>) {
+    clock_poll_loop(tx, stop)
+}
+
+/// Fallback: compare the realtime/boottime offset every 250 ms. Misses a step that is undone
+/// within one interval.
+fn clock_poll_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>) {
     let mut last = clock_offset_ns();
     while !stop.load(Ordering::SeqCst) {
         sleep_unless_stopped(&stop, Duration::from_millis(250));
         let now = clock_offset_ns();
         let delta = now - last;
-        if delta.abs() >= CLOCK_STEP_NS {
-            let p = Pending {
-                src: Source::Daemon,
-                body: Body::ClockChange(ClockChange {
-                    kind: ClockKind::Step,
-                    delta_ns: delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
-                    syscall: None,
-                }),
-                wall_ns: None,
-            };
-            if tx.send(p).is_err() {
-                return;
-            }
+        if delta.abs() >= CLOCK_STEP_NS && !clock_event(delta, &tx) {
+            return;
         }
         last = now;
     }

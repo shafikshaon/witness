@@ -9,3 +9,4 @@ pub mod hasher;
 #[cfg(target_os = "linux")]
 pub mod loader;
 pub mod pipeline;
+pub mod sensitive;

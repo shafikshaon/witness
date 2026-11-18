@@ -31,6 +31,8 @@ pub mod fop {
     pub const CHMOD: u32 = 6;
     pub const CHOWN: u32 = 7;
     pub const TRUNCATE: u32 = 8;
+    /// A read-only open of a file on the sensitive list (matched by inode in the kernel).
+    pub const OPEN_READ: u32 = 9;
     pub const RENAME: u32 = 20;
     pub const LINK: u32 = 21;
     pub const SYMLINK: u32 = 22;
@@ -237,6 +239,19 @@ pub struct FileTwoEvent {
     pub body: FileTwoBody,
 }
 
+/// Identity of a file for the in-kernel sensitive-file filter: the superblock's kernel-format
+/// `dev_t` (`major << 20 | minor`) and the inode number.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InodeKey {
+    pub dev: u32,
+    pub _pad: u32,
+    pub ino: u64,
+}
+
+/// Capacity of the sensitive-inode map.
+pub const SENSITIVE_MAX: u32 = 512;
+
 /// `result` value meaning the hook's outcome was not observed (kprobes see the call, not
 /// its return value).
 pub const RESULT_UNKNOWN: i32 = i32::MAX;
@@ -410,6 +425,7 @@ const _: () = assert!(core::mem::size_of::<FileTwoBody>() == FileTwoBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileTwoEvent>() == RawHdr::SIZE + FileTwoBody::SIZE);
 const _: () = assert!(FileBody::SIZE % 8 == 0 && FileTwoBody::SIZE % 8 == 0);
+const _: () = assert!(core::mem::size_of::<InodeKey>() == 16);
 const _: () = assert!(PATH_CAP.is_power_of_two());
 const _: () = assert!(MAX_COMPONENTS * (COMP_CAP + 1) <= SCRATCH_LEN);
 const _: () = assert!(SCRATCH_LEN.is_power_of_two());

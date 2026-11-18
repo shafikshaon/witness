@@ -124,6 +124,12 @@ impl FilePolicy {
             Body::FileAttr(f) => (vec![&f.path], Kind::Other),
             Body::FileRename(f) => (vec![&f.old, &f.new], Kind::Other),
             Body::FileLink(f) => (vec![&f.path], Kind::Other),
+            // Only files on the sensitive list reach us as reads (the kernel matches them by
+            // inode), so every one is evidence regardless of where the file lives.
+            Body::FileOpenRead(_) => {
+                ev.prio = Priority::P1 as u8;
+                return Some(ev);
+            }
             _ => return Some(ev),
         };
         let classes: Vec<Class> = paths
@@ -194,6 +200,21 @@ impl FilePolicy {
                 }
             })
             .collect()
+    }
+}
+
+/// Every path a file event names (for noticing changes to watched files).
+pub fn touched_paths(ev: &Event) -> Vec<&OsBytes> {
+    match &ev.body {
+        Body::FileOpenWrite(f)
+        | Body::FileOpenRead(f)
+        | Body::FileCreate(f)
+        | Body::FileDelete(f)
+        | Body::FileTruncate(f) => vec![&f.path],
+        Body::FileRename(r) => vec![&r.old, &r.new],
+        Body::FileLink(l) => vec![&l.path],
+        Body::FileAttr(a) => vec![&a.path],
+        _ => Vec::new(),
     }
 }
 

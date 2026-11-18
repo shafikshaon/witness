@@ -23,6 +23,7 @@ use crate::filepolicy::{content_changed_path, Class, FilePolicy};
 use crate::hasher::{Hasher, Settings as HashSettings};
 use crate::loader::Collector;
 use crate::pipeline::{Pipeline, Settings, SystemClock};
+use crate::sensitive::Sensitive;
 
 /// Kernel functions the planned hooks attach to (DESIGN.md §2); `doctor` reports which
 /// exist on this kernel.
@@ -345,6 +346,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         debounce: Duration::from_millis(cfg.files.hash_debounce_ms),
         queue: 256,
     });
+    let mut sensitive = Sensitive::new(&cfg.files.sensitive_read);
     let summary_every = Duration::from_secs(60);
     let mut last_summary = Instant::now();
     let resolve = |pid: u32| {
@@ -378,6 +380,9 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                     if let Some(ev) = policy.apply(ev) {
                         // A change under a critical path starts that file's quiet period;
                         // it is hashed once it has settled.
+                        for p in crate::filepolicy::touched_paths(&ev) {
+                            sensitive.note_change(&p.to_string_lossy(), Instant::now());
+                        }
                         if let Some(path) = content_changed_path(&ev) {
                             if policy.classify(&path.to_string_lossy()) == Class::Critical {
                                 hasher.note(path, ev.actor.clone(), Instant::now());
@@ -413,6 +418,12 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         }
         if last_drops == drops {
             drops_since = crate::pipeline::Clock::boot_ns(&clock);
+        }
+        if sensitive.due(Instant::now()) {
+            let delta = sensitive.refresh(Instant::now());
+            if let Err(e) = collector.sync_sensitive(&delta.add, &delta.remove) {
+                tracing::warn!(error = %e, "could not update the sensitive-file set");
+            }
         }
         hasher.tick(Instant::now());
         let hashed = hasher.drain(

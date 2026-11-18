@@ -15,11 +15,11 @@ use aya_ebpf::{
         bpf_probe_read_kernel_str_bytes, generated,
     },
     macros::{btf_tracepoint, kprobe, map},
-    maps::{PerCpuArray, RingBuf},
+    maps::{HashMap, PerCpuArray, RingBuf},
     programs::{BtfTracePointContext, ProbeContext},
 };
 use witness_common::{
-    RESULT_UNKNOWN, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
+    InodeKey, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
     MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
 };
@@ -32,6 +32,11 @@ static CRITICAL: RingBuf = RingBuf::with_byte_size(8 << 20, 0);
 /// never evict process lifecycle records.
 #[map]
 static VOLUME: RingBuf = RingBuf::with_byte_size(32 << 20, 0);
+
+/// Files whose *reads* are reported, keyed by `(dev, ino)`. Filled by the loader from the
+/// configured sensitive list; matching by inode means no path walk for ordinary opens.
+#[map]
+static SENSITIVE: HashMap<InodeKey, u8> = HashMap::with_max_entries(SENSITIVE_MAX, 0);
 
 /// Where paths are assembled before the final bounded copy into a record (one per CPU).
 #[map]
@@ -644,18 +649,23 @@ pub fn file_open(ctx: ProbeContext) -> u32 {
         let ret: i32 = RESULT_UNKNOWN;
         let o = offsets();
         let mode: u32 = rd_or(file, o.file_f_mode, 0);
-        if mode & FMODE_WRITE == 0 {
-            return 0;
-        }
         let flags: u32 = rd_or(file, o.file_f_flags, 0);
         let fpath = file.add(o.file_f_path as usize);
         let (mnt, dentry) = path_parts(fpath, &o);
         if dentry.is_null() {
             return 0;
         }
-        // Regular files only: directories, devices and sockets are not file writes.
-        let (_, _, _, imode) = file_identity(dentry, &o);
+        // Regular files only: directories, devices and sockets are not file accesses.
+        let (_, dev, ino, imode) = file_identity(dentry, &o);
         if imode & S_IFMT != S_IFREG {
+            return 0;
+        }
+        if mode & FMODE_WRITE == 0 {
+            // A read-only open matters only for files on the sensitive list.
+            let key = InodeKey { dev, _pad: 0, ino };
+            if SENSITIVE.get_ptr(&key).is_some() {
+                emit_file(fop::OPEN_READ, ret, mnt, dentry, flags, 0, 0, 0);
+            }
             return 0;
         }
         emit_file(fop::OPEN_WRITE, ret, mnt, dentry, flags, 0, 0, 0);

@@ -5,15 +5,24 @@ use std::os::fd::AsFd;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use aya::maps::{MapData, PerCpuArray, RingBuf};
+use aya::maps::{HashMap as BpfHashMap, MapData, PerCpuArray, RingBuf};
 use aya::programs::BtfTracePoint;
 use aya::{Btf as AyaBtf, EbpfLoader, VerifierLogLevel};
-use witness_common::{Offsets, UNAVAILABLE};
+use witness_common::{InodeKey, Offsets, UNAVAILABLE};
 
 use crate::btf::Btf;
 
 /// The compiled eBPF object (empty placeholder if it was not built; see `build.rs`).
 static OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/witness-ebpf"));
+
+/// `InodeKey` made usable as a map key.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct KeyPod(InodeKey);
+
+// SAFETY: `InodeKey` is `repr(C)`, fully initialised (explicit pad field, no implicit
+// padding) and made of integers, so any bytes copied to or from the kernel are valid.
+unsafe impl aya::Pod for KeyPod {}
 
 /// SHA-256 of the embedded eBPF object, recorded in `daemon_start`.
 pub fn object_sha256() -> String {
@@ -137,6 +146,7 @@ pub struct Collector {
     critical: RingBuf<MapData>,
     volume: RingBuf<MapData>,
     drops: PerCpuArray<MapData, u64>,
+    sensitive: BpfHashMap<MapData, KeyPod, u8>,
     // Dropping `Ebpf` detaches the programs, so it must outlive the readers.
     _ebpf: aya::Ebpf,
 }
@@ -283,11 +293,13 @@ impl Collector {
         let critical = RingBuf::try_from(take(&mut ebpf, "CRITICAL")?)?;
         let volume = RingBuf::try_from(take(&mut ebpf, "VOLUME")?)?;
         let drops = PerCpuArray::try_from(take(&mut ebpf, "DROPS")?)?;
+        let sensitive = BpfHashMap::try_from(take(&mut ebpf, "SENSITIVE")?)?;
         Ok((
             Collector {
                 critical,
                 volume,
                 drops,
+                sensitive,
                 _ebpf: ebpf,
             },
             reports,
@@ -333,6 +345,20 @@ impl Collector {
             n += 1;
         }
         Ok(n)
+    }
+
+    /// Updates the set of files whose reads are reported.
+    pub fn sync_sensitive(&mut self, add: &[InodeKey], remove: &[InodeKey]) -> Result<()> {
+        for k in add {
+            self.sensitive
+                .insert(KeyPod(*k), 1, 0)
+                .context("adding a sensitive file")?;
+        }
+        for k in remove {
+            // Already gone is fine.
+            let _ = self.sensitive.remove(&KeyPod(*k));
+        }
+        Ok(())
     }
 
     /// Events lost in the kernel because a ring buffer was full, `[critical, volume]`.

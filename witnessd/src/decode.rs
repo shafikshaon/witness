@@ -57,6 +57,7 @@ fn file_op(b: &FileBody, mode: Option<u32>, flags: Option<u32>) -> FileOp {
 fn file_body(b: &FileBody) -> Body {
     match b.op {
         fop::OPEN_WRITE => Body::FileOpenWrite(file_op(b, None, Some(b.flags))),
+        fop::OPEN_READ => Body::FileOpenRead(file_op(b, None, Some(b.flags))),
         fop::CREATE => Body::FileCreate(file_op(b, Some(b.mode), None)),
         fop::MKDIR => Body::FileCreate(file_op(b, Some(b.mode | S_IFDIR), None)),
         fop::UNLINK => Body::FileDelete(file_op(b, None, None)),

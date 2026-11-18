@@ -1,13 +1,16 @@
 //! Turns raw ring-buffer records from the kernel programs into schema [`Event`]s.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use witness_common::schema::{
-    puid, Actor, AttrOp, Body, Event, FileAttr, FileLink, FileOp, FileRename, HookResult, LinkKind,
-    OsBytes, Priority, ProcExec, ProcExit, ProcFork, Source, SCHEMA_VERSION,
+    puid, Actor, AttrOp, Body, ConnOutcome, Event, FileAttr, FileLink, FileOp, FileRename,
+    HookResult, LinkKind, NetClose, NetConn, NetListen, OsBytes, Priority, ProcExec, ProcExit,
+    ProcFork, Proto, Source, SCHEMA_VERSION,
 };
 use witness_common::{
-    flags, fop, kind, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody, RawHdr,
+    flags, fop, kind, nop, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody, NetBody, RawHdr,
+    AF_INET,
 };
 
 const S_ISUID: u32 = 0o4000;
@@ -31,6 +34,53 @@ pub enum DecodeError {
     Short,
     #[error("unknown event kind {0}")]
     UnknownKind(u16),
+}
+
+fn ip(family: u32, a: &[u8; 16]) -> IpAddr {
+    if family == AF_INET {
+        IpAddr::V4(Ipv4Addr::new(a[0], a[1], a[2], a[3]))
+    } else {
+        IpAddr::V6(Ipv6Addr::from(*a))
+    }
+}
+
+fn net_conn(b: &NetBody, outcome: ConnOutcome) -> NetConn {
+    NetConn {
+        proto: Proto::Tcp,
+        laddr: ip(b.family, &b.laddr),
+        lport: b.lport,
+        raddr: ip(b.family, &b.raddr),
+        rport: b.rport,
+        outcome,
+        errno: None,
+    }
+}
+
+fn net_body(b: &NetBody) -> Body {
+    match b.op {
+        nop::CONNECT => Body::NetConnect(net_conn(b, ConnOutcome::Established)),
+        nop::CONNECT_FAILED => Body::NetConnect(net_conn(b, ConnOutcome::Failed)),
+        nop::ACCEPT => Body::NetAccept(net_conn(b, ConnOutcome::Accepted)),
+        nop::LISTEN | nop::LISTEN_CLOSE => {
+            let l = NetListen {
+                proto: Proto::Tcp,
+                addr: ip(b.family, &b.laddr),
+                port: b.lport,
+            };
+            if b.op == nop::LISTEN {
+                Body::NetListen(l)
+            } else {
+                Body::NetListenClose(l)
+            }
+        }
+        // CLOSE, and anything newer we do not recognise: keep it as a close.
+        _ => Body::NetClose(NetClose {
+            conn: net_conn(b, ConnOutcome::Established),
+            bytes_sent: Some(b.bytes_sent),
+            bytes_recv: Some(b.bytes_recv),
+            duration_ns: b.duration_ns,
+        }),
+    }
 }
 
 fn hook_result(r: i32) -> HookResult {
@@ -308,6 +358,15 @@ impl Decoder {
                     actor.exe = resolve_exe(hdr.pid).map(OsBytes);
                 }
                 file_two_body(&b)
+            }
+            kind::NET_TCP => {
+                let b = NetBody::parse(body).ok_or(DecodeError::Short)?;
+                actor.comm = String::from_utf8_lossy(&cstr(&b.comm, 16)).into_owned();
+                self.enrich(&mut actor);
+                if actor.exe.is_none() {
+                    actor.exe = resolve_exe(hdr.pid).map(OsBytes);
+                }
+                net_body(&b)
             }
             other => return Err(DecodeError::UnknownKind(other)),
         };
@@ -781,5 +840,190 @@ mod file_tests {
         xr.extend(xb);
         d.decode(&xr, &|_| None).unwrap();
         assert!(d.procs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+    use witness_common::AF_INET6;
+
+    fn rec(
+        op: u32,
+        family: u32,
+        l: ([u8; 16], u16),
+        r: ([u8; 16], u16),
+        sent: u64,
+        recv: u64,
+        dur: u64,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; NetBody::SIZE];
+        b[0..4].copy_from_slice(&op.to_ne_bytes());
+        b[4..8].copy_from_slice(&family.to_ne_bytes());
+        b[8..10].copy_from_slice(&l.1.to_ne_bytes());
+        b[10..12].copy_from_slice(&r.1.to_ne_bytes());
+        b[16..32].copy_from_slice(&l.0);
+        b[32..48].copy_from_slice(&r.0);
+        b[48..56].copy_from_slice(&sent.to_ne_bytes());
+        b[56..64].copy_from_slice(&recv.to_ne_bytes());
+        b[64..72].copy_from_slice(&dur.to_ne_bytes());
+        b[80..84].copy_from_slice(b"curl");
+        let hdr = RawHdr {
+            kind: kind::NET_TCP,
+            flags: 0,
+            len: (RawHdr::SIZE + b.len()) as u32,
+            boot_ns: 9,
+            pid: 77,
+            tid: 77,
+            ppid: 1,
+            _pad0: 0,
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
+            auid: 1000,
+            ses: 4,
+            cgroup_id: 3,
+            start_boot_ns: 20_000_000,
+        };
+        let mut out = hdr.to_bytes().to_vec();
+        out.extend(b);
+        out
+    }
+
+    fn v4(a: [u8; 4]) -> [u8; 16] {
+        let mut x = [0u8; 16];
+        x[..4].copy_from_slice(&a);
+        x
+    }
+
+    fn dec() -> Decoder {
+        Decoder::new("4f2a9c1e-0000-0000-0000-000000000000")
+    }
+
+    #[test]
+    fn outbound_connect_close_and_failure() {
+        let mut d = dec();
+        let c = d
+            .decode(
+                &rec(
+                    nop::CONNECT,
+                    AF_INET,
+                    (v4([10, 0, 0, 5]), 51234),
+                    (v4([93, 184, 216, 34]), 443),
+                    0,
+                    0,
+                    0,
+                ),
+                &|_| None,
+            )
+            .unwrap();
+        assert_eq!(c.prio, 1);
+        assert_eq!(c.actor.as_ref().unwrap().comm, "curl");
+        let Body::NetConnect(n) = c.body else {
+            panic!()
+        };
+        assert_eq!(n.raddr, "93.184.216.34".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            (n.lport, n.rport, n.outcome),
+            (51234, 443, ConnOutcome::Established)
+        );
+
+        let f = d
+            .decode(
+                &rec(
+                    nop::CONNECT_FAILED,
+                    AF_INET,
+                    (v4([0; 4]), 0),
+                    (v4([127, 0, 0, 1]), 9),
+                    0,
+                    0,
+                    0,
+                ),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::NetConnect(n) = f.body else {
+            panic!()
+        };
+        assert_eq!(n.outcome, ConnOutcome::Failed);
+
+        let x = d
+            .decode(
+                &rec(
+                    nop::CLOSE,
+                    AF_INET,
+                    (v4([10, 0, 0, 5]), 51234),
+                    (v4([93, 184, 216, 34]), 443),
+                    1200,
+                    56000,
+                    3_000_000_000,
+                ),
+                &|_| None,
+            )
+            .unwrap();
+        assert_eq!(x.prio, 2);
+        let Body::NetClose(c) = x.body else { panic!() };
+        assert_eq!(
+            (c.bytes_sent, c.bytes_recv, c.duration_ns),
+            (Some(1200), Some(56000), 3_000_000_000)
+        );
+        assert_eq!(c.conn.rport, 443);
+    }
+
+    #[test]
+    fn accept_and_ipv6_listen() {
+        let mut d = dec();
+        let a = d
+            .decode(
+                &rec(
+                    nop::ACCEPT,
+                    AF_INET,
+                    (v4([10, 0, 0, 5]), 22),
+                    (v4([192, 168, 1, 9]), 40022),
+                    0,
+                    0,
+                    0,
+                ),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::NetAccept(n) = a.body else { panic!() };
+        assert_eq!(
+            (n.lport, n.raddr, n.outcome),
+            (
+                22,
+                "192.168.1.9".parse::<IpAddr>().unwrap(),
+                ConnOutcome::Accepted
+            )
+        );
+
+        let lo = std::net::Ipv6Addr::LOCALHOST.octets();
+        let l = d
+            .decode(
+                &rec(nop::LISTEN, AF_INET6, (lo, 8080), ([0; 16], 0), 0, 0, 0),
+                &|_| None,
+            )
+            .unwrap();
+        let Body::NetListen(n) = l.body else { panic!() };
+        assert_eq!(
+            (n.addr, n.port),
+            (IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 8080)
+        );
+        let lc = d
+            .decode(
+                &rec(
+                    nop::LISTEN_CLOSE,
+                    AF_INET6,
+                    (lo, 8080),
+                    ([0; 16], 0),
+                    0,
+                    0,
+                    0,
+                ),
+                &|_| None,
+            )
+            .unwrap();
+        assert!(matches!(lc.body, Body::NetListenClose(_)));
     }
 }

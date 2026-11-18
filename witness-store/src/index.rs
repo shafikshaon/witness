@@ -317,7 +317,14 @@ fn insert_event(
     .map_err(db)?;
 
     let cmdline = join_strings(&a["cmdline"]).or_else(|| join_strings(&v["data"]["argv"]));
-    let path = v["data"]["path"].as_str().map(str::to_owned);
+    // Files by path; network events by the remote (or listening) address, so a search for an
+    // IP finds the connections to it.
+    let path = v["data"]["path"]
+        .as_str()
+        .or_else(|| v["data"]["raddr"].as_str())
+        .or_else(|| v["data"]["conn"]["raddr"].as_str())
+        .or_else(|| v["data"]["addr"].as_str())
+        .map(str::to_owned);
     let name = v["data"]["qname"]
         .as_str()
         .or_else(|| a["comm"].as_str())

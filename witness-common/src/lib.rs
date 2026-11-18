@@ -371,6 +371,29 @@ pub mod nop {
 pub const AF_INET: u32 = 2;
 pub const AF_INET6: u32 = 10;
 
+/// A connection's addresses and ports. Snapshotted while the socket is live because the
+/// kernel clears the local port (`skc_num`) when the socket closes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetAddrs {
+    /// 0 until captured.
+    pub family: u32,
+    pub lport: u16,
+    pub rport: u16,
+    pub laddr: [u8; 16],
+    pub raddr: [u8; 16],
+}
+
+impl NetAddrs {
+    pub const ZERO: NetAddrs = NetAddrs {
+        family: 0,
+        lport: 0,
+        rport: 0,
+        laddr: [0; 16],
+        raddr: [0; 16],
+    };
+}
+
 /// What the kernel remembers about the process that owns a socket, so later state changes
 /// (reported from softirq, where "current" is arbitrary) can be attributed to it.
 #[repr(C)]
@@ -381,6 +404,7 @@ pub struct ConnInfo {
     pub comm: [u8; COMM_LEN],
     /// `CLOCK_BOOTTIME` when the socket was first seen, for the connection's duration.
     pub since_ns: u64,
+    pub net: NetAddrs,
 }
 
 /// Body of a [`kind::NET_TCP`] record. Addresses are 16 bytes: IPv4 uses the first four.
@@ -549,9 +573,10 @@ const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBo
 const _: () = assert!(core::mem::size_of::<FileTwoEvent>() == RawHdr::SIZE + FileTwoBody::SIZE);
 const _: () = assert!(FileBody::SIZE % 8 == 0 && FileTwoBody::SIZE % 8 == 0);
 const _: () = assert!(core::mem::size_of::<InodeKey>() == 16);
+const _: () = assert!(core::mem::size_of::<NetAddrs>() == 40);
 const _: () = assert!(core::mem::size_of::<NetBody>() == NetBody::SIZE);
 const _: () = assert!(core::mem::size_of::<NetEvent>() == RawHdr::SIZE + NetBody::SIZE);
-const _: () = assert!(core::mem::size_of::<ConnInfo>() == RawHdr::SIZE + COMM_LEN + 8);
+const _: () = assert!(core::mem::size_of::<ConnInfo>() == RawHdr::SIZE + COMM_LEN + 8 + 40);
 const _: () = assert!(PATH_CAP.is_power_of_two());
 const _: () = assert!(MAX_COMPONENTS * (COMP_CAP + 1) <= SCRATCH_LEN);
 const _: () = assert!(SCRATCH_LEN.is_power_of_two());

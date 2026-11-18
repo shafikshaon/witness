@@ -19,7 +19,7 @@ use aya_ebpf::{
     programs::{BtfTracePointContext, ProbeContext, RetProbeContext},
 };
 use witness_common::{
-    nop, ConnInfo, InodeKey, NetEvent, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
+    nop, ConnInfo, InodeKey, NetAddrs, NetEvent, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
     MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
 };
@@ -881,6 +881,7 @@ unsafe fn current_owner(o: &Offsets) -> ConnInfo {
         hdr: RawHdr::ZERO,
         comm: comm_or_zero(),
         since_ns: bpf_ktime_get_boot_ns(),
+        net: NetAddrs::ZERO,
     };
     let task = generated::bpf_get_current_task() as *const u8;
     fill_hdr(
@@ -893,9 +894,39 @@ unsafe fn current_owner(o: &Offsets) -> ConnInfo {
     info
 }
 
-/// Emits one TCP lifecycle record for socket `sk`, attributed to `owner`.
+/// Reads a socket's addresses and ports as they are right now.
 #[inline(always)]
-unsafe fn emit_net(op: u32, sk: *const u8, owner: &ConnInfo, old: i32, new: i32, o: &Offsets) {
+unsafe fn read_addrs(sk: *const u8, o: &Offsets) -> NetAddrs {
+    let family = rd_or::<u16>(sk, o.sock_skc_family, 0) as u32;
+    let mut a = NetAddrs {
+        family,
+        lport: rd_or::<u16>(sk, o.sock_skc_num, 0),
+        rport: u16::from_be(rd_or::<u16>(sk, o.sock_skc_dport, 0)),
+        // The IPv6 pair is read unconditionally; IPv4 overwrites the first four bytes below.
+        laddr: rd_or::<[u8; 16]>(sk, o.sock_skc_v6_rcv_saddr, [0; 16]),
+        raddr: rd_or::<[u8; 16]>(sk, o.sock_skc_v6_daddr, [0; 16]),
+    };
+    if family == AF_INET {
+        let l = rd_or::<[u8; 4]>(sk, o.sock_skc_rcv_saddr, [0; 4]);
+        let r = rd_or::<[u8; 4]>(sk, o.sock_skc_daddr, [0; 4]);
+        a.laddr = [l[0], l[1], l[2], l[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        a.raddr = [r[0], r[1], r[2], r[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    }
+    a
+}
+
+/// Emits one TCP lifecycle record for socket `sk`, attributed to `owner`, with `addrs` as its
+/// addresses (live-read, or the snapshot taken while the socket was still open).
+#[inline(always)]
+unsafe fn emit_net(
+    op: u32,
+    sk: *const u8,
+    owner: &ConnInfo,
+    addrs: &NetAddrs,
+    old: i32,
+    new: i32,
+    o: &Offsets,
+) {
     let Some(mut entry) = VOLUME.reserve::<NetEvent>(0) else {
         count_drop(DROP_CLASS_VOLUME);
         return;
@@ -904,22 +935,14 @@ unsafe fn emit_net(op: u32, sk: *const u8, owner: &ConnInfo, old: i32, new: i32,
     copy_hdr(addr_of_mut!((*ev).hdr), &owner.hdr);
     (*ev).hdr.boot_ns = bpf_ktime_get_boot_ns();
     let b = addr_of_mut!((*ev).body);
-    let family = rd_or::<u16>(sk, o.sock_skc_family, 0) as u32;
     (*b).op = op;
-    (*b).family = family;
-    (*b).lport = rd_or::<u16>(sk, o.sock_skc_num, 0);
-    (*b).rport = u16::from_be(rd_or::<u16>(sk, o.sock_skc_dport, 0));
+    (*b).family = addrs.family;
+    (*b).lport = addrs.lport;
+    (*b).rport = addrs.rport;
     // Bit 0 of `sk_shutdown` is RCV_SHUTDOWN: set when the peer's FIN arrives.
     (*b).flags = (rd_or::<u8>(sk, o.sock_sk_shutdown, 0) & 1) as u32;
-    // Read the IPv6 pair unconditionally, then overwrite the first four bytes for IPv4.
-    (*b).laddr = rd_or::<[u8; 16]>(sk, o.sock_skc_v6_rcv_saddr, [0; 16]);
-    (*b).raddr = rd_or::<[u8; 16]>(sk, o.sock_skc_v6_daddr, [0; 16]);
-    if family == AF_INET {
-        let l = rd_or::<[u8; 4]>(sk, o.sock_skc_rcv_saddr, [0; 4]);
-        let r = rd_or::<[u8; 4]>(sk, o.sock_skc_daddr, [0; 4]);
-        (*b).laddr = [l[0], l[1], l[2], l[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        (*b).raddr = [r[0], r[1], r[2], r[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    }
+    (*b).laddr = addrs.laddr;
+    (*b).raddr = addrs.raddr;
     (*b).bytes_sent = rd_or::<u64>(sk, o.tcp_bytes_sent, 0);
     (*b).bytes_recv = rd_or::<u64>(sk, o.tcp_bytes_received, 0);
     (*b).duration_ns = (*ev).hdr.boot_ns.wrapping_sub(owner.since_ns);
@@ -968,9 +991,18 @@ pub fn tcp_accept(ctx: RetProbeContext) -> u32 {
             return 0;
         }
         let o = offsets();
-        let info = current_owner(&o);
+        let mut info = current_owner(&o);
+        info.net = read_addrs(sk as *const u8, &o);
         let _ = CONNS.insert(&sk, &info, 0);
-        emit_net(nop::ACCEPT, sk as *const u8, &info, TCP_LISTEN, TCP_ESTABLISHED, &o);
+        emit_net(
+            nop::ACCEPT,
+            sk as *const u8,
+            &info,
+            &info.net,
+            TCP_LISTEN,
+            TCP_ESTABLISHED,
+            &o,
+        );
     }
     0
 }
@@ -996,9 +1028,10 @@ unsafe fn on_state(ctx: &BtfTracePointContext) {
         if is_self() {
             return;
         }
-        let info = current_owner(&o);
+        let mut info = current_owner(&o);
+        info.net = read_addrs(sk, &o);
         let _ = CONNS.insert(&key, &info, 0);
-        emit_net(nop::LISTEN, sk, &info, old, new, &o);
+        emit_net(nop::LISTEN, sk, &info, &info.net, old, new, &o);
     } else if new == TCP_CLOSE {
         // Copy the owner out of the map before removing it.
         let Some(found) = CONNS.get(&key) else {
@@ -1013,13 +1046,22 @@ unsafe fn on_state(ctx: &BtfTracePointContext) {
         } else {
             nop::CLOSE
         };
-        emit_net(op, sk, &owner, old, new, &o);
+        // A failed connect never got a snapshot; everything else did, and the live socket has
+        // already lost its local port by now.
+        let addrs = if owner.net.family == 0 {
+            read_addrs(sk, &o)
+        } else {
+            owner.net
+        };
+        emit_net(op, sk, &owner, &addrs, old, new, &o);
     } else if new == TCP_ESTABLISHED && old == TCP_SYN_SENT {
         let Some(found) = CONNS.get(&key) else {
             return;
         };
-        let owner = *found;
-        emit_net(nop::CONNECT, sk, &owner, old, new, &o);
+        let mut owner = *found;
+        owner.net = read_addrs(sk, &o);
+        let _ = CONNS.insert(&key, &owner, 0);
+        emit_net(nop::CONNECT, sk, &owner, &owner.net, old, new, &o);
     }
 }
 

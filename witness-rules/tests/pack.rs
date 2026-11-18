@@ -10,6 +10,12 @@ fn pack() -> Engine {
     Engine::new(r.set)
 }
 
+fn ev_cmd(kind: &str, exe: &str, cmd: &[&str], data: Value) -> Value {
+    let mut e = ev(kind, exe, data);
+    e["actor"]["cmdline"] = json!(cmd);
+    e
+}
+
 fn ev(kind: &str, exe: &str, data: Value) -> Value {
     json!({"type": kind, "boot_ns": 1_000_000_000u64, "actor": {"puid": "p1", "ses": 3, "exe": exe, "user": "u"}, "data": data})
 }

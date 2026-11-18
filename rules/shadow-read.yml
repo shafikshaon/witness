@@ -36,6 +36,17 @@ match:
           - /usr/sbin/newusers
           - /usr/sbin/pwconv
           - /usr/sbin/pwunconv
+    # Routine root-run scripts that look users up through getpwnam (seen on Ubuntu 22.04 during
+    # apt runs and at boot). Matched on the script's own command line, so `perl -e '...'` typed
+    # by an attacker does not match.
+    - not:
+        field: actor.cmdline
+        op: contains
+        value:
+          - debconf
+          - dpkg-preconfigure
+          - cloud-init
+          - 'getpwnam("man")'
 alert:
   fields: [actor.exe, actor.user, actor.cmdline]
   suppress: 5m

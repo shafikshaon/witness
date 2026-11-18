@@ -320,6 +320,15 @@ impl Btf {
             inode_i_ino: opt("inode", "i_ino"),
             sb_s_dev: opt("super_block", "s_dev"),
             sb_s_magic: opt("super_block", "s_magic"),
+            sock_skc_daddr: opt("sock_common", "skc_daddr"),
+            sock_skc_rcv_saddr: opt("sock_common", "skc_rcv_saddr"),
+            sock_skc_dport: opt("sock_common", "skc_dport"),
+            sock_skc_num: opt("sock_common", "skc_num"),
+            sock_skc_family: opt("sock_common", "skc_family"),
+            sock_skc_v6_daddr: opt("sock_common", "skc_v6_daddr"),
+            sock_skc_v6_rcv_saddr: opt("sock_common", "skc_v6_rcv_saddr"),
+            tcp_bytes_sent: opt("tcp_sock", "bytes_sent"),
+            tcp_bytes_received: opt("tcp_sock", "bytes_received"),
         };
         Ok(Resolved { offsets, notes })
     }

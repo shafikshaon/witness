@@ -19,6 +19,8 @@ pub mod kind {
     pub const FILE_OP: u16 = 10;
     /// Two-path file operation: rename, link, symlink ([`super::FileTwoEvent`]).
     pub const FILE_TWO: u16 = 11;
+    /// TCP connection lifecycle ([`super::NetEvent`]).
+    pub const NET_TCP: u16 = 20;
 }
 
 /// File operations carried in [`FileBody::op`] / [`FileTwoBody::op`].
@@ -89,6 +91,15 @@ pub struct Offsets {
     pub inode_i_ino: u32,
     pub sb_s_dev: u32,
     pub sb_s_magic: u32,
+    pub sock_skc_daddr: u32,
+    pub sock_skc_rcv_saddr: u32,
+    pub sock_skc_dport: u32,
+    pub sock_skc_num: u32,
+    pub sock_skc_family: u32,
+    pub sock_skc_v6_daddr: u32,
+    pub sock_skc_v6_rcv_saddr: u32,
+    pub tcp_bytes_sent: u32,
+    pub tcp_bytes_received: u32,
 }
 
 impl Offsets {
@@ -130,6 +141,15 @@ impl Offsets {
             inode_i_ino: UNAVAILABLE,
             sb_s_dev: UNAVAILABLE,
             sb_s_magic: UNAVAILABLE,
+            sock_skc_daddr: UNAVAILABLE,
+            sock_skc_rcv_saddr: UNAVAILABLE,
+            sock_skc_dport: UNAVAILABLE,
+            sock_skc_num: UNAVAILABLE,
+            sock_skc_family: UNAVAILABLE,
+            sock_skc_v6_daddr: UNAVAILABLE,
+            sock_skc_v6_rcv_saddr: UNAVAILABLE,
+            tcp_bytes_sent: UNAVAILABLE,
+            tcp_bytes_received: UNAVAILABLE,
         }
     }
 }
@@ -327,6 +347,102 @@ impl FileTwoBody {
     }
 }
 
+/// TCP operations carried in [`NetBody::op`].
+pub mod nop {
+    /// Outbound connection established (SYN_SENT -> ESTABLISHED).
+    pub const CONNECT: u32 = 1;
+    /// Outbound connection failed (SYN_SENT -> CLOSE).
+    pub const CONNECT_FAILED: u32 = 2;
+    /// Inbound connection accepted by a process.
+    pub const ACCEPT: u32 = 3;
+    /// A connection closed.
+    pub const CLOSE: u32 = 4;
+    /// A socket started listening.
+    pub const LISTEN: u32 = 5;
+    /// A listening socket closed.
+    pub const LISTEN_CLOSE: u32 = 6;
+}
+
+pub const AF_INET: u32 = 2;
+pub const AF_INET6: u32 = 10;
+
+/// What the kernel remembers about the process that owns a socket, so later state changes
+/// (reported from softirq, where "current" is arbitrary) can be attributed to it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ConnInfo {
+    /// The owner's header, captured at `connect()`/`accept()`/`listen()` time.
+    pub hdr: RawHdr,
+    pub comm: [u8; COMM_LEN],
+    /// `CLOCK_BOOTTIME` when the socket was first seen, for the connection's duration.
+    pub since_ns: u64,
+}
+
+/// Body of a [`kind::NET_TCP`] record. Addresses are 16 bytes: IPv4 uses the first four.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetBody {
+    pub op: u32,
+    pub family: u32,
+    pub lport: u16,
+    pub rport: u16,
+    pub _pad: u32,
+    pub laddr: [u8; 16],
+    pub raddr: [u8; 16],
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    pub duration_ns: u64,
+    pub old_state: u32,
+    pub new_state: u32,
+    pub comm: [u8; COMM_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetEvent {
+    pub hdr: RawHdr,
+    pub body: NetBody,
+}
+
+impl NetBody {
+    pub const SIZE: usize = 96;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u16_at = |o: usize| u16::from_ne_bytes([b[o], b[o + 1]]);
+        let u64_at = |o: usize| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&b[o..o + 8]);
+            u64::from_ne_bytes(a)
+        };
+        let mut laddr = [0u8; 16];
+        laddr.copy_from_slice(&b[16..32]);
+        let mut raddr = [0u8; 16];
+        raddr.copy_from_slice(&b[32..48]);
+        let mut comm = [0u8; COMM_LEN];
+        comm.copy_from_slice(&b[80..96]);
+        Some(Self {
+            op: u32_at(0),
+            family: u32_at(4),
+            lport: u16_at(8),
+            rport: u16_at(10),
+            _pad: 0,
+            laddr,
+            raddr,
+            bytes_sent: u64_at(48),
+            bytes_recv: u64_at(56),
+            duration_ns: u64_at(64),
+            old_state: u32_at(72),
+            new_state: u32_at(76),
+            comm,
+        })
+    }
+}
+
+/// Capacity of the socket-owner map.
+pub const CONNS_MAX: u32 = 65_536;
+
 /// A complete exec record as written into the ring buffer.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -419,13 +535,16 @@ impl ForkBody {
 const _: () = assert!(core::mem::size_of::<ExecBody>() == ExecBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ExitBody>() == ExitBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ForkBody>() == ForkBody::SIZE);
-const _: () = assert!(core::mem::size_of::<Offsets>() == 36 * 4);
+const _: () = assert!(core::mem::size_of::<Offsets>() == 45 * 4);
 const _: () = assert!(core::mem::size_of::<FileBody>() == FileBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileTwoBody>() == FileTwoBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileTwoEvent>() == RawHdr::SIZE + FileTwoBody::SIZE);
 const _: () = assert!(FileBody::SIZE % 8 == 0 && FileTwoBody::SIZE % 8 == 0);
 const _: () = assert!(core::mem::size_of::<InodeKey>() == 16);
+const _: () = assert!(core::mem::size_of::<NetBody>() == NetBody::SIZE);
+const _: () = assert!(core::mem::size_of::<NetEvent>() == RawHdr::SIZE + NetBody::SIZE);
+const _: () = assert!(core::mem::size_of::<ConnInfo>() == RawHdr::SIZE + COMM_LEN + 8);
 const _: () = assert!(PATH_CAP.is_power_of_two());
 const _: () = assert!(MAX_COMPONENTS * (COMP_CAP + 1) <= SCRATCH_LEN);
 const _: () = assert!(SCRATCH_LEN.is_power_of_two());

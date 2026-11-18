@@ -1326,4 +1326,46 @@ mod auth {
             "block events: {blocks:?}"
         );
     }
+
+    #[test]
+    #[ignore = "needs root and a loadable module"]
+    fn module_load_and_unload_are_attributed_to_the_loader() {
+        let t = tempfile::tempdir().unwrap();
+        // `dummy` is a small network driver shipped with every distribution kernel.
+        let have = Command::new("modinfo")
+            .arg("dummy")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        if !have {
+            eprintln!("skipped: no `dummy` module on this kernel");
+            return;
+        }
+        Command::new("rmmod").arg("dummy").status().ok();
+        let (mut child, _err) = spawn(t.path(), 10);
+        assert!(Command::new("modprobe")
+            .arg("dummy")
+            .status()
+            .unwrap()
+            .success());
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(Command::new("rmmod")
+            .arg("dummy")
+            .status()
+            .unwrap()
+            .success());
+        let _ = child.wait();
+
+        let ev = records(t.path());
+        verify(t.path());
+        let load = ev
+            .iter()
+            .find(|e| e["type"] == "module_load" && e["data"]["name"] == "dummy")
+            .expect("module_load");
+        assert_eq!(load["actor"]["comm"], "modprobe");
+        assert!(ev
+            .iter()
+            .any(|e| e["type"] == "module_unload" && e["data"]["name"] == "dummy"));
+    }
 }

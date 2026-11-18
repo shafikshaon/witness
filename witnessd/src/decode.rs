@@ -9,8 +9,8 @@ use witness_common::schema::{
     Priority, ProcExec, ProcExit, ProcFork, Proto, Source, SCHEMA_VERSION,
 };
 use witness_common::{
-    flags, fop, kind, nop, DnsBody, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody, NetBody,
-    RawHdr, AF_INET,
+    flags, fop, kind, modop, nop, DnsBody, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody,
+    ModuleBody, NetBody, RawHdr, AF_INET,
 };
 
 const S_ISUID: u32 = 0o4000;
@@ -414,6 +414,23 @@ impl Decoder {
                     actor.exe = resolve_exe(hdr.pid).map(OsBytes);
                 }
                 net_body(&b)
+            }
+            kind::MODULE => {
+                let b = ModuleBody::parse(body).ok_or(DecodeError::Short)?;
+                self.enrich(&mut actor);
+                if actor.exe.is_none() {
+                    actor.exe = resolve_exe(hdr.pid).map(OsBytes);
+                }
+                let m = Module {
+                    name: String::from_utf8_lossy(&cstr(&b.name, b.name.len())).into_owned(),
+                    file: None,
+                    taints: (b.taints != 0).then(|| format!("{:#x}", b.taints)),
+                };
+                if b.op == modop::LOAD {
+                    Body::ModuleLoad(m)
+                } else {
+                    Body::ModuleUnload(m)
+                }
             }
             kind::DNS => {
                 let b = DnsBody::parse(body).ok_or(DecodeError::Short)?;

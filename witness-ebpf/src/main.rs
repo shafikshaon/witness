@@ -19,8 +19,8 @@ use aya_ebpf::{
     programs::{BtfTracePointContext, ProbeContext, RetProbeContext},
 };
 use witness_common::{
-    nop, ConnInfo, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
-    DNS_RESPONSE, RECV_MAX, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
+    nop, modop, ConnInfo, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
+    DNS_RESPONSE, RECV_MAX, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, ModuleEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
     MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
 };
@@ -1087,6 +1087,52 @@ unsafe fn on_state(ctx: &BtfTracePointContext) {
         read_addrs_into(addr_of_mut!((*owner).net), sk, &o);
         emit_net(nop::CONNECT, sk, owner, addr_of_mut!((*owner).net), old, new, &o);
     }
+}
+
+// ---- kernel modules ---------------------------------------------------------------------
+
+/// module_load / module_free(struct module *mod). Loading runs in the loading process's context,
+/// so attribution is exact; frees can run anywhere and are attributed to whoever is current.
+#[inline(always)]
+unsafe fn on_module(ctx: &BtfTracePointContext, op: u32) {
+    if is_self() {
+        return;
+    }
+    let m: *const u8 = ctx.arg(0);
+    let o = offsets();
+    let Some(mut entry) = CRITICAL.reserve::<ModuleEvent>(0) else {
+        count_drop(DROP_CLASS_CRITICAL);
+        return;
+    };
+    let ev = entry.as_mut_ptr();
+    let task = generated::bpf_get_current_task() as *const u8;
+    fill_hdr(
+        addr_of_mut!((*ev).hdr),
+        kind::MODULE,
+        core::mem::size_of::<ModuleEvent>(),
+        task,
+        &o,
+    );
+    let b = addr_of_mut!((*ev).body);
+    (*b).op = op;
+    (*b)._pad = 0;
+    (*b).taints = rd_or::<u64>(m, o.module_taints, 0);
+    (*b).name = rd_or::<[u8; 56]>(m, o.module_name, [0; 56]);
+    entry.submit(0);
+}
+
+#[btf_tracepoint(function = "module_load")]
+pub fn module_load(ctx: BtfTracePointContext) -> i32 {
+    // SAFETY: kernel memory is only read through the probe-read helper.
+    unsafe { on_module(&ctx, modop::LOAD) };
+    0
+}
+
+#[btf_tracepoint(function = "module_free")]
+pub fn module_free(ctx: BtfTracePointContext) -> i32 {
+    // SAFETY: as above.
+    unsafe { on_module(&ctx, modop::FREE) };
+    0
 }
 
 // ---- DNS (UDP) --------------------------------------------------------------------------

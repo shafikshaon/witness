@@ -345,6 +345,8 @@ impl Btf {
             // Present only on kernels with ITER_UBUF (6.0+).
             iov_iter_ubuf: self.field_offset("iov_iter", "ubuf").unwrap_or(UNAVAILABLE),
             iov_iter_count: opt("iov_iter", "count"),
+            module_name: opt("module", "name"),
+            module_taints: opt("module", "taints"),
         };
         Ok(Resolved { offsets, notes })
     }

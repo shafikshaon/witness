@@ -52,6 +52,7 @@ enum Group {
     Files,
     Net,
     Dns,
+    System,
 }
 
 #[derive(Clone, Copy)]
@@ -93,7 +94,7 @@ const fn hook(
 /// All optional hooks. File hooks are kprobes (no fentry/fexit on arm64 before 6.0, and
 /// `kuid_t` by-value arguments); TCP uses kprobes on connect/accept plus the
 /// `inet_sock_set_state` tracepoint.
-const HOOKS: [Hook; 22] = [
+const HOOKS: [Hook; 24] = [
     hook(
         "file_open",
         "security_file_open",
@@ -205,6 +206,20 @@ const HOOKS: [Hook; 22] = [
         None,
         Attach::BtfTp,
         Group::Net,
+    ),
+    hook(
+        "module_load",
+        "module_load",
+        None,
+        Attach::BtfTp,
+        Group::System,
+    ),
+    hook(
+        "module_free",
+        "module_free",
+        None,
+        Attach::BtfTp,
+        Group::System,
     ),
     hook(
         "udp_send4",
@@ -384,6 +399,7 @@ pub struct Groups {
     pub files: bool,
     pub network: bool,
     pub dns: bool,
+    pub system: bool,
 }
 
 /// `(hook index, program name, outcome)` for one hook load.
@@ -404,6 +420,7 @@ impl Collector {
             files,
             network,
             dns,
+            system,
         } = groups;
         if OBJECT.is_empty() {
             bail!("this build has no eBPF object (built off Linux or with WITNESS_SKIP_EBPF=1)");
@@ -445,6 +462,14 @@ impl Collector {
         let missing_files = missing_file_offsets(&offsets);
         let missing_net = missing_net_offsets(&offsets);
         let missing_dns = missing_dns_offsets(&offsets);
+        let missing_system: Vec<&'static str> = [
+            ("module.name", offsets.module_name),
+            ("module.taints", offsets.module_taints),
+        ]
+        .into_iter()
+        .filter(|(_, v)| *v == UNAVAILABLE)
+        .map(|(n, _)| n)
+        .collect();
         // Diagnostic: attach only the named hook (e.g. WITNESS_ONLY_HOOK=security_file_open).
         let only = std::env::var("WITNESS_ONLY_HOOK").ok();
         let mut by_name: std::collections::HashMap<String, &mut aya::programs::Program> = ebpf
@@ -465,6 +490,7 @@ impl Collector {
                     Group::Files => (files, &missing_files, layout_problem(&offsets)),
                     Group::Net => (network, &missing_net, None),
                     Group::Dns => (dns && network, &missing_dns, None),
+                    Group::System => (system, &missing_system, None),
                 };
                 if !enabled {
                     return Err("capture of this kind is disabled in the configuration".into());

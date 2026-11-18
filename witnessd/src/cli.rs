@@ -112,6 +112,7 @@ pub fn tail(seconds: Option<u64>) -> Result<()> {
             files: true,
             network: true,
             dns: true,
+            system: true,
         },
         &|| false,
     )?;
@@ -288,6 +289,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
             files: cfg.capture.files,
             network: cfg.capture.network,
             dns: cfg.capture.dns,
+            system: cfg.capture.auth,
         },
         &|| signal_pending(sigfd.as_fd()),
     )?;

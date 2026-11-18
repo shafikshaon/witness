@@ -23,6 +23,8 @@ pub mod kind {
     pub const NET_TCP: u16 = 20;
     /// A DNS packet over UDP ([`super::DnsEvent`]).
     pub const DNS: u16 = 21;
+    /// A kernel module load or free ([`super::ModuleEvent`]).
+    pub const MODULE: u16 = 22;
 }
 
 /// File operations carried in [`FileBody::op`] / [`FileTwoBody::op`].
@@ -110,6 +112,8 @@ pub struct Offsets {
     pub iov_iter_iov: u32,
     pub iov_iter_ubuf: u32,
     pub iov_iter_count: u32,
+    pub module_name: u32,
+    pub module_taints: u32,
 }
 
 impl Offsets {
@@ -168,6 +172,8 @@ impl Offsets {
             iov_iter_iov: UNAVAILABLE,
             iov_iter_ubuf: UNAVAILABLE,
             iov_iter_count: UNAVAILABLE,
+            module_name: UNAVAILABLE,
+            module_taints: UNAVAILABLE,
         }
     }
 }
@@ -487,6 +493,53 @@ impl NetBody {
     }
 }
 
+/// [`ModuleBody::op`] values.
+pub mod modop {
+    pub const LOAD: u32 = 1;
+    pub const FREE: u32 = 2;
+}
+
+/// `MODULE_NAME_LEN` in the kernel.
+pub const MODULE_NAME_LEN: usize = 56;
+
+/// Body of a [`kind::MODULE`] record.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ModuleBody {
+    pub op: u32,
+    pub _pad: u32,
+    /// `struct module::taints` bit mask.
+    pub taints: u64,
+    pub name: [u8; MODULE_NAME_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ModuleEvent {
+    pub hdr: RawHdr,
+    pub body: ModuleBody,
+}
+
+impl ModuleBody {
+    pub const SIZE: usize = 16 + MODULE_NAME_LEN;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let mut t = [0u8; 8];
+        t.copy_from_slice(&b[8..16]);
+        let mut name = [0u8; MODULE_NAME_LEN];
+        name.copy_from_slice(&b[16..]);
+        Some(Self {
+            op: u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+            _pad: 0,
+            taints: u64::from_ne_bytes(t),
+            name,
+        })
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ModuleBody>() == ModuleBody::SIZE);
+
 /// DNS packet direction carried in [`DnsBody::dir`].
 pub const DNS_QUERY: u32 = 1;
 pub const DNS_RESPONSE: u32 = 2;
@@ -654,7 +707,7 @@ impl ForkBody {
 const _: () = assert!(core::mem::size_of::<ExecBody>() == ExecBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ExitBody>() == ExitBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ForkBody>() == ForkBody::SIZE);
-const _: () = assert!(core::mem::size_of::<Offsets>() == 53 * 4);
+const _: () = assert!(core::mem::size_of::<Offsets>() == 55 * 4);
 const _: () = assert!(core::mem::size_of::<FileBody>() == FileBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileTwoBody>() == FileTwoBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBody::SIZE);

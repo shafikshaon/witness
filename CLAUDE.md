@@ -10,7 +10,7 @@ Linux forensic activity monitor. Authoritative design: `docs/DESIGN.md` (approve
 
 ## Commands
 - Userspace build/test (stable): `cargo build --workspace --exclude witness-ebpf` / `cargo test --workspace --exclude witness-ebpf --all-features`
-- Lint: `cargo fmt --all --check` and `cargo clippy --workspace --exclude witness-ebpf --all-targets --all-features -- -D warnings`
+- Lint: `cargo fmt --all --check` and `cargo clippy --workspace --exclude witness-ebpf --all-targets --all-features -- -D warnings`. **Run clippy on the Linux VM too**: Linux-only code (`loader.rs`, `cli.rs`) is not compiled on macOS, so a green Mac run proves nothing about it.
 - eBPF object: built automatically by `witnessd/build.rs` on Linux (needs `rustup` nightly `nightly-2026-11-17` with `rust-src`, and `bpf-linker` on PATH). Skip with `WITNESS_SKIP_EBPF=1` (e.g. on macOS or for clippy).
 - Privileged integration tests (Linux VM, root only): build as the normal user, run the binary with sudo: `T=$(cargo test -p witnessd --test integration --no-run 2>&1 | sed -n 's/.*(\(target[^)]*\)).*/\1/p' | head -1); sudo $T --ignored --test-threads=1 --nocapture`
 - Run the daemon on the VM: `sudo target/debug/witnessd run --config /nonexistent --data-dir /tmp/wd --seconds 10`, then `target/debug/witness verify --dir /tmp/wd` (use `sudo sh -c` for globs inside the root-only data dir).
@@ -24,6 +24,15 @@ Linux forensic activity monitor. Authoritative design: `docs/DESIGN.md` (approve
 - Evidence is never deleted automatically. Never corrupt existing segments.
 - Hash is computed over the exact stored bytes (no re-serialization).
 - Tamper *detection*, not prevention.
+
+## More workflow lessons
+- Packaging: `packaging/build-deb.sh target/release /tmp/dist` on the VM after `cargo build --release -p witnessd -p witness-cli [-p witness-gui]`. GUI on Linux needs `libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev`; headless screenshots need `xvfb-run` + `dbus-run-session` and `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`.
+- The VM checkout's `Cargo.lock` gets modified by its own cargo runs and blocks `git pull`; run `git checkout Cargo.lock` first.
+- Never `pkill -f "witnessd run"` in a shell whose own command line contains that text (it kills the shell); use `pkill -x witnessd`.
+- After a text-replace edit, grep to confirm it landed; rustfmt reflows code and silent misses already cost a debugging round (the rule engine was once not started at all).
+- Expected values in tests must come from an independent source (`ssh-keygen -l`, `date -u`), not from memory.
+- Real data finds bugs unit tests do not: sudo's padded messages, `newgrp`/debconf shadow reads, `iov_iter` layouts.
+- Screenshots: `limactl copy witness-dev:/tmp/x.png <mac path>`; the macOS home is read-only inside the VM.
 
 ## Git
 - Small, focused commits. **No Co-Authored-By trailer** (user preference).

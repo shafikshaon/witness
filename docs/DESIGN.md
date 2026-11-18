@@ -214,6 +214,53 @@ Not done: TCP/53 and DoT/DoH (not visible this way), per-flow UDP summaries for 
 
 **Measured.** All 22 programs verify on 5.15.0-198 aarch64 with no rejections. Startup with every hook is about 4.9 s since loading uses a work queue (heaviest verifier jobs first) instead of fixed batches (was 6.8 s); `security_path_rename` alone takes about 3.7 s in the verifier. Privileged suite: 23 tests pass, including TCP lifecycle with byte counts, child-process attribution and DNS query/response with parsed answers. x86_64 is still unverified.
 
+### 2.12 Auth and system events, as built (Ubuntu 22.04 / 5.15 / aarch64)
+
+Userspace sources run on their own threads (`witnessd/src/sources.rs`) and are stamped by the main loop; each reports to `source_health` as `auth`.
+
+| Event | How it is actually captured | Verified on a real kernel |
+|---|---|---|
+| sshd login/failure, sudo/su | `journalctl -f -o json` child filtered on `_COMM`, parsed by `authlog.rs`; the journal's own timestamp is kept | yes (`sudo`, failed ssh against the local sshd) |
+| Account changes | polled diff of `/etc/passwd`, `group`, `shadow` (1 s, stat-gated); only a SHA-256 of the shadow password field is stored | yes (useradd, `usermod -p`, userdel) |
+| `authorized_keys` | polled diff per home directory; OpenSSH-style `SHA256:` fingerprints (checked against `ssh-keygen -l`); options stored as a digest; files opened `O_NOFOLLOW`, capped at 4 MiB | yes |
+| Package changes | tail of `/var/log/dpkg.log` (whole lines only, rotation-aware); dnf/rpm **not done** | yes (observed during `apt install`) |
+| USB / block devices | raw `NETLINK_KOBJECT_UEVENT` group 1; vendor/product/serial read from sysfs | block: yes (loop device add/remove). **USB: parsed and unit-tested, never run against real USB hardware** |
+| Kernel modules | `tp_btf` `module_load`/`module_free`, actor = the loading process | yes (`modprobe dummy` is attributed to `modprobe`) |
+| Clock steps | `CLOCK_REALTIME − CLOCK_BOOTTIME` watched at 250 ms; steps ≥ 0.5 s reported | yes (`date -s` both ways). Slewing is not reported; the changing syscall is not attributed |
+
+Deviations and gaps from §2.4: **no systemd D-Bus/logind source** (service start/stop, session open/close, `PrepareForShutdown`), so `service_change`, `logout` and shutdown reasons are not produced; login events come from sshd's message only (`session_id` is 0); the sshd/sudo parsers are regexes over free text and keep the raw line; sudo escapes newlines as `#012` and that is left as is. A real-journal test found sudo left-pads messages with spaces; that is now handled and covered by a regression test.
+
+### 2.13 The rule engine, as built
+
+`witness-rules` implements §8 with these differences, all deliberate:
+
+- **Fields are checked by prefix only** at load time (`actor`, `data`, `type`, `prio`, `src`, `seq`, `boot_ns`, `wall_ns`, `boot_id`). An unknown field under `data.` simply never matches; it is not rejected. Operators, regexes, globs, CIDRs, durations, step references and ids *are* validated, with `file:line:col` for YAML errors.
+- `same_tree` is **approximated by login session** (`actor.ses`, else the process). Real process-tree scoping is not implemented. `same_process`, `same_session`, `same_host` are exact.
+- Evaluation is **inline** after storage, not on worker threads with drop-oldest. Measured cost (`witness-rules/tests/bench.rs`, release, 500k synthetic mixed events, 17 rules): 492k events/s on one aarch64 core in the VM (about 10% of a core at 50k ev/s), 648k/s on the Mac. The stream is synthetic and mostly non-matching, so treat this as an upper bound for matching cost, not a guarantee.
+- Correlation state is capped (50k groups per rule, 64 partials per group) and evicted wholesale, counted in `Stats::state_evicted`. Same-rule alerts are suppressed per `alert.suppress`, and the swallowed count rides on the next alert.
+- Disabled rules are loaded (so they list) but not indexed. Reload (2 s directory poll, not inotify) keeps correlation state of unchanged rules, records a `rule_set_change` with `added/removed/modified/rejected`, and a bad file never blocks the others.
+- Alerts are chained records naming the stored `trigger_seqs`; verified on a real kernel that an `exec` from `/dev/shm` produces an alert whose trigger resolves to that exact `proc_exec` record, that a rule added while running fires, and that a broken file is reported as rejected.
+- The shipped pack (`rules/`, 17 rules) was tuned against a real system: `shadow-read` first alerted on `newgrp`, then on debconf, cloud-init and man-db's `getpwnam`. Those are excluded by program and command line. Expect to tune it for your machine. Not shipped: stdio-socket reverse-shell detection (stdio kinds are not captured), "unknown USB device" learning, `verify`-failure alerts.
+- `witness rules lint` and `witness rules test <file|dir> --dir <data>` replay stored events on the event clock and write nothing.
+
+### 2.14 The API, as built
+
+Deviation from §9.1: a **hand-written HTTP/1.1 server over the Unix socket** (std threads, `Connection: close`), not axum/hyper. It keeps the daemon's dependency tree and attack surface small for a local, low-rate API; the cost is that HTTP handling is ours, so it is deliberately minimal (16 KiB headers, 256 KiB bodies, 32 connections, 10 s read timeout). `witness-client` is the shared blocking client.
+
+Implemented: `health, status, events (filters + keyset cursor), events/{seq}, events/{seq}/raw, stream (NDJSON with heartbeats and since_seq), timeline, dashboard, alerts (+ triage state), alerts/{seq}/triage, sessions, processes/{puid}, integrity (+ background verify), export (ndjson/json/csv), rules (list, validate, put, delete, enable/disable)`. Not implemented: a server-side process *tree* endpoint (the GUI builds the tree from `proc_exec`/`proc_exit`), incident-bundle tar export (§9.3), signed exports, `lagged` markers on the stream.
+
+Security: socket `0660 root:witness` in a `0750` directory; `SO_PEERCRED` picks the tier (root or `witness-admin` members may write rules; everyone else reads and triages); one `api_access` record per caller per minute and every triage is chained. `CAP_CHOWN` is in the unit's bounding set solely to hand the socket to the group. Verified: a group member reads, a rule write is refused with 403, a non-member cannot connect.
+
+### 2.15 The GUI, as built
+
+`witness-gui` (Dioxus 0.7.10 desktop, pinned) has pages for Dashboard, Live (stream, pause, filter), Search (text/kind/time, paging, export), Alerts (detail with trigger events and triage), Timeline (click a bar to see its events), Processes (tree), Sessions, Integrity (run and show verification), and Rules (list, enable/disable, validate, save). The pure logic (summaries, time formatting, process tree incl. pid reuse, sessions, bar scaling) is unit-tested in `witness-gui/src/model.rs`.
+
+**Visual verification is partial.** I ran it on macOS against the VM daemon (socket forwarded over SSH) and on Linux under Xvfb against the installed daemon, and looked at screenshots of the **Dashboard only**. The other pages are compiled, share the tested client and model code, and their API calls are covered by the end-to-end API test, but I did not click through them. No accessibility, keyboard-navigation or HiDPI review was done. Dark mode follows the OS and is untested on Linux.
+
+### 2.16 Packaging, as built
+
+`packaging/build-deb.sh` builds `witness_<ver>_<arch>.deb` (daemon, CLI, unit, rule pack as conffiles, default config) and `witness-gui_<ver>_<arch>.deb` with `dpkg-deb` only. The postinst creates the `witness` and `witness-admin` groups and `/var/lib/witness` (0700) and starts the service; **removal and purge never delete `/var/lib/witness`**. Verified on the VM: fresh install, in-place upgrade (a changed conffile replaced), service active under the hardened unit with every source working, and a full reboot (new kernel 5.15.0-203; `new_boot` gap recorded; chain verified with 1042 anchors). **Not done:** RPM packaging, x86_64 builds, a signed repository, a bundled GPL-2.0 text. `.github/workflows/ci.yml` is written but has never run.
+
 ## 3. Kernel side and daemon internals
 
 ### 3.1 Programs, maps, buffers
@@ -866,9 +913,25 @@ Live view (`/stream`), Timeline (`/timeline`), Process tree (`/processes/*`), Se
 
 ---
 
-## 14. Milestone verification honesty
+## 14. What is verified
 
-I (the assistant) develop on macOS. **I cannot load eBPF on macOS.** For every milestone I will state *compiled-only* vs *run on a real kernel*. To be able to say "run on a real kernel" I need access to at least one Linux x86_64 environment with root and BTF (Ubuntu 22.04 / 5.15 preferred, since it's the floor), reachable from this machine (SSH to a VM/host, or a local Lima/UTM/Multipass VM that I can drive from the shell). Until then, M1+ are **compiled and unit-tested only**, and nothing in §2 moves from 📘/❓ to verified.
+I develop on macOS and cannot load eBPF there, so every claim below says where it was run. "Real kernel" means Ubuntu 22.04.5 under Lima, **aarch64**, kernel 5.15.0-198 (and 5.15.0-203 after the final reboot), BTF on.
+
+| Area | State |
+|---|---|
+| Storage, hash chain, seals, anchors, disk-full policy, verify, index | unit + real-kernel tests (including real ENOSPC on a 1 MiB tmpfs) |
+| Process, file, network, DNS eBPF capture | real kernel, 24 programs verified by the kernel verifier, privileged suite passes |
+| Auth/system sources | real kernel, except USB hardware (see §2.12) |
+| Rule engine and pack | unit, benchmark, real-kernel alert + hot reload |
+| API | real-kernel end-to-end test; tiers checked with real group membership |
+| GUI | compiled on macOS and Linux; Dashboard viewed on both; other pages not visually checked |
+| .deb install, upgrade, reboot persistence | real VM |
+| **x86_64** | **not built, not run** (the eBPF object is built per architecture; only aarch64 was exercised) |
+| Kernels other than 5.15 (incl. 6.x `ITER_UBUF` DNS path, fentry) | **not run** |
+| RPM, other distros, SELinux/AppArmor interaction | **not done** |
+| Load: sustained high event rates, many-user hosts, `authorized_keys` at scale | **not measured** beyond the rule benchmark and the file/open overhead measured earlier |
+
+Known gaps are listed in each as-built section above; the largest are: no systemd D-Bus/logind source, `same_tree` approximated by session, GUI pages other than the Dashboard not visually checked, argv longer than 3 KiB not chunked, exit events only for thread-group leaders, file events are "attempted" not confirmed.
 
 ---
 

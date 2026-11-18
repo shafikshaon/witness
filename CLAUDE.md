@@ -32,6 +32,7 @@ Linux forensic activity monitor. Authoritative design: `docs/DESIGN.md` (approve
 - After a text-replace edit, grep to confirm it landed; rustfmt reflows code and silent misses already cost a debugging round (the rule engine was once not started at all).
 - Expected values in tests must come from an independent source (`ssh-keygen -l`, `date -u`), not from memory.
 - Real data finds bugs unit tests do not: sudo's padded messages, `newgrp`/debconf shadow reads, `iov_iter` layouts.
+- Test configs must never point the API socket (or any daemon-managed path) at a shared directory like `/tmp`; use a private temp dir. (A daemon once chmod'ed `/tmp`; now fixed and tested, but keep the habit.)
 - Screenshots: `limactl copy witness-dev:/tmp/x.png <mac path>`; the macOS home is read-only inside the VM.
 
 ## Git

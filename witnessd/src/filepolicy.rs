@@ -197,6 +197,20 @@ impl FilePolicy {
     }
 }
 
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+
+/// The path whose *content* may have changed, if this event is one that can change content:
+/// a write-open, a created file (not a directory), a truncate, or the destination of a rename.
+pub fn content_changed_path(ev: &Event) -> Option<&OsBytes> {
+    match &ev.body {
+        Body::FileOpenWrite(f) | Body::FileTruncate(f) => Some(&f.path),
+        Body::FileCreate(f) if f.mode.is_none_or(|m| m & S_IFMT != S_IFDIR) => Some(&f.path),
+        Body::FileRename(r) => Some(&r.new),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Open,
@@ -240,6 +254,53 @@ mod tests {
         let p = FilePolicy::new(&["/srv/app/conf".into()], &["/srv/uploads".into()], &[]);
         assert_eq!(p.classify("/srv/app/conf/x.toml"), Class::Critical);
         assert_eq!(p.classify("/srv/uploads/f"), Class::Watched);
+    }
+
+    #[test]
+    fn only_content_changing_events_name_a_path_to_hash() {
+        use witness_common::schema::{FileOp, FileRename, HookResult, Source};
+        let ev = |body: Body| Event {
+            v: 1,
+            seq: 0,
+            boot_id: "b".into(),
+            boot_ns: 0,
+            wall_ns: 0,
+            wall_uncertain: false,
+            src: Source::Ebpf,
+            prio: 1,
+            actor: None,
+            body,
+            h: None,
+        };
+        let op = |mode: Option<u32>| FileOp {
+            path: "/etc/x".into(),
+            path_resolved: true,
+            path_truncated: false,
+            dev: 0,
+            ino: 0,
+            mode,
+            flags: None,
+            result: HookResult::Attempted,
+        };
+        assert!(content_changed_path(&ev(Body::FileOpenWrite(op(None)))).is_some());
+        assert!(content_changed_path(&ev(Body::FileTruncate(op(None)))).is_some());
+        assert!(content_changed_path(&ev(Body::FileCreate(op(Some(0o100644))))).is_some());
+        assert!(
+            content_changed_path(&ev(Body::FileCreate(op(Some(0o040755))))).is_none(),
+            "a new directory has no content"
+        );
+        assert!(content_changed_path(&ev(Body::FileDelete(op(None)))).is_none());
+        let r = FileRename {
+            old: "/tmp/a".into(),
+            new: "/etc/a".into(),
+            dev: 0,
+            ino: 0,
+            result: HookResult::Attempted,
+        };
+        assert_eq!(
+            content_changed_path(&ev(Body::FileRename(r))),
+            Some(&OsBytes::from("/etc/a"))
+        );
     }
 
     #[test]

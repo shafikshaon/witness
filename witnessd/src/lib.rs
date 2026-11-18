@@ -5,6 +5,7 @@ pub mod btf;
 pub mod cli;
 pub mod decode;
 pub mod filepolicy;
+pub mod hasher;
 #[cfg(target_os = "linux")]
 pub mod loader;
 pub mod pipeline;

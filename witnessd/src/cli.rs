@@ -19,7 +19,8 @@ use witness_store::index::Index;
 
 use crate::btf::Btf;
 use crate::decode::Decoder;
-use crate::filepolicy::FilePolicy;
+use crate::filepolicy::{content_changed_path, Class, FilePolicy};
+use crate::hasher::{Hasher, Settings as HashSettings};
 use crate::loader::Collector;
 use crate::pipeline::{Pipeline, Settings, SystemClock};
 
@@ -338,6 +339,12 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         &cfg.files.watch,
         &cfg.files.exclude,
     );
+    let mut hasher = Hasher::start(HashSettings {
+        max_bytes: cfg.files.hash_max_mib << 20,
+        rate_bps: cfg.files.hash_rate_mib_per_sec << 20,
+        debounce: Duration::from_millis(cfg.files.hash_debounce_ms),
+        queue: 256,
+    });
     let summary_every = Duration::from_secs(60);
     let mut last_summary = Instant::now();
     let resolve = |pid: u32| {
@@ -369,6 +376,13 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
             match decoder.decode(rec, &resolve) {
                 Ok(ev) => {
                     if let Some(ev) = policy.apply(ev) {
+                        // A change under a critical path starts that file's quiet period;
+                        // it is hashed once it has settled.
+                        if let Some(path) = content_changed_path(&ev) {
+                            if policy.classify(&path.to_string_lossy()) == Class::Critical {
+                                hasher.note(path, ev.actor.clone(), Instant::now());
+                            }
+                        }
                         if let Err(e) = pipeline.ingest(&ev) {
                             err = Some(e);
                         }
@@ -399,6 +413,18 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         }
         if last_drops == drops {
             drops_since = crate::pipeline::Clock::boot_ns(&clock);
+        }
+        hasher.tick(Instant::now());
+        let hashed = hasher.drain(
+            &boot,
+            crate::pipeline::Clock::boot_ns(&clock),
+            crate::pipeline::Clock::wall_ns(&clock),
+        );
+        for ev in &hashed {
+            if let Err(e) = pipeline.ingest(ev) {
+                failure = Some(e);
+                break 'main;
+            }
         }
         if last_summary.elapsed() >= summary_every {
             let interval = last_summary.elapsed().as_nanos() as u64;

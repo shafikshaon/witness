@@ -422,34 +422,49 @@ impl Collector {
             .unwrap_or(1)
             .clamp(1, 8);
         let kbtf_ref = &kbtf;
-        let mut outcomes: Vec<(usize, &'static str, Result<(), String>)> = Vec::new();
-        while !jobs.is_empty() {
-            if interrupted() {
-                for (idx, func, _, _) in jobs.drain(..) {
-                    outcomes.push((
-                        idx,
-                        func,
-                        Err("startup interrupted by a stop request".into()),
-                    ));
-                }
-                break;
+        // A work queue, heaviest programs first: the kernel verifier's time per program varies
+        // from 0.2 s (TCP) to 4 s (rename walks two paths), so fixed batches would leave most
+        // CPUs idle behind the slowest program in each.
+        let weight = |idx: usize| match HOOKS[idx].prog {
+            "path_rename" | "path_link" | "path_symlink" => 3,
+            _ if HOOKS[idx].group == Group::Files => 2,
+            _ => 1,
+        };
+        jobs.sort_by_key(|(idx, ..)| std::cmp::Reverse(weight(*idx)));
+        let total = jobs.len();
+        let queue = std::sync::Mutex::new(std::collections::VecDeque::from(jobs));
+        let results: std::sync::Mutex<Vec<(usize, &'static str, Result<(), String>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let relock = |e: std::sync::PoisonError<_>| e.into_inner();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let job = queue.lock().unwrap_or_else(relock).pop_front();
+                    let Some((idx, func, attach, prog)) = job else {
+                        break;
+                    };
+                    let status = if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        Err("startup interrupted by a stop request".to_string())
+                    } else {
+                        load_attach(prog, func, attach, kbtf_ref)
+                    };
+                    results
+                        .lock()
+                        .unwrap_or_else(relock)
+                        .push((idx, func, status));
+                });
             }
-            let batch: Vec<_> = jobs.drain(..jobs.len().min(workers)).collect();
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = batch
-                    .into_iter()
-                    .map(|(idx, func, attach, prog)| {
-                        scope.spawn(move || (idx, func, load_attach(prog, func, attach, kbtf_ref)))
-                    })
-                    .collect();
-                for h in handles {
-                    match h.join() {
-                        Ok(o) => outcomes.push(o),
-                        Err(_) => tracing::error!("a hook loader thread panicked"),
-                    }
+            // Watch for a stop request while the workers run; they finish what they have
+            // started and skip the rest.
+            while results.lock().unwrap_or_else(relock).len() < total {
+                if interrupted() {
+                    stop.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-            });
-        }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let outcomes = results.into_inner().unwrap_or_else(relock);
         for (idx, func, status) in outcomes {
             reports[idx] = Some(HookReport { hook: func, status });
         }

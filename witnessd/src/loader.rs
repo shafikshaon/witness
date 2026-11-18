@@ -92,7 +92,7 @@ const fn hook(
 /// All optional hooks. File hooks are kprobes (no fentry/fexit on arm64 before 6.0, and
 /// `kuid_t` by-value arguments); TCP uses kprobes on connect/accept plus the
 /// `inet_sock_set_state` tracepoint.
-const HOOKS: [Hook; 15] = [
+const HOOKS: [Hook; 16] = [
     hook(
         "file_open",
         "security_file_open",

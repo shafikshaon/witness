@@ -874,45 +874,38 @@ unsafe fn copy_hdr(dst: *mut RawHdr, src: &RawHdr) {
     (*dst).start_boot_ns = src.start_boot_ns;
 }
 
-/// Captures the current process as a socket owner.
+/// Captures the current process as a socket owner, writing into `dst` in place.
 #[inline(always)]
-unsafe fn current_owner(o: &Offsets) -> ConnInfo {
-    let mut info = ConnInfo {
-        hdr: RawHdr::ZERO,
-        comm: comm_or_zero(),
-        since_ns: bpf_ktime_get_boot_ns(),
-        net: NetAddrs::ZERO,
-    };
+unsafe fn fill_owner(dst: *mut ConnInfo, o: &Offsets) {
     let task = generated::bpf_get_current_task() as *const u8;
     fill_hdr(
-        &mut info.hdr,
+        addr_of_mut!((*dst).hdr),
         kind::NET_TCP,
         core::mem::size_of::<NetEvent>(),
         task,
         o,
     );
-    info
+    (*dst).comm = comm_or_zero();
+    (*dst).since_ns = bpf_ktime_get_boot_ns();
+    (*dst).net.family = 0;
 }
 
-/// Reads a socket's addresses and ports as they are right now.
+/// Reads a socket's addresses and ports as they are right now into `dst`.
 #[inline(always)]
-unsafe fn read_addrs(sk: *const u8, o: &Offsets) -> NetAddrs {
+unsafe fn read_addrs_into(dst: *mut NetAddrs, sk: *const u8, o: &Offsets) {
     let family = rd_or::<u16>(sk, o.sock_skc_family, 0) as u32;
-    let mut a = NetAddrs {
-        family,
-        lport: rd_or::<u16>(sk, o.sock_skc_num, 0),
-        rport: u16::from_be(rd_or::<u16>(sk, o.sock_skc_dport, 0)),
-        // The IPv6 pair is read unconditionally; IPv4 overwrites the first four bytes below.
-        laddr: rd_or::<[u8; 16]>(sk, o.sock_skc_v6_rcv_saddr, [0; 16]),
-        raddr: rd_or::<[u8; 16]>(sk, o.sock_skc_v6_daddr, [0; 16]),
-    };
+    (*dst).family = family;
+    (*dst).lport = rd_or::<u16>(sk, o.sock_skc_num, 0);
+    (*dst).rport = u16::from_be(rd_or::<u16>(sk, o.sock_skc_dport, 0));
+    // The IPv6 pair is read unconditionally; IPv4 overwrites the first four bytes below.
+    (*dst).laddr = rd_or::<[u8; 16]>(sk, o.sock_skc_v6_rcv_saddr, [0; 16]);
+    (*dst).raddr = rd_or::<[u8; 16]>(sk, o.sock_skc_v6_daddr, [0; 16]);
     if family == AF_INET {
         let l = rd_or::<[u8; 4]>(sk, o.sock_skc_rcv_saddr, [0; 4]);
         let r = rd_or::<[u8; 4]>(sk, o.sock_skc_daddr, [0; 4]);
-        a.laddr = [l[0], l[1], l[2], l[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        a.raddr = [r[0], r[1], r[2], r[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        (*dst).laddr = [l[0], l[1], l[2], l[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        (*dst).raddr = [r[0], r[1], r[2], r[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     }
-    a
 }
 
 /// Emits one TCP lifecycle record for socket `sk`, attributed to `owner`, with `addrs` as its
@@ -921,8 +914,8 @@ unsafe fn read_addrs(sk: *const u8, o: &Offsets) -> NetAddrs {
 unsafe fn emit_net(
     op: u32,
     sk: *const u8,
-    owner: &ConnInfo,
-    addrs: &NetAddrs,
+    owner: *const ConnInfo,
+    addrs: *const NetAddrs,
     old: i32,
     new: i32,
     o: &Offsets,
@@ -932,23 +925,23 @@ unsafe fn emit_net(
         return;
     };
     let ev = entry.as_mut_ptr();
-    copy_hdr(addr_of_mut!((*ev).hdr), &owner.hdr);
+    copy_hdr(addr_of_mut!((*ev).hdr), &(*owner).hdr);
     (*ev).hdr.boot_ns = bpf_ktime_get_boot_ns();
     let b = addr_of_mut!((*ev).body);
     (*b).op = op;
-    (*b).family = addrs.family;
-    (*b).lport = addrs.lport;
-    (*b).rport = addrs.rport;
+    (*b).family = (*addrs).family;
+    (*b).lport = (*addrs).lport;
+    (*b).rport = (*addrs).rport;
     // Bit 0 of `sk_shutdown` is RCV_SHUTDOWN: set when the peer's FIN arrives.
     (*b).flags = (rd_or::<u8>(sk, o.sock_sk_shutdown, 0) & 1) as u32;
-    (*b).laddr = addrs.laddr;
-    (*b).raddr = addrs.raddr;
+    (*b).laddr = (*addrs).laddr;
+    (*b).raddr = (*addrs).raddr;
     (*b).bytes_sent = rd_or::<u64>(sk, o.tcp_bytes_sent, 0);
     (*b).bytes_recv = rd_or::<u64>(sk, o.tcp_bytes_received, 0);
-    (*b).duration_ns = (*ev).hdr.boot_ns.wrapping_sub(owner.since_ns);
+    (*b).duration_ns = (*ev).hdr.boot_ns.wrapping_sub((*owner).since_ns);
     (*b).old_state = old as u32;
     (*b).new_state = new as u32;
-    (*b).comm = owner.comm;
+    (*b).comm = (*owner).comm;
     entry.submit(0);
 }
 
@@ -960,8 +953,9 @@ unsafe fn on_connect(ctx: &ProbeContext) {
     }
     let sk: u64 = ctx.arg(0).unwrap_or(0);
     let o = offsets();
-    let info = current_owner(&o);
-    let _ = CONNS.insert(&sk, &info, 0);
+    let mut info = core::mem::MaybeUninit::<ConnInfo>::uninit();
+    fill_owner(info.as_mut_ptr(), &o);
+    let _ = CONNS.insert(&sk, &*info.as_ptr(), 0);
 }
 
 #[kprobe(function = "tcp_v4_connect")]
@@ -991,14 +985,16 @@ pub fn tcp_accept(ctx: RetProbeContext) -> u32 {
             return 0;
         }
         let o = offsets();
-        let mut info = current_owner(&o);
-        info.net = read_addrs(sk as *const u8, &o);
-        let _ = CONNS.insert(&sk, &info, 0);
+        let mut info = core::mem::MaybeUninit::<ConnInfo>::uninit();
+        let p = info.as_mut_ptr();
+        fill_owner(p, &o);
+        read_addrs_into(addr_of_mut!((*p).net), sk as *const u8, &o);
+        let _ = CONNS.insert(&sk, &*p, 0);
         emit_net(
             nop::ACCEPT,
             sk as *const u8,
-            &info,
-            &info.net,
+            p,
+            addr_of_mut!((*p).net),
             TCP_LISTEN,
             TCP_ESTABLISHED,
             &o,
@@ -1007,7 +1003,7 @@ pub fn tcp_accept(ctx: RetProbeContext) -> u32 {
     0
 }
 
-/// inet_sock_set_state(const struct sock *sk, int oldstate, int newstate)
+/// inet_sock_set_state(const struct sock *sk, int oldstate, int newstate): establish and close.
 #[btf_tracepoint(function = "inet_sock_set_state")]
 pub fn tcp_state(ctx: BtfTracePointContext) -> i32 {
     // SAFETY: as above.
@@ -1015,27 +1011,47 @@ pub fn tcp_state(ctx: BtfTracePointContext) -> i32 {
     0
 }
 
+/// The same tracepoint, for sockets entering LISTEN. A separate program keeps each one's stack
+/// well under the 512-byte BPF limit.
+#[btf_tracepoint(function = "inet_sock_set_state")]
+pub fn tcp_listen(ctx: BtfTracePointContext) -> i32 {
+    // SAFETY: as above.
+    unsafe {
+        let new: i32 = ctx.arg(2);
+        // listen() runs in the owning process.
+        if new != TCP_LISTEN || is_self() {
+            return 0;
+        }
+        let sk: *const u8 = ctx.arg(0);
+        let old: i32 = ctx.arg(1);
+        let key = sk as u64;
+        let o = offsets();
+        let mut info = core::mem::MaybeUninit::<ConnInfo>::uninit();
+        let p = info.as_mut_ptr();
+        fill_owner(p, &o);
+        read_addrs_into(addr_of_mut!((*p).net), sk, &o);
+        let _ = CONNS.insert(&key, &*p, 0);
+        emit_net(nop::LISTEN, sk, p, addr_of_mut!((*p).net), old, new, &o);
+    }
+    0
+}
+
 #[inline(always)]
 unsafe fn on_state(ctx: &BtfTracePointContext) {
+    let new: i32 = ctx.arg(2);
+    // Only CLOSE and ESTABLISHED matter here; everything else returns before touching memory.
+    if new != TCP_CLOSE && new != TCP_ESTABLISHED {
+        return;
+    }
     let sk: *const u8 = ctx.arg(0);
     let old: i32 = ctx.arg(1);
-    let new: i32 = ctx.arg(2);
     let key = sk as u64;
     let o = offsets();
 
-    // The owner record is read through the map's own memory: copying a 136-byte record onto
-    // the 512-byte BPF stack, more than once, overflows it.
-    if new == TCP_LISTEN {
-        // listen() runs in the owning process.
-        if is_self() {
-            return;
-        }
-        let mut info = current_owner(&o);
-        info.net = read_addrs(sk, &o);
-        let _ = CONNS.insert(&key, &info, 0);
-        emit_net(nop::LISTEN, sk, &info, &info.net, old, new, &o);
-    } else if new == TCP_CLOSE {
-        let Some(owner) = CONNS.get_ptr(&key) else {
+    // The owner record is used through the map's own memory: copying a 136-byte record onto
+    // the 512-byte BPF stack overflows it.
+    if new == TCP_CLOSE {
+        let Some(owner) = CONNS.get_ptr_mut(&key) else {
             return;
         };
         let op = if old == TCP_SYN_SENT {
@@ -1048,18 +1064,16 @@ unsafe fn on_state(ctx: &BtfTracePointContext) {
         // A failed connect never got a snapshot; everything else did, and the live socket has
         // already lost its local port by now.
         if (*owner).net.family == 0 {
-            let live = read_addrs(sk, &o);
-            emit_net(op, sk, &*owner, &live, old, new, &o);
-        } else {
-            emit_net(op, sk, &*owner, &(*owner).net, old, new, &o);
+            read_addrs_into(addr_of_mut!((*owner).net), sk, &o);
         }
+        emit_net(op, sk, owner, addr_of_mut!((*owner).net), old, new, &o);
         let _ = CONNS.remove(&key);
-    } else if new == TCP_ESTABLISHED && old == TCP_SYN_SENT {
+    } else if old == TCP_SYN_SENT {
         let Some(owner) = CONNS.get_ptr_mut(&key) else {
             return;
         };
-        (*owner).net = read_addrs(sk, &o);
-        emit_net(nop::CONNECT, sk, &*owner, &(*owner).net, old, new, &o);
+        read_addrs_into(addr_of_mut!((*owner).net), sk, &o);
+        emit_net(nop::CONNECT, sk, owner, addr_of_mut!((*owner).net), old, new, &o);
     }
 }
 

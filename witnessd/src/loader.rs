@@ -351,7 +351,7 @@ impl Collector {
     pub fn sync_sensitive(&mut self, add: &[InodeKey], remove: &[InodeKey]) -> Result<()> {
         for k in add {
             self.sensitive
-                .insert(KeyPod(*k), 1, 0)
+                .insert(&KeyPod(*k), &1, 0)
                 .context("adding a sensitive file")?;
         }
         for k in remove {

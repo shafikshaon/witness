@@ -224,9 +224,21 @@ mod store_mode {
         data: &Path,
         seconds: u32,
     ) -> (Child, std::io::BufReader<std::process::ChildStderr>) {
+        spawn_cfg(data, seconds, Path::new("/nonexistent/witness.toml"))
+    }
+
+    // The child is handed to the caller, which always waits on or kills it.
+    #[allow(clippy::zombie_processes)]
+    pub(super) fn spawn_cfg(
+        data: &Path,
+        seconds: u32,
+        config: &Path,
+    ) -> (Child, std::io::BufReader<std::process::ChildStderr>) {
         assert!(rustix::process::geteuid().is_root(), "run with sudo");
         let mut child = Command::new(env!("CARGO_BIN_EXE_witnessd"))
-            .args(["run", "--config", "/nonexistent/witness.toml", "--data-dir"])
+            .args(["run", "--config"])
+            .arg(config)
+            .arg("--data-dir")
             .arg(data)
             .args(["--seconds", &seconds.to_string()])
             .stdout(Stdio::null())
@@ -902,6 +914,62 @@ mod files {
                 .any(|v| v["type"] == "file_hash" && v["data"]["path"] == ordinary.as_str()),
             "/tmp is watched, not critical: not hashed"
         );
+    }
+
+    /// Reads of files on the sensitive list are reported (matched by inode in the kernel),
+    /// ordinary reads are not, and a replaced file (new inode) is tracked.
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn sensitive_file_reads_are_reported_including_after_replacement() {
+        use super::store_mode::{records, spawn_cfg, verify};
+        let t = tempfile::tempdir_in("/tmp").unwrap();
+        let m = marker("secret");
+        let secret = format!("/etc/{m}");
+        fs::write(&secret, b"s3cret v1").unwrap();
+        let cfg = t.path().join("config.toml");
+        fs::write(
+            &cfg,
+            format!("[files]\nsensitive_read = [\"{secret}\", \"/etc/shadow\"]\n"),
+        )
+        .unwrap();
+        let (child, _err) = spawn_cfg(&t.path().join("data"), 14, &cfg);
+        std::thread::sleep(std::time::Duration::from_millis(1200)); // the set is loaded
+        fs::read(&secret).unwrap(); // sensitive
+        fs::read("/etc/hostname").unwrap(); // ordinary
+        fs::read("/etc/shadow").unwrap(); // sensitive (the real one)
+                                          // Replace the secret the way `passwd` replaces /etc/shadow: new file, rename over.
+        let new = format!("{secret}.new");
+        fs::write(&new, b"s3cret v2").unwrap();
+        fs::rename(&new, &secret).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2500)); // refresh settles
+        fs::read(&secret).unwrap(); // sensitive again, on the new inode
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        fs::remove_file(&secret).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+
+        verify(&t.path().join("data"));
+        let recs = records(&t.path().join("data"));
+        let reads = |p: &str| {
+            recs.iter()
+                .filter(|v| v["type"] == "file_open_read" && v["data"]["path"] == p)
+                .count()
+        };
+        assert_eq!(
+            reads(&secret),
+            2,
+            "once before and once after the replacement"
+        );
+        assert!(reads("/etc/shadow") >= 1, "the real /etc/shadow");
+        assert_eq!(reads("/etc/hostname"), 0, "ordinary files are not reported");
+        let r = recs
+            .iter()
+            .find(|v| v["type"] == "file_open_read" && v["data"]["path"] == secret.as_str())
+            .unwrap();
+        assert_eq!(r["actor"]["uid"], 0);
+        assert!(r["actor"]["exe"]
+            .as_str()
+            .is_some_and(|e| e.contains("integration")));
+        assert_eq!(r["prio"], 1, "sensitive reads are never first to be shed");
     }
 
     /// In store mode the path policy applies: watched and critical paths are kept, the rest

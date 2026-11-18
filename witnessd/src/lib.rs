@@ -4,6 +4,7 @@ pub mod btf;
 #[cfg(target_os = "linux")]
 pub mod cli;
 pub mod decode;
+pub mod dns;
 pub mod filepolicy;
 pub mod hasher;
 #[cfg(target_os = "linux")]

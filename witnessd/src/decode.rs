@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use witness_common::schema::{
-    puid, Actor, AttrOp, Body, ConnOutcome, Event, FileAttr, FileLink, FileOp, FileRename,
-    HookResult, LinkKind, NetClose, NetConn, NetListen, OsBytes, Priority, ProcExec, ProcExit,
-    ProcFork, Proto, Source, SCHEMA_VERSION,
+    puid, Actor, AttrOp, Body, ConnOutcome, DnsDir, DnsEvent as DnsBodyOut, Event, FileAttr,
+    FileLink, FileOp, FileRename, HookResult, LinkKind, NetClose, NetConn, NetListen, OsBytes,
+    Priority, ProcExec, ProcExit, ProcFork, Proto, Source, SCHEMA_VERSION,
 };
 use witness_common::{
-    flags, fop, kind, nop, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody, NetBody, RawHdr,
-    AF_INET,
+    flags, fop, kind, nop, DnsBody, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody, NetBody,
+    RawHdr, AF_INET,
 };
 
 const S_ISUID: u32 = 0o4000;
@@ -46,6 +46,28 @@ fn ip(family: u32, a: &[u8; 16]) -> IpAddr {
     } else {
         IpAddr::V6(Ipv6Addr::from(*a))
     }
+}
+
+fn dns_body(b: &DnsBody) -> Body {
+    let packet = b.packet();
+    let parsed = crate::dns::parse(packet).unwrap_or_default();
+    Body::Dns(DnsBodyOut {
+        direction: if b.dir == witness_common::DNS_RESPONSE {
+            DnsDir::Response
+        } else {
+            DnsDir::Query
+        },
+        server: ip(b.family, &b.raddr),
+        server_port: b.rport,
+        id: parsed.id,
+        qname: parsed.qname,
+        qtype: parsed.qtype,
+        rcode: parsed.rcode,
+        answers: parsed.answers,
+        transport: Proto::Udp,
+        // The kernel copies at most DNS_CAP bytes; a full buffer may mean the packet was cut.
+        truncated: packet.len() >= witness_common::DNS_CAP,
+    })
 }
 
 fn net_conn(b: &NetBody, outcome: ConnOutcome) -> NetConn {
@@ -392,6 +414,14 @@ impl Decoder {
                     actor.exe = resolve_exe(hdr.pid).map(OsBytes);
                 }
                 net_body(&b)
+            }
+            kind::DNS => {
+                let b = DnsBody::parse(body).ok_or(DecodeError::Short)?;
+                self.enrich(&mut actor);
+                if actor.exe.is_none() {
+                    actor.exe = resolve_exe(hdr.pid).map(OsBytes);
+                }
+                dns_body(&b)
             }
             other => return Err(DecodeError::UnknownKind(other)),
         };

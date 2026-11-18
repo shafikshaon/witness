@@ -1153,4 +1153,57 @@ mod net {
             .as_str()
             .is_some_and(|x| x.ends_with("bash")));
     }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn dns_queries_and_responses_are_captured_and_parsed() {
+        use std::net::UdpSocket;
+        let (ev, _) = capture(8, || {
+            // A fake resolver on port 53 that answers every query with 93.184.216.34.
+            let srv = UdpSocket::bind("127.0.0.1:53").unwrap();
+            srv.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let t = std::thread::spawn(move || {
+                let mut buf = [0u8; 512];
+                let (n, from) = srv.recv_from(&mut buf).unwrap();
+                let mut r = buf[..n].to_vec();
+                r[2] = 0x81;
+                r[3] = 0x80;
+                r[7] = 1;
+                r.extend([0xC0, 12, 0, 1, 0, 1, 0, 0, 1, 0x2C, 0, 4, 93, 184, 216, 34]);
+                srv.send_to(&r, from).unwrap();
+            });
+            let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+            c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut q = vec![0xAB, 0xCD, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+            for l in ["witness-test", "example"] {
+                q.push(l.len() as u8);
+                q.extend(l.as_bytes());
+            }
+            q.extend([0, 0, 1, 0, 1]);
+            c.send_to(&q, "127.0.0.1:53").unwrap();
+            let mut b = [0u8; 512];
+            c.recv_from(&mut b).unwrap();
+            t.join().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        let dns = mine(&ev, "dns");
+        let query = dns
+            .iter()
+            .find(|e| e["data"]["direction"] == "query")
+            .expect("the query");
+        assert_eq!(query["data"]["qname"], "witness-test.example");
+        assert_eq!(query["data"]["qtype"], "A");
+        assert_eq!(query["data"]["id"], 0xABCD);
+        assert_eq!(query["data"]["server"], "127.0.0.1");
+        assert_eq!(query["data"]["server_port"], 53);
+        let resp = dns
+            .iter()
+            .find(|e| e["data"]["direction"] == "response")
+            .expect("the response");
+        assert_eq!(resp["data"]["rcode"], "NOERROR");
+        assert_eq!(resp["data"]["answers"][0]["data"], "93.184.216.34");
+        assert_eq!(resp["data"]["answers"][0]["ttl"], 300);
+    }
 }

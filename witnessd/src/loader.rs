@@ -496,14 +496,28 @@ impl Collector {
             Err(rustix::io::Errno::INTR) => return Ok(0),
             Err(e) => return Err(e).context("poll on the ring buffers"),
         }
-        let mut n = 0;
-        while let Some(item) = self.critical.next() {
-            f(&item);
-            n += 1;
+        // Both rings' pending records, in the order the kernel produced them. Draining one ring
+        // then the other would hand a short-lived process's `exit` to the decoder before its
+        // own network records, so records are merged by their kernel timestamp (header bytes
+        // 8..16). A bounded batch keeps one poll from holding the whole backlog in memory.
+        const BATCH: usize = 8192;
+        let mut batch: Vec<(u64, Vec<u8>)> = Vec::new();
+        for ring in [&mut self.critical, &mut self.volume] {
+            let mut taken = 0;
+            while taken < BATCH {
+                let Some(item) = ring.next() else { break };
+                let ts = item
+                    .get(8..16)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map_or(0, u64::from_ne_bytes);
+                batch.push((ts, item.to_vec()));
+                taken += 1;
+            }
         }
-        while let Some(item) = self.volume.next() {
-            f(&item);
-            n += 1;
+        batch.sort_by_key(|(ts, _)| *ts);
+        let n = batch.len();
+        for (_, rec) in &batch {
+            f(rec);
         }
         Ok(n)
     }

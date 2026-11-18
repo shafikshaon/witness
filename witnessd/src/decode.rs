@@ -18,6 +18,10 @@ const S_ISGID: u32 = 0o2000;
 const S_IFDIR: u32 = 0o040000;
 /// Processes remembered for attributing later events; cleared wholesale if exceeded.
 const PROC_TABLE_CAP: usize = 200_000;
+/// How long an exited process stays attributable. Records from the high-volume ring (file and
+/// network events) can be decoded after the process's `exit` record, which comes from a
+/// different ring, so forgetting at exit would leave their last events unattributed.
+const EXIT_GRACE_NS: u64 = 30_000_000_000;
 
 /// What we know about a running process, for enriching events that only carry its identity.
 #[derive(Clone)]
@@ -182,6 +186,8 @@ pub struct Decoder {
     /// `CLOCK_REALTIME - CLOCK_BOOTTIME`, refreshed by the caller (DESIGN.md §3.4).
     clock_offset_ns: i64,
     procs: HashMap<String, ProcInfo>,
+    /// `(exit time, puid)` in exit order; entries leave `procs` once older than the grace.
+    exited: std::collections::VecDeque<(u64, String)>,
 }
 
 fn cstr(buf: &[u8], len: u32) -> Vec<u8> {
@@ -199,6 +205,7 @@ impl Decoder {
             boot_id: boot_id.into(),
             clock_offset_ns: 0,
             procs: HashMap::new(),
+            exited: std::collections::VecDeque::new(),
         }
     }
 
@@ -215,6 +222,18 @@ impl Decoder {
                 tty: a.tty.clone(),
             },
         );
+    }
+
+    /// Drops exited processes whose grace period has passed (`now` is a kernel timestamp).
+    fn forget_expired(&mut self, now_ns: u64) {
+        while let Some((t, _)) = self.exited.front() {
+            if now_ns.saturating_sub(*t) < EXIT_GRACE_NS {
+                break;
+            }
+            if let Some((_, puid)) = self.exited.pop_front() {
+                self.procs.remove(&puid);
+            }
+        }
     }
 
     /// Learns a process from an event decoded elsewhere (the baseline snapshot).
@@ -263,6 +282,7 @@ impl Decoder {
             return Err(DecodeError::Short);
         }
         let body = &rec[RawHdr::SIZE..hdr.len as usize];
+        self.forget_expired(hdr.boot_ns);
         let mut actor = Actor {
             puid: puid(&self.boot_id, hdr.pid, hdr.start_boot_ns),
             pid: hdr.pid,
@@ -320,7 +340,7 @@ impl Decoder {
                 let b = ExitBody::parse(body).ok_or(DecodeError::Short)?;
                 actor.comm = String::from_utf8_lossy(&cstr(&b.comm, 16)).into_owned();
                 self.enrich(&mut actor);
-                self.procs.remove(&actor.puid);
+                self.exited.push_back((hdr.boot_ns, actor.puid.clone()));
                 let code = b.exit_code;
                 let signal = (code & 0x7f) as u8;
                 Body::ProcExit(ProcExit {
@@ -822,7 +842,7 @@ mod file_tests {
     }
 
     #[test]
-    fn exit_forgets_the_process() {
+    fn exited_processes_stay_attributable_for_a_grace_period_then_are_forgotten() {
         let mut d = dec();
         d.decode(
             &{
@@ -844,7 +864,18 @@ mod file_tests {
             .to_vec();
         xr.extend(xb);
         d.decode(&xr, &|_| None).unwrap();
-        assert!(d.procs.is_empty());
+        // Still attributable for a while: later records from the other ring may name it.
+        assert_eq!(d.procs.len(), 1, "kept through the grace period");
+        // A record well after the grace period purges it.
+        let mut later = hdr(kind::PROC_EXIT, RawHdr::SIZE + ExitBody::SIZE, 99);
+        later.boot_ns = 9_000_000_000 + EXIT_GRACE_NS + 1;
+        let mut lr = later.to_bytes().to_vec();
+        lr.extend(vec![0u8; ExitBody::SIZE]);
+        d.decode(&lr, &|_| None).unwrap();
+        assert!(
+            !d.procs.contains_key("4f2a9c1e-7-5"),
+            "forgotten after the grace period"
+        );
     }
 }
 

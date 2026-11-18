@@ -9,6 +9,8 @@ use witness_common::schema::{AuthFail, Body, Login, Sudo};
 
 /// `ident` is the syslog identifier of the emitter (`sshd`, `sudo`, `su`, `login`).
 pub fn parse(ident: &str, msg: &str) -> Option<Body> {
+    // sudo left-pads its messages with spaces when it has no TTY (seen on Ubuntu 22.04).
+    let msg = msg.trim();
     match ident {
         "sshd" | "sshd-session" => sshd(msg),
         "sudo" => sudo(msg),
@@ -189,6 +191,18 @@ mod tests {
         };
         assert!(!d.allowed);
         assert!(parse("sudo", "pam_unix(sudo:session): session opened").is_none());
+    }
+
+    #[test]
+    fn sudo_messages_with_leading_padding_and_no_tty() {
+        // Verbatim from journald on Ubuntu 22.04.
+        let Some(Body::Sudo(s)) = parse(
+            "sudo",
+            "    root : PWD=/Users/x/Witness ; USER=root ; COMMAND=/usr/bin/id -u",
+        ) else {
+            panic!()
+        };
+        assert!(s.allowed && s.tty.is_none() && s.command == "/usr/bin/id -u");
     }
 
     #[test]

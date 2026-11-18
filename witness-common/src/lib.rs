@@ -589,6 +589,27 @@ pub struct RawHdr {
 impl RawHdr {
     pub const SIZE: usize = 72;
 
+    /// An all-zero header, written as plain constants (a `zeroed()` call can compile to a
+    /// byte-loop `memset` that the BPF verifier then explores iteration by iteration).
+    pub const ZERO: RawHdr = RawHdr {
+        kind: 0,
+        flags: 0,
+        len: 0,
+        boot_ns: 0,
+        pid: 0,
+        tid: 0,
+        ppid: 0,
+        _pad0: 0,
+        uid: 0,
+        gid: 0,
+        euid: 0,
+        egid: 0,
+        auid: 0,
+        ses: 0,
+        cgroup_id: 0,
+        start_boot_ns: 0,
+    };
+
     /// Native-endian bytes in wire order (the inverse of [`RawHdr::parse`]).
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];

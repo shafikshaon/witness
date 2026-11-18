@@ -14,12 +14,12 @@ use aya_ebpf::{
         bpf_get_current_uid_gid, bpf_ktime_get_boot_ns,
         bpf_probe_read_kernel_str_bytes, generated,
     },
-    macros::{btf_tracepoint, kprobe, map},
-    maps::{HashMap, PerCpuArray, RingBuf},
-    programs::{BtfTracePointContext, ProbeContext},
+    macros::{btf_tracepoint, kprobe, kretprobe, map},
+    maps::{HashMap, LruHashMap, PerCpuArray, RingBuf},
+    programs::{BtfTracePointContext, ProbeContext, RetProbeContext},
 };
 use witness_common::{
-    InodeKey, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
+    nop, ConnInfo, InodeKey, NetEvent, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
     MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
 };
@@ -37,6 +37,12 @@ static VOLUME: RingBuf = RingBuf::with_byte_size(32 << 20, 0);
 /// configured sensitive list; matching by inode means no path walk for ordinary opens.
 #[map]
 static SENSITIVE: HashMap<InodeKey, u8> = HashMap::with_max_entries(SENSITIVE_MAX, 0);
+
+/// Owner of each TCP socket we have seen start (`connect`, `accept`, `listen`), keyed by the
+/// kernel `struct sock *`. Later state changes arrive in softirq context where "the current
+/// process" is arbitrary, so they are attributed from here. LRU keeps it bounded.
+#[map]
+static CONNS: LruHashMap<u64, ConnInfo> = LruHashMap::with_max_entries(CONNS_MAX, 0);
 
 /// Where paths are assembled before the final bounded copy into a record (one per CPU).
 #[map]
@@ -837,6 +843,183 @@ pub fn path_symlink(ctx: ProbeContext) -> u32 {
         emit_two(fop::SYMLINK, ret, null(), null(), mnt, dentry, target, 0);
     }
     0
+}
+
+// ---- TCP --------------------------------------------------------------------------------
+
+const TCP_ESTABLISHED: i32 = 1;
+const TCP_SYN_SENT: i32 = 2;
+const TCP_CLOSE: i32 = 7;
+const TCP_LISTEN: i32 = 10;
+
+/// Copies a header field by field. A whole-struct copy compiles to `memcpy`, which in BPF is
+/// a byte loop the verifier would walk iteration by iteration.
+#[inline(always)]
+unsafe fn copy_hdr(dst: *mut RawHdr, src: &RawHdr) {
+    (*dst).kind = src.kind;
+    (*dst).flags = src.flags;
+    (*dst).len = src.len;
+    (*dst).boot_ns = src.boot_ns;
+    (*dst).pid = src.pid;
+    (*dst).tid = src.tid;
+    (*dst).ppid = src.ppid;
+    (*dst)._pad0 = 0;
+    (*dst).uid = src.uid;
+    (*dst).gid = src.gid;
+    (*dst).euid = src.euid;
+    (*dst).egid = src.egid;
+    (*dst).auid = src.auid;
+    (*dst).ses = src.ses;
+    (*dst).cgroup_id = src.cgroup_id;
+    (*dst).start_boot_ns = src.start_boot_ns;
+}
+
+/// Captures the current process as a socket owner.
+#[inline(always)]
+unsafe fn current_owner(o: &Offsets) -> ConnInfo {
+    let mut info = ConnInfo {
+        hdr: RawHdr::ZERO,
+        comm: comm_or_zero(),
+        since_ns: bpf_ktime_get_boot_ns(),
+    };
+    let task = generated::bpf_get_current_task() as *const u8;
+    fill_hdr(
+        &mut info.hdr,
+        kind::NET_TCP,
+        core::mem::size_of::<NetEvent>(),
+        task,
+        o,
+    );
+    info
+}
+
+/// Emits one TCP lifecycle record for socket `sk`, attributed to `owner`.
+#[inline(always)]
+unsafe fn emit_net(op: u32, sk: *const u8, owner: &ConnInfo, old: i32, new: i32, o: &Offsets) {
+    let Some(mut entry) = VOLUME.reserve::<NetEvent>(0) else {
+        count_drop(DROP_CLASS_VOLUME);
+        return;
+    };
+    let ev = entry.as_mut_ptr();
+    copy_hdr(addr_of_mut!((*ev).hdr), &owner.hdr);
+    (*ev).hdr.boot_ns = bpf_ktime_get_boot_ns();
+    let b = addr_of_mut!((*ev).body);
+    let family = rd_or::<u16>(sk, o.sock_skc_family, 0) as u32;
+    (*b).op = op;
+    (*b).family = family;
+    (*b).lport = rd_or::<u16>(sk, o.sock_skc_num, 0);
+    (*b).rport = u16::from_be(rd_or::<u16>(sk, o.sock_skc_dport, 0));
+    (*b)._pad = 0;
+    // Read the IPv6 pair unconditionally, then overwrite the first four bytes for IPv4.
+    (*b).laddr = rd_or::<[u8; 16]>(sk, o.sock_skc_v6_rcv_saddr, [0; 16]);
+    (*b).raddr = rd_or::<[u8; 16]>(sk, o.sock_skc_v6_daddr, [0; 16]);
+    if family == AF_INET {
+        let l = rd_or::<[u8; 4]>(sk, o.sock_skc_rcv_saddr, [0; 4]);
+        let r = rd_or::<[u8; 4]>(sk, o.sock_skc_daddr, [0; 4]);
+        (*b).laddr = [l[0], l[1], l[2], l[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        (*b).raddr = [r[0], r[1], r[2], r[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    }
+    (*b).bytes_sent = rd_or::<u64>(sk, o.tcp_bytes_sent, 0);
+    (*b).bytes_recv = rd_or::<u64>(sk, o.tcp_bytes_received, 0);
+    (*b).duration_ns = (*ev).hdr.boot_ns.wrapping_sub(owner.since_ns);
+    (*b).old_state = old as u32;
+    (*b).new_state = new as u32;
+    (*b).comm = owner.comm;
+    entry.submit(0);
+}
+
+/// tcp_v4_connect / tcp_v6_connect(struct sock *sk, ...): remember who is connecting.
+#[inline(always)]
+unsafe fn on_connect(ctx: &ProbeContext) {
+    if is_self() {
+        return;
+    }
+    let sk: u64 = ctx.arg(0).unwrap_or(0);
+    let o = offsets();
+    let info = current_owner(&o);
+    let _ = CONNS.insert(&sk, &info, 0);
+}
+
+#[kprobe(function = "tcp_v4_connect")]
+pub fn tcp_v4_connect(ctx: ProbeContext) -> u32 {
+    // SAFETY: kernel memory is only read through the probe-read helper.
+    unsafe { on_connect(&ctx) };
+    0
+}
+
+#[kprobe(function = "tcp_v6_connect")]
+pub fn tcp_v6_connect(ctx: ProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe { on_connect(&ctx) };
+    0
+}
+
+/// inet_csk_accept(...) returns the new `struct sock *`; the accepting process is current.
+#[kretprobe(function = "inet_csk_accept")]
+pub fn tcp_accept(ctx: RetProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe {
+        if is_self() {
+            return 0;
+        }
+        let sk: u64 = ctx.ret().unwrap_or(0);
+        if sk == 0 {
+            return 0;
+        }
+        let o = offsets();
+        let info = current_owner(&o);
+        let _ = CONNS.insert(&sk, &info, 0);
+        emit_net(nop::ACCEPT, sk as *const u8, &info, TCP_LISTEN, TCP_ESTABLISHED, &o);
+    }
+    0
+}
+
+/// inet_sock_set_state(const struct sock *sk, int oldstate, int newstate)
+#[btf_tracepoint(function = "inet_sock_set_state")]
+pub fn tcp_state(ctx: BtfTracePointContext) -> i32 {
+    // SAFETY: as above.
+    unsafe { on_state(&ctx) };
+    0
+}
+
+#[inline(always)]
+unsafe fn on_state(ctx: &BtfTracePointContext) {
+    let sk: *const u8 = ctx.arg(0);
+    let old: i32 = ctx.arg(1);
+    let new: i32 = ctx.arg(2);
+    let key = sk as u64;
+    let o = offsets();
+
+    if new == TCP_LISTEN {
+        // listen() runs in the owning process.
+        if is_self() {
+            return;
+        }
+        let info = current_owner(&o);
+        let _ = CONNS.insert(&key, &info, 0);
+        emit_net(nop::LISTEN, sk, &info, old, new, &o);
+    } else if new == TCP_CLOSE {
+        // Copy the owner out of the map before removing it.
+        let Some(found) = CONNS.get(&key) else {
+            return;
+        };
+        let owner = *found;
+        let _ = CONNS.remove(&key);
+        let op = if old == TCP_SYN_SENT {
+            nop::CONNECT_FAILED
+        } else if old == TCP_LISTEN {
+            nop::LISTEN_CLOSE
+        } else {
+            nop::CLOSE
+        };
+        emit_net(op, sk, &owner, old, new, &o);
+    } else if new == TCP_ESTABLISHED && old == TCP_SYN_SENT {
+        let Some(found) = CONNS.get(&key) else {
+            return;
+        };
+        let owner = *found;
+        emit_net(nop::CONNECT, sk, &owner, old, new, &o);
+    }
 }
 
 #[panic_handler]

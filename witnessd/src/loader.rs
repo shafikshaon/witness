@@ -215,6 +215,11 @@ pub struct HookReport {
     pub status: Result<(), String>,
 }
 
+/// A poisoned lock only means another loader thread panicked; the data is still usable.
+fn relock<T>(e: std::sync::PoisonError<T>) -> T {
+    e.into_inner()
+}
+
 /// Loads one hook program into the kernel (running the verifier) and attaches it.
 fn load_attach(
     program: &mut aya::programs::Program,
@@ -436,7 +441,6 @@ impl Collector {
         let results: std::sync::Mutex<Vec<(usize, &'static str, Result<(), String>)>> =
             std::sync::Mutex::new(Vec::new());
         let stop = std::sync::atomic::AtomicBool::new(false);
-        let relock = |e: std::sync::PoisonError<_>| e.into_inner();
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| loop {

@@ -46,23 +46,158 @@ const PROGRAMS: [&str; 3] = [
     "sched_process_fork",
 ];
 
-/// File hooks: `(program, kernel function, expected parameter count)`. The count is checked
-/// against the running kernel's BTF so a changed signature degrades the hook instead of
-/// letting the program read the wrong argument.
-/// `true` marks a kprobe (used where the signature has by-value struct arguments, which
-/// fexit cannot carry); all others are fexit.
-const FILE_HOOKS: [(&str, &str, usize, bool); 11] = [
-    ("file_open", "security_file_open", 1, true),
-    ("path_mknod", "security_path_mknod", 4, true),
-    ("path_mkdir", "security_path_mkdir", 3, true),
-    ("path_unlink", "security_path_unlink", 2, true),
-    ("path_rmdir", "security_path_rmdir", 2, true),
-    ("path_chmod", "security_path_chmod", 2, true),
-    ("path_chown", "security_path_chown", 3, true),
-    ("path_truncate", "security_path_truncate", 1, true),
-    ("path_rename", "security_path_rename", 5, true),
-    ("path_link", "security_path_link", 3, true),
-    ("path_symlink", "security_path_symlink", 3, true),
+/// Which capture source a hook belongs to; each has its own pre-checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Group {
+    Files,
+    Net,
+}
+
+#[derive(Clone, Copy)]
+enum Attach {
+    /// kprobe or kretprobe on a kernel function (both load as `KProbe`).
+    KProbe,
+    /// BTF raw tracepoint.
+    BtfTp,
+}
+
+struct Hook {
+    prog: &'static str,
+    /// Kernel function (kprobe) or tracepoint name.
+    target: &'static str,
+    /// Expected parameter count, checked against the running kernel's BTF so a changed
+    /// signature degrades the hook instead of letting the program read the wrong argument.
+    /// `None` for tracepoints (their arguments are typed by BTF).
+    params: Option<usize>,
+    attach: Attach,
+    group: Group,
+}
+
+const fn hook(
+    prog: &'static str,
+    target: &'static str,
+    params: Option<usize>,
+    attach: Attach,
+    group: Group,
+) -> Hook {
+    Hook {
+        prog,
+        target,
+        params,
+        attach,
+        group,
+    }
+}
+
+/// All optional hooks. File hooks are kprobes (no fentry/fexit on arm64 before 6.0, and
+/// `kuid_t` by-value arguments); TCP uses kprobes on connect/accept plus the
+/// `inet_sock_set_state` tracepoint.
+const HOOKS: [Hook; 15] = [
+    hook(
+        "file_open",
+        "security_file_open",
+        Some(1),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_mknod",
+        "security_path_mknod",
+        Some(4),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_mkdir",
+        "security_path_mkdir",
+        Some(3),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_unlink",
+        "security_path_unlink",
+        Some(2),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_rmdir",
+        "security_path_rmdir",
+        Some(2),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_chmod",
+        "security_path_chmod",
+        Some(2),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_chown",
+        "security_path_chown",
+        Some(3),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_truncate",
+        "security_path_truncate",
+        Some(1),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_rename",
+        "security_path_rename",
+        Some(5),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_link",
+        "security_path_link",
+        Some(3),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "path_symlink",
+        "security_path_symlink",
+        Some(3),
+        Attach::KProbe,
+        Group::Files,
+    ),
+    hook(
+        "tcp_v4_connect",
+        "tcp_v4_connect",
+        Some(3),
+        Attach::KProbe,
+        Group::Net,
+    ),
+    hook(
+        "tcp_v6_connect",
+        "tcp_v6_connect",
+        Some(3),
+        Attach::KProbe,
+        Group::Net,
+    ),
+    hook(
+        "tcp_accept",
+        "inet_csk_accept",
+        Some(4),
+        Attach::KProbe,
+        Group::Net,
+    ),
+    hook(
+        "tcp_state",
+        "inet_sock_set_state",
+        None,
+        Attach::BtfTp,
+        Group::Net,
+    ),
 ];
 
 /// Outcome of attaching one optional hook.
@@ -76,19 +211,19 @@ pub struct HookReport {
 /// Loads one hook program into the kernel (running the verifier) and attaches it.
 fn load_attach(
     program: &mut aya::programs::Program,
-    func: &str,
-    kprobe: bool,
+    target: &str,
+    attach: Attach,
     kbtf: &AyaBtf,
 ) -> Result<(), String> {
     use aya::programs::Program;
-    match (program, kprobe) {
-        (Program::KProbe(p), true) => {
+    match (program, attach) {
+        (Program::KProbe(p), Attach::KProbe) => {
             p.load().map_err(|e| format!("load: {e}"))?;
-            p.attach(func, 0).map_err(|e| format!("attach: {e}"))?;
+            p.attach(target, 0).map_err(|e| format!("attach: {e}"))?;
             Ok(())
         }
-        (Program::FExit(p), false) => {
-            p.load(func, kbtf).map_err(|e| format!("load: {e}"))?;
+        (Program::BtfTracePoint(p), Attach::BtfTp) => {
+            p.load(target, kbtf).map_err(|e| format!("load: {e}"))?;
             p.attach().map_err(|e| format!("attach: {e}"))?;
             Ok(())
         }
@@ -117,6 +252,25 @@ fn missing_file_offsets(o: &Offsets) -> Vec<&'static str> {
         ("inode.i_ino", o.inode_i_ino),
         ("super_block.s_dev", o.sb_s_dev),
         ("super_block.s_magic", o.sb_s_magic),
+    ]
+    .into_iter()
+    .filter(|(_, v)| *v == UNAVAILABLE)
+    .map(|(n, _)| n)
+    .collect()
+}
+
+/// Offsets the TCP hooks need.
+fn missing_net_offsets(o: &Offsets) -> Vec<&'static str> {
+    [
+        ("sock_common.skc_daddr", o.sock_skc_daddr),
+        ("sock_common.skc_rcv_saddr", o.sock_skc_rcv_saddr),
+        ("sock_common.skc_dport", o.sock_skc_dport),
+        ("sock_common.skc_num", o.sock_skc_num),
+        ("sock_common.skc_family", o.sock_skc_family),
+        ("sock_common.skc_v6_daddr", o.sock_skc_v6_daddr),
+        ("sock_common.skc_v6_rcv_saddr", o.sock_skc_v6_rcv_saddr),
+        ("tcp_sock.bytes_sent", o.tcp_bytes_sent),
+        ("tcp_sock.bytes_received", o.tcp_bytes_received),
     ]
     .into_iter()
     .filter(|(_, v)| *v == UNAVAILABLE)
@@ -158,6 +312,7 @@ impl Collector {
         critical_bytes: u32,
         volume_bytes: u32,
         files: bool,
+        network: bool,
         // Polled between batches of hook loads so a stop request during a slow start (the
         // kernel verifier takes seconds for the file hooks) is honoured promptly.
         interrupted: &dyn Fn() -> bool,
@@ -198,55 +353,61 @@ impl Collector {
         // program is independent and CPU-bound (the kernel verifier walks every path), so the
         // programs are loaded concurrently: serial loading took ~6 s on a 4-CPU VM, which would
         // delay every service ordered after us at boot.
-        let mut reports: Vec<Option<HookReport>> = vec![None; FILE_HOOKS.len()];
-        let missing = missing_file_offsets(&offsets);
+        let mut reports: Vec<Option<HookReport>> = (0..HOOKS.len()).map(|_| None).collect();
+        let missing_files = missing_file_offsets(&offsets);
+        let missing_net = missing_net_offsets(&offsets);
         // Diagnostic: attach only the named hook (e.g. WITNESS_ONLY_HOOK=security_file_open).
         let only = std::env::var("WITNESS_ONLY_HOOK").ok();
         let mut by_name: std::collections::HashMap<String, &mut aya::programs::Program> = ebpf
             .programs_mut()
             .map(|(n, p)| (n.to_string(), p))
             .collect();
-        let mut jobs: Vec<(usize, &'static str, bool, &mut aya::programs::Program)> = Vec::new();
-        for (idx, (prog_name, func, params, kprobe)) in FILE_HOOKS.into_iter().enumerate() {
-            if only.as_deref().is_some_and(|o| o != func) {
+        let mut jobs: Vec<(usize, &'static str, Attach, &mut aya::programs::Program)> = Vec::new();
+        for (idx, h) in HOOKS.iter().enumerate() {
+            if only.as_deref().is_some_and(|o| o != h.target) {
                 reports[idx] = Some(HookReport {
-                    hook: func,
+                    hook: h.target,
                     status: Err("skipped (WITNESS_ONLY_HOOK)".into()),
                 });
                 continue;
             }
             let pre: Result<(), String> = (|| {
-                if !files {
-                    return Err("file capture disabled in the configuration".into());
+                let (enabled, missing, layout) = match h.group {
+                    Group::Files => (files, &missing_files, layout_problem(&offsets)),
+                    Group::Net => (network, &missing_net, None),
+                };
+                if !enabled {
+                    return Err("capture of this kind is disabled in the configuration".into());
                 }
                 if !missing.is_empty() {
                     return Err(format!("kernel BTF lacks {}", missing.join(", ")));
                 }
-                if let Some(why) = layout_problem(&offsets) {
+                if let Some(why) = layout {
                     return Err(why);
                 }
-                match btf.func_param_count(func) {
-                    None => Err(format!("{func} is not in the kernel's BTF")),
-                    Some(n) if n != params => {
-                        Err(format!("{func} has {n} parameters, expected {params}"))
+                match (h.params, btf.func_param_count(h.target)) {
+                    (None, _) => Ok(()),
+                    (Some(_), None) => Err(format!("{} is not in the kernel's BTF", h.target)),
+                    (Some(want), Some(n)) if n != want => {
+                        Err(format!("{} has {n} parameters, expected {want}", h.target))
                     }
-                    Some(_) => Ok(()),
+                    (Some(_), Some(_)) => Ok(()),
                 }
             })();
-            match (pre, by_name.remove(prog_name)) {
+            match (pre, by_name.remove(h.prog)) {
                 (Err(e), _) => {
                     reports[idx] = Some(HookReport {
-                        hook: func,
+                        hook: h.target,
                         status: Err(e),
                     })
                 }
                 (Ok(()), None) => {
                     reports[idx] = Some(HookReport {
-                        hook: func,
-                        status: Err(format!("program {prog_name} missing from the object")),
+                        hook: h.target,
+                        status: Err(format!("program {} missing from the object", h.prog)),
                     })
                 }
-                (Ok(()), Some(prog)) => jobs.push((idx, func, kprobe, prog)),
+                (Ok(()), Some(prog)) => jobs.push((idx, h.target, h.attach, prog)),
             }
         }
         let workers = std::thread::available_parallelism()
@@ -270,8 +431,8 @@ impl Collector {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = batch
                     .into_iter()
-                    .map(|(idx, func, kprobe, prog)| {
-                        scope.spawn(move || (idx, func, load_attach(prog, func, kprobe, kbtf_ref)))
+                    .map(|(idx, func, attach, prog)| {
+                        scope.spawn(move || (idx, func, load_attach(prog, func, attach, kbtf_ref)))
                     })
                     .collect();
                 for h in handles {

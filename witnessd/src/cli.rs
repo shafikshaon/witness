@@ -277,6 +277,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         cfg.capture.ring_critical_mib << 20,
         cfg.capture.ring_volume_mib << 20,
         cfg.capture.files,
+        cfg.capture.network,
         &|| signal_pending(sigfd.as_fd()),
     )?;
     let failed: Vec<String> = hooks

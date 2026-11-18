@@ -403,7 +403,8 @@ fn dpkg_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>, r: Roots) {
 
 #[cfg(target_os = "linux")]
 fn uevent_socket() -> std::io::Result<std::os::fd::OwnedFd> {
-    use rustix::net::{netlink, AddressFamily, SocketAddrNetlink, SocketType};
+    use rustix::net::netlink::{self, SocketAddrNetlink};
+    use rustix::net::{AddressFamily, SocketType};
     let fd = rustix::net::socket(
         AddressFamily::NETLINK,
         SocketType::DGRAM,

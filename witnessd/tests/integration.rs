@@ -843,6 +843,67 @@ mod files {
         assert_eq!(creates, 500, "every one of 500 creations is captured");
     }
 
+    /// A critical file's content is hashed once it settles; a real change names the previous
+    /// hash, an identical rewrite produces nothing, and non-critical paths are not hashed.
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn critical_files_are_hashed_after_they_settle_and_only_on_change() {
+        use super::store_mode::{records, spawn, verify};
+        use sha2::{Digest, Sha256};
+        let hex = |b: &[u8]| {
+            witness_store::chain::to_hex(
+                &<[u8; 32]>::try_from(Sha256::digest(b).as_slice()).unwrap(),
+            )
+        };
+        let t = tempfile::tempdir_in("/tmp").unwrap();
+        let m = marker("hash");
+        let critical = format!("/etc/{m}");
+        let ordinary = format!("/tmp/{m}");
+        let (child, _err) = spawn(t.path(), 22);
+        let settle = std::time::Duration::from_millis(3500); // debounce (2 s) + hashing + a loop tick
+        fs::write(&critical, b"version one").unwrap();
+        fs::write(&ordinary, b"version one").unwrap();
+        std::thread::sleep(settle);
+        fs::write(&critical, b"version two").unwrap();
+        std::thread::sleep(settle);
+        fs::write(&critical, b"version two").unwrap(); // same bytes: touched, not changed
+        std::thread::sleep(settle);
+        fs::remove_file(&critical).unwrap();
+        fs::remove_file(&ordinary).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+
+        verify(t.path());
+        let recs = records(t.path());
+        let hashes: Vec<&Value> = recs
+            .iter()
+            .filter(|v| v["type"] == "file_hash" && v["data"]["path"] == critical.as_str())
+            .collect();
+        assert_eq!(
+            hashes.len(),
+            2,
+            "first sighting and one real change, got {hashes:#?}"
+        );
+        assert_eq!(hashes[0]["data"]["sha256"], hex(b"version one"));
+        assert!(
+            hashes[0]["data"].get("prev_sha256").is_none(),
+            "no previous hash the first time"
+        );
+        assert_eq!(hashes[1]["data"]["sha256"], hex(b"version two"));
+        assert_eq!(hashes[1]["data"]["prev_sha256"], hex(b"version one"));
+        assert_eq!(hashes[1]["data"]["size"], 11);
+        // The hash event names who made the change.
+        assert_eq!(hashes[1]["actor"]["uid"], 0);
+        assert!(hashes[1]["actor"]["exe"]
+            .as_str()
+            .is_some_and(|e| e.contains("integration")));
+        assert!(
+            !recs
+                .iter()
+                .any(|v| v["type"] == "file_hash" && v["data"]["path"] == ordinary.as_str()),
+            "/tmp is watched, not critical: not hashed"
+        );
+    }
+
     /// In store mode the path policy applies: watched and critical paths are kept, the rest
     /// is counted rather than stored, and the daemon never records its own writes.
     #[test]

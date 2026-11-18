@@ -86,8 +86,21 @@ impl Sources {
             threads.push(std::thread::spawn(move || account_loop(tx, stop, r)));
         }
         {
-            let (stop, r) = (stop.clone(), roots);
+            let (tx, stop, r) = (tx.clone(), stop.clone(), roots);
             threads.push(std::thread::spawn(move || dpkg_loop(tx, stop, r)));
+        }
+        #[cfg(target_os = "linux")]
+        match uevent_socket() {
+            Ok(sock) => {
+                let stop = stop.clone();
+                threads.push(std::thread::spawn(move || uevent_loop(tx, stop, sock)));
+            }
+            Err(e) => unavailable.push(("uevent", e.to_string())),
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = tx;
+            unavailable.push(("uevent", "Linux only".into()));
         }
         Sources {
             rx,
@@ -381,6 +394,55 @@ fn dpkg_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>, r: Roots) {
                 if tx.send(p).is_err() {
                     return;
                 }
+            }
+        }
+    }
+}
+
+// ---- uevent ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn uevent_socket() -> std::io::Result<std::os::fd::OwnedFd> {
+    use rustix::net::{netlink, AddressFamily, SocketAddrNetlink, SocketType};
+    let fd = rustix::net::socket(
+        AddressFamily::NETLINK,
+        SocketType::DGRAM,
+        Some(netlink::KOBJECT_UEVENT),
+    )?;
+    // Group 1: events straight from the kernel.
+    rustix::net::bind(&fd, &SocketAddrNetlink::new(0, 1))?;
+    // A timeout lets the loop notice a stop request.
+    rustix::net::sockopt::set_socket_timeout(
+        &fd,
+        rustix::net::sockopt::Timeout::Recv,
+        Some(Duration::from_millis(250)),
+    )?;
+    Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn uevent_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>, sock: std::os::fd::OwnedFd) {
+    let mut buf = vec![0u8; 16 * 1024];
+    while !stop.load(Ordering::SeqCst) {
+        let n = match rustix::net::recv(&sock, &mut buf[..], rustix::net::RecvFlags::empty()) {
+            Ok((n, _total)) => n,
+            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "uevent socket failed; device events stop");
+                return;
+            }
+        };
+        let Some(ev) = crate::uevent::parse(&buf[..n]) else {
+            continue;
+        };
+        if let Some(body) = crate::uevent::to_body(&ev, Path::new("/sys")) {
+            let p = Pending {
+                src: Source::Uevent,
+                body,
+                wall_ns: None,
+            };
+            if tx.send(p).is_err() {
+                return;
             }
         }
     }

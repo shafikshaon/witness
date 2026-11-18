@@ -15,3 +15,4 @@ pub mod pipeline;
 pub mod pkglog;
 pub mod sensitive;
 pub mod sources;
+pub mod uevent;

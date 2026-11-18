@@ -1368,4 +1368,30 @@ mod auth {
             .iter()
             .any(|e| e["type"] == "module_unload" && e["data"]["name"] == "dummy"));
     }
+
+    #[test]
+    #[ignore = "needs root; briefly changes the system clock"]
+    fn a_clock_step_is_recorded_with_its_size() {
+        let t = tempfile::tempdir().unwrap();
+        let (mut child, _err) = spawn(t.path(), 9);
+        let date = |args: &[&str]| Command::new("date").args(args).status().unwrap();
+        let before = std::time::SystemTime::now();
+        date(&["-s", "@1900000000"]);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Put it back, accounting for the time that really passed.
+        let back = before
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 2;
+        date(&["-s", &format!("@{back}")]);
+        let _ = child.wait();
+        let ev = records(t.path());
+        let steps: Vec<_> = ev.iter().filter(|e| e["type"] == "clock_change").collect();
+        assert!(
+            steps.iter().any(|e| e["data"]["kind"] == "step"
+                && e["data"]["delta_ns"].as_i64().unwrap().abs() > 1_000_000_000),
+            "clock events: {steps:?}"
+        );
+    }
 }

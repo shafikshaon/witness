@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use serde_json::Value;
-use witness_common::schema::{Body, Event, Source, SCHEMA_VERSION};
+use witness_common::schema::{Body, ClockChange, ClockKind, Event, Source, SCHEMA_VERSION};
 
 use crate::accounts::{self, Accounts, Key};
 
@@ -88,6 +88,10 @@ impl Sources {
         {
             let (tx, stop, r) = (tx.clone(), stop.clone(), roots);
             threads.push(std::thread::spawn(move || dpkg_loop(tx, stop, r)));
+        }
+        {
+            let (tx, stop) = (tx.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || clock_loop(tx, stop)));
         }
         #[cfg(target_os = "linux")]
         match uevent_socket() {
@@ -396,6 +400,50 @@ fn dpkg_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>, r: Roots) {
                 }
             }
         }
+    }
+}
+
+// ---- clock ----------------------------------------------------------------------------
+
+/// `CLOCK_REALTIME - CLOCK_BOOTTIME` in nanoseconds. Steady time passing leaves it constant;
+/// someone setting the clock moves it by exactly the step.
+fn clock_offset_ns() -> i128 {
+    use rustix::time::{clock_gettime, ClockId};
+    let ns = |c| {
+        let t = clock_gettime(c);
+        t.tv_sec as i128 * 1_000_000_000 + t.tv_nsec as i128
+    };
+    #[cfg(target_os = "linux")]
+    let boot = ClockId::Boottime;
+    #[cfg(not(target_os = "linux"))]
+    let boot = ClockId::Monotonic;
+    ns(ClockId::Realtime) - ns(boot)
+}
+
+/// Steps smaller than this are scheduler noise or NTP slewing, not tampering.
+const CLOCK_STEP_NS: i128 = 500_000_000;
+
+fn clock_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>) {
+    let mut last = clock_offset_ns();
+    while !stop.load(Ordering::SeqCst) {
+        sleep_unless_stopped(&stop, Duration::from_millis(250));
+        let now = clock_offset_ns();
+        let delta = now - last;
+        if delta.abs() >= CLOCK_STEP_NS {
+            let p = Pending {
+                src: Source::Daemon,
+                body: Body::ClockChange(ClockChange {
+                    kind: ClockKind::Step,
+                    delta_ns: delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+                    syscall: None,
+                }),
+                wall_ns: None,
+            };
+            if tx.send(p).is_err() {
+                return;
+            }
+        }
+        last = now;
     }
 }
 

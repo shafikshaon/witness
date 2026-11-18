@@ -962,7 +962,7 @@ pub fn tcp_accept(ctx: RetProbeContext) -> u32 {
         if is_self() {
             return 0;
         }
-        let sk: u64 = ctx.ret::<u64>().unwrap_or(0);
+        let sk: u64 = ctx.ret();
         if sk == 0 {
             return 0;
         }

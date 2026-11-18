@@ -5,8 +5,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use witness_common::schema::{
     puid, Actor, AttrOp, Body, ConnOutcome, DnsDir, DnsEvent as DnsBodyOut, Event, FileAttr,
-    FileLink, FileOp, FileRename, HookResult, LinkKind, NetClose, NetConn, NetListen, OsBytes,
-    Priority, ProcExec, ProcExit, ProcFork, Proto, Source, SCHEMA_VERSION,
+    FileLink, FileOp, FileRename, HookResult, LinkKind, Module, NetClose, NetConn, NetListen,
+    OsBytes, Priority, ProcExec, ProcExit, ProcFork, Proto, Source, SCHEMA_VERSION,
 };
 use witness_common::{
     flags, fop, kind, modop, nop, DnsBody, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody,
@@ -422,7 +422,7 @@ impl Decoder {
                     actor.exe = resolve_exe(hdr.pid).map(OsBytes);
                 }
                 let m = Module {
-                    name: String::from_utf8_lossy(&cstr(&b.name, b.name.len())).into_owned(),
+                    name: String::from_utf8_lossy(&cstr(&b.name, b.name.len() as u32)).into_owned(),
                     file: None,
                     taints: (b.taints != 0).then(|| format!("{:#x}", b.taints)),
                 };

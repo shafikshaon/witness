@@ -887,7 +887,13 @@ unsafe fn fill_owner(dst: *mut ConnInfo, o: &Offsets) {
     );
     (*dst).comm = comm_or_zero();
     (*dst).since_ns = bpf_ktime_get_boot_ns();
+    // No snapshot yet. Every byte must be initialised: the whole record is handed to the map
+    // helper, and the verifier rejects reads of uninitialised stack.
     (*dst).net.family = 0;
+    (*dst).net.lport = 0;
+    (*dst).net.rport = 0;
+    (*dst).net.laddr = [0; 16];
+    (*dst).net.raddr = [0; 16];
 }
 
 /// Reads a socket's addresses and ports as they are right now into `dst`.

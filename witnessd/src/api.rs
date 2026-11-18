@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -127,11 +127,32 @@ fn members_of(group: &str) -> Vec<String> {
 
 impl Api {
     pub fn start(cfg: ApiConfig) -> std::io::Result<Api> {
-        if let Some(dir) = cfg.socket.parent() {
+        // Only a directory dedicated to Witness (`/run/witness`) is created, restricted and
+        // handed to the group. Any other directory (say `/tmp`, if the socket is configured
+        // there) is left exactly as it is: changing a shared directory's mode or group is not
+        // ours to do. The socket's own mode and group still control access.
+        let dedicated = cfg
+            .socket
+            .parent()
+            .filter(|d| d.file_name().is_some_and(|n| n == "witness"));
+        if let Some(dir) = cfg.socket.parent().filter(|d| !d.exists()) {
+            std::fs::create_dir_all(dir)?;
+        }
+        if let Some(dir) = dedicated {
             std::fs::create_dir_all(dir)?;
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750));
         }
-        let _ = std::fs::remove_file(&cfg.socket);
+        // Remove only a stale socket, never some other file that happens to sit at the path.
+        if let Ok(m) = std::fs::symlink_metadata(&cfg.socket) {
+            if m.file_type().is_socket() {
+                std::fs::remove_file(&cfg.socket)?;
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a socket", cfg.socket.display()),
+                ));
+            }
+        }
         let listener = UnixListener::bind(&cfg.socket)?;
         listener.set_nonblocking(true)?;
         // Group-accessible if the group exists; otherwise root only, never world-accessible.
@@ -140,7 +161,7 @@ impl Api {
         std::fs::set_permissions(&cfg.socket, std::fs::Permissions::from_mode(mode))?;
         if let Some(g) = gid {
             let _ = rustix::fs::chown(&cfg.socket, None, Some(rustix::fs::Gid::from_raw(g)));
-            if let Some(dir) = cfg.socket.parent() {
+            if let Some(dir) = dedicated {
                 let _ = rustix::fs::chown(dir, None, Some(rustix::fs::Gid::from_raw(g)));
             }
         } else {
@@ -1005,4 +1026,77 @@ fn rules_toggle(sh: &Shared, id: &str, enable: bool) -> Res {
     std::fs::rename(&from, &to)
         .map_err(|e| (404, "not found", format!("{}: {e}", from.display())))?;
     ok(json!({"id": id, "enabled": enable}))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn cfg(socket: PathBuf, dir: &std::path::Path) -> ApiConfig {
+        ApiConfig {
+            socket,
+            group: "witness-no-such-group".into(),
+            admin_group: "witness-no-such-admin".into(),
+            data_dir: dir.join("data"),
+            rules_dir: dir.join("rules"),
+        }
+    }
+
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_shared_directory_holding_the_socket_is_not_touched() {
+        let t = tempfile::tempdir().unwrap();
+        let shared = t.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let api = Api::start(cfg(shared.join("w.sock"), t.path())).unwrap();
+        assert_eq!(
+            mode(&shared),
+            0o1777,
+            "the daemon must not chmod a directory it does not own"
+        );
+        assert_eq!(
+            mode(&shared.join("w.sock")),
+            0o600,
+            "no such group: root only, never world"
+        );
+        api.stop();
+    }
+
+    #[test]
+    fn a_dedicated_witness_directory_is_created_and_restricted() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("run/witness");
+        let api = Api::start(cfg(dir.join("w.sock"), t.path())).unwrap();
+        assert_eq!(mode(&dir), 0o750);
+        api.stop();
+        assert!(
+            !dir.join("w.sock").exists(),
+            "the socket is removed on stop"
+        );
+    }
+
+    #[test]
+    fn a_stale_socket_is_replaced_but_a_regular_file_is_never_deleted() {
+        let t = tempfile::tempdir().unwrap();
+        let sock = t.path().join("w.sock");
+        let first = Api::start(cfg(sock.clone(), t.path())).unwrap();
+        // Simulate a crash: the socket file is left behind.
+        std::mem::forget(first);
+        let second = Api::start(cfg(sock.clone(), t.path())).unwrap();
+        second.stop();
+
+        let precious = t.path().join("precious");
+        std::fs::write(&precious, "keep me").unwrap();
+        let err = Api::start(cfg(precious.clone(), t.path())).err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&precious).unwrap(), "keep me");
+    }
 }

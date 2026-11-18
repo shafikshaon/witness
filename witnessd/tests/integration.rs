@@ -1659,9 +1659,7 @@ mod api {
             .is_err());
 
         // Export in each format.
-        let nd = c
-            .get_text("/v1/export?kind=proc_exec&max=5&format=ndjson")
-            .unwrap();
+        let nd = c.get_text("/v1/export?max=5&format=ndjson").unwrap();
         assert_eq!(nd.lines().count(), 5);
         let js: serde_json::Value =
             serde_json::from_str(&c.get_text("/v1/export?max=3&format=json").unwrap()).unwrap();

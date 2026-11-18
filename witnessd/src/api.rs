@@ -343,9 +343,7 @@ fn peer_of(s: &UnixStream, cfg: &ApiConfig) -> Option<Peer> {
             })
         })
         .unwrap_or_default();
-    let admin = uid == 0
-        || admin_gid == Some(gid)
-        || members_of(&cfg.admin_group).iter().any(|m| *m == name);
+    let admin = uid == 0 || admin_gid == Some(gid) || members_of(&cfg.admin_group).contains(&name);
     Some(Peer {
         uid,
         gid,

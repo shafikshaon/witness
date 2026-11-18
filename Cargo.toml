@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 exclude = ["witness-ebpf"]
-members = ["witness-common", "witness-store", "witness-config", "witness-rules", "witness-client", "witnessd", "witness-cli"]
+members = ["witness-common", "witness-store", "witness-config", "witness-rules", "witness-client", "witness-gui", "witnessd", "witness-cli"]
 # witness-ebpf is a separate workspace (nightly, bpfel-unknown-none); see docs/DESIGN.md §1.2.
 
 [workspace.package]

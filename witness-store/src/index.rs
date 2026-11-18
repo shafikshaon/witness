@@ -47,6 +47,8 @@ pub struct Filter {
     pub text: Option<String>,
     /// Keyset cursor: return events with `seq` strictly below this (newest-first order).
     pub before_seq: Option<u64>,
+    /// Return events with `seq` strictly above this, oldest first (for following live data).
+    pub after_seq: Option<u64>,
     pub limit: usize,
 }
 
@@ -212,6 +214,9 @@ impl Index {
         if let Some(v) = f.before_seq {
             and("seq < ?", Sql::Integer(v as i64));
         }
+        if let Some(v) = f.after_seq {
+            and("seq > ?", Sql::Integer(v as i64));
+        }
         let mut sql = String::from(
             "SELECT seq,kind,boot_ns,wall_ns,pid,uid,puid,seg_id,seg_off,len FROM events",
         );
@@ -219,7 +224,11 @@ impl Index {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
         }
-        sql.push_str(" ORDER BY seq DESC LIMIT ?");
+        sql.push_str(if f.after_seq.is_some() {
+            " ORDER BY seq ASC LIMIT ?"
+        } else {
+            " ORDER BY seq DESC LIMIT ?"
+        });
         args.push(Sql::Integer(f.limit.clamp(1, 1000) as i64));
 
         let mut stmt = self.conn.prepare(&sql).map_err(db)?;
@@ -237,6 +246,53 @@ impl Index {
                     seg_off: r.get::<_, i64>(8)? as u64,
                     len: r.get::<_, i64>(9)? as u64,
                 })
+            })
+            .map_err(db)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db)?;
+        Ok(rows)
+    }
+
+    /// Event counts per `(bucket, kind)` over `[from, to)` (wall-clock ns), `buckets` equal
+    /// slices. The caller bounds the range; bucket indexes are `0..buckets`.
+    pub fn timeline(&self, from: u64, to: u64, buckets: u32) -> Result<Vec<(u32, String, u64)>> {
+        if to <= from || buckets == 0 {
+            return Ok(Vec::new());
+        }
+        let buckets = buckets.min(1000);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ((wall_ns - ?1) * ?3 / (?2 - ?1)) AS b, kind, COUNT(*) FROM events \
+                 WHERE wall_ns >= ?1 AND wall_ns < ?2 GROUP BY b, kind ORDER BY b",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([from as i64, to as i64, buckets as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u32,
+                    r.get(1)?,
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .map_err(db)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db)?;
+        Ok(rows)
+    }
+
+    /// Total events per kind over `[from, to)`.
+    pub fn kind_counts(&self, from: u64, to: u64) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT kind, COUNT(*) FROM events WHERE wall_ns >= ?1 AND wall_ns < ?2 \
+                 GROUP BY kind ORDER BY 2 DESC",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([from as i64, to as i64], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as u64))
             })
             .map_err(db)?
             .collect::<std::result::Result<Vec<_>, _>>()

@@ -1053,6 +1053,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "witness-client"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "witness-common"
 version = "0.1.0"
 dependencies = [

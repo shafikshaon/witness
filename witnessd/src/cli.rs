@@ -311,6 +311,24 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         Ok(n) => tracing::info!(rules = n, dir = %cfg.rules.dir.display(), "rule engine active"),
         Err(e) => tracing::warn!(error = %e, "rule engine not started"),
     }
+    let api = match crate::api::Api::start(crate::api::ApiConfig {
+        socket: cfg.api.socket.clone(),
+        group: cfg.api.group.clone(),
+        admin_group: cfg.api.admin_group.clone(),
+        data_dir: data_dir.clone(),
+        rules_dir: cfg.rules.dir.clone(),
+    }) {
+        Ok(a) => {
+            tracing::info!(socket = %cfg.api.socket.display(), "api listening");
+            pipeline.source_health("api", "active", None)?;
+            Some(a)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "api not available");
+            pipeline.source_health("api", "unavailable", Some(e.to_string()))?;
+            None
+        }
+    };
     let sources = cfg
         .capture
         .auth
@@ -485,6 +503,28 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                 }
             }
         }
+        if let Some(a) = &api {
+            for cmd in a.drain() {
+                let body = match cmd {
+                    crate::api::ApiCmd::Triage {
+                        alert_seq,
+                        status,
+                        note,
+                        uid,
+                    } => Body::TriageAction(witness_common::schema::TriageAction {
+                        alert_seq,
+                        status,
+                        note,
+                        actor_uid: uid,
+                    }),
+                    crate::api::ApiCmd::Access(a) => Body::ApiAccess(a),
+                };
+                if let Err(e) = pipeline.record(body) {
+                    failure = Some(e);
+                    break 'main;
+                }
+            }
+        }
         if last_summary.elapsed() >= summary_every {
             let interval = last_summary.elapsed().as_nanos() as u64;
             last_summary = Instant::now();
@@ -527,6 +567,9 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
     drop(collector);
     if let Some(s) = sources {
         s.stop();
+    }
+    if let Some(a) = api {
+        a.stop();
     }
     let reason = match (&failure, signalled) {
         (Some(_), _) => "error",

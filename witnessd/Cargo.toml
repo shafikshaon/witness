@@ -42,4 +42,5 @@ aya = "=0.16.0"
 anyhow = "=1.0.104"
 
 [dev-dependencies]
+witness-client = { path = "../witness-client" }
 tempfile = "=3.27.0"

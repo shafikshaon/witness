@@ -288,6 +288,11 @@ impl Pipeline {
         Ok(n)
     }
 
+    /// Records a daemon-originated body (triage actions, API access) in the chain.
+    pub fn record(&mut self, body: Body) -> Result<()> {
+        self.write(body)
+    }
+
     /// Stores one captured event, subject to the disk-full policy, then evaluates the rules
     /// over it. Alerts are chained records of their own.
     pub fn ingest(&mut self, ev: &Event) -> Result<()> {

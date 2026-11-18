@@ -1478,3 +1478,207 @@ mod rules {
                 .any(|x| x.as_str().is_some_and(|s| s.starts_with("broken.yml"))))));
     }
 }
+
+mod api {
+    use std::fs;
+    use std::process::Command;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use witness_client::Client;
+
+    use super::store_mode::spawn_cfg;
+
+    fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..60 {
+            if let Some(v) = f() {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn the_api_serves_events_search_streams_triage_integrity_and_rules() {
+        let t = tempfile::tempdir().unwrap();
+        let rules = t.path().join("rules.d");
+        fs::create_dir(&rules).unwrap();
+        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rules");
+        fs::copy(
+            pack.join("exec-from-tmp.yml"),
+            rules.join("exec-from-tmp.yml"),
+        )
+        .unwrap();
+        let sock = t.path().join("run/witness.sock");
+        let cfg = t.path().join("config.toml");
+        fs::write(
+            &cfg,
+            format!(
+                "[rules]\ndir = \"{}\"\n[api]\nsocket = \"{}\"\ngroup = \"witness-no-such-group\"\n",
+                rules.display(),
+                sock.display()
+            ),
+        )
+        .unwrap();
+        let (mut child, _err) = spawn_cfg(&t.path().join("data"), 40, &cfg);
+        let c = Client::new(&sock);
+
+        assert_eq!(c.get("/v1/health").unwrap()["ok"], true);
+        let st = c.get("/v1/status").unwrap();
+        assert_eq!(st["tier"], "admin");
+        assert!(st["head_seq"].as_u64().unwrap() > 0);
+
+        // A live stream opened now must see activity that happens afterwards.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sc = c.clone();
+        let streamer = std::thread::spawn(move || {
+            let _ = sc.stream("/v1/stream?kind=proc_exec", |v| {
+                if v["data"]["exe"]
+                    .as_str()
+                    .is_some_and(|e| e.ends_with("witness-api-marker"))
+                {
+                    let _ = tx.send(v);
+                    return false;
+                }
+                true
+            });
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        let marker = "/dev/shm/witness-api-marker";
+        fs::copy("/bin/true", marker).unwrap();
+        Command::new(marker).status().unwrap();
+        fs::remove_file(marker).unwrap();
+        let streamed = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the stream delivered the exec");
+        assert_eq!(streamed["type"], "proc_exec");
+        streamer.join().unwrap();
+
+        // Search finds it, by FTS text and by kind; the event is fetchable by seq and raw.
+        let found = wait_for("the event to be indexed", || {
+            let r = c
+                .get("/v1/events?kind=proc_exec&q=witness-api-marker&limit=5")
+                .ok()?;
+            (!r["events"].as_array()?.is_empty()).then_some(r)
+        });
+        let seq = found["events"][0]["seq"].as_u64().unwrap();
+        let one = c.get(&format!("/v1/events/{seq}")).unwrap();
+        assert_eq!(one["data"]["exe"], marker);
+        let raw = c.get_text(&format!("/v1/events/{seq}/raw")).unwrap();
+        assert!(raw.contains(&format!("\"seq\":{seq}")) && raw.contains("\"h\":\""));
+        assert!(c.get("/v1/events/999999999").is_err());
+        assert!(c.get("/v1/events?limit=abc").is_err());
+
+        // The alert exists and can be triaged; the list reflects the new state.
+        let alert = wait_for("the alert", || {
+            let r = c.get("/v1/alerts?limit=10").ok()?;
+            r["events"].as_array()?.first().cloned()
+        });
+        assert_eq!(alert["triage"]["status"], "new");
+        let aseq = alert["seq"].as_u64().unwrap();
+        c.post(
+            &format!("/v1/alerts/{aseq}/triage"),
+            &json!({"status": "false_positive", "note": "test"}),
+        )
+        .unwrap();
+        wait_for("the triage to be recorded", || {
+            let r = c.get("/v1/alerts?limit=10").ok()?;
+            let a = r["events"]
+                .as_array()?
+                .iter()
+                .find(|e| e["seq"] == aseq)?
+                .clone();
+            (a["triage"]["status"] == "false_positive").then_some(a)
+        });
+        assert!(
+            c.post("/v1/alerts/1/triage", &json!({"status": "acknowledged"}))
+                .is_err(),
+            "triaging a non-alert is refused"
+        );
+
+        // Timeline, dashboard, sessions.
+        let tl = c.get("/v1/timeline?buckets=10").unwrap();
+        assert_eq!(tl["buckets"], 10);
+        assert!(tl["series"].as_object().is_some_and(|m| !m.is_empty()));
+        let d = c.get("/v1/dashboard").unwrap();
+        assert!(d["by_kind"].as_array().is_some_and(|a| !a.is_empty()));
+        assert!(c.get("/v1/sessions").is_ok());
+
+        // Integrity verification runs in the background and reports a good chain.
+        c.post("/v1/integrity/verify", &json!({})).unwrap();
+        let v = wait_for("verification", || {
+            let r = c.get("/v1/integrity").ok()?;
+            (r["state"] != "running" && r["state"] != "never_run").then_some(r)
+        });
+        assert_eq!(v["state"], "ok", "{v}");
+
+        // Rules: list, validate, save (hot reloaded), disable, delete.
+        assert!(
+            c.get("/v1/rules").unwrap()["rules"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 1
+        );
+        let bad = c
+            .post(
+                "/v1/rules/validate",
+                &json!({"yaml": "id: x\nseverity: nope\n"}),
+            )
+            .unwrap();
+        assert_eq!(bad["ok"], false);
+        let yaml = "id: api.added\ntitle: Added\nseverity: low\nevent: proc_exec\n";
+        assert_eq!(
+            c.post("/v1/rules/validate", &json!({"yaml": yaml}))
+                .unwrap()["ok"],
+            true
+        );
+        c.put("/v1/rules/api.added", &json!({"yaml": yaml}))
+            .unwrap();
+        assert!(
+            c.put("/v1/rules/other.id", &json!({"yaml": yaml})).is_err(),
+            "id must match"
+        );
+        assert_eq!(
+            c.get("/v1/rules").unwrap()["rules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        c.post("/v1/rules/api.added/disable", &json!({})).unwrap();
+        assert_eq!(
+            c.get("/v1/rules").unwrap()["disabled_files"][0],
+            "api.added.yml.off"
+        );
+        c.delete("/v1/rules/api.added").unwrap();
+        assert!(c
+            .put("/v1/rules/..%2Fevil", &json!({"yaml": yaml}))
+            .is_err());
+
+        // Export in each format.
+        let nd = c
+            .get_text("/v1/export?kind=proc_exec&max=5&format=ndjson")
+            .unwrap();
+        assert_eq!(nd.lines().count(), 5);
+        let js: serde_json::Value =
+            serde_json::from_str(&c.get_text("/v1/export?max=3&format=json").unwrap()).unwrap();
+        assert_eq!(js.as_array().unwrap().len(), 3);
+        assert!(c
+            .get_text("/v1/export?max=3&format=csv")
+            .unwrap()
+            .starts_with("seq,wall_ns"));
+        assert!(c.get("/v1/nonsense").is_err());
+
+        // The caller's access was itself recorded.
+        let access = wait_for("api_access", || {
+            let r = c.get("/v1/events?kind=api_access&limit=5").ok()?;
+            (!r["events"].as_array()?.is_empty()).then_some(r)
+        });
+        assert_eq!(access["events"][0]["data"]["uid"], 0);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}

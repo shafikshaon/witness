@@ -1,5 +1,6 @@
 //! Witness collector daemon (library part). See `docs/DESIGN.md`.
 pub mod accounts;
+pub mod api;
 pub mod authlog;
 pub mod baseline;
 pub mod btf;

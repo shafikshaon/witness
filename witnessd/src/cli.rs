@@ -108,9 +108,11 @@ pub fn tail(seconds: Option<u64>) -> Result<()> {
         &btf,
         RING_CRITICAL_BYTES,
         32 << 20,
-        true,
-        true,
-        true,
+        crate::loader::Groups {
+            files: true,
+            network: true,
+            dns: true,
+        },
         &|| false,
     )?;
     for h in &hooks {
@@ -282,9 +284,11 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         &btf,
         cfg.capture.ring_critical_mib << 20,
         cfg.capture.ring_volume_mib << 20,
-        cfg.capture.files,
-        cfg.capture.network,
-        cfg.capture.dns,
+        crate::loader::Groups {
+            files: cfg.capture.files,
+            network: cfg.capture.network,
+            dns: cfg.capture.dns,
+        },
         &|| signal_pending(sigfd.as_fd()),
     )?;
     let failed: Vec<String> = hooks

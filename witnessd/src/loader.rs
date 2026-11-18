@@ -378,19 +378,33 @@ pub struct Collector {
     _ebpf: aya::Ebpf,
 }
 
+/// Which optional hook groups to load.
+#[derive(Clone, Copy, Debug)]
+pub struct Groups {
+    pub files: bool,
+    pub network: bool,
+    pub dns: bool,
+}
+
+/// `(hook index, program name, outcome)` for one hook load.
+type LoadOutcome = (usize, &'static str, Result<(), String>);
+
 impl Collector {
     pub fn start(
         offsets: Offsets,
         btf: &Btf,
         critical_bytes: u32,
         volume_bytes: u32,
-        files: bool,
-        network: bool,
-        dns: bool,
+        groups: Groups,
         // Polled between batches of hook loads so a stop request during a slow start (the
         // kernel verifier takes seconds for the file hooks) is honoured promptly.
         interrupted: &dyn Fn() -> bool,
     ) -> Result<(Collector, Vec<HookReport>)> {
+        let Groups {
+            files,
+            network,
+            dns,
+        } = groups;
         if OBJECT.is_empty() {
             bail!("this build has no eBPF object (built off Linux or with WITNESS_SKIP_EBPF=1)");
         }
@@ -502,8 +516,7 @@ impl Collector {
         jobs.sort_by_key(|(idx, ..)| std::cmp::Reverse(weight(*idx)));
         let total = jobs.len();
         let queue = std::sync::Mutex::new(std::collections::VecDeque::from(jobs));
-        let results: std::sync::Mutex<Vec<(usize, &'static str, Result<(), String>)>> =
-            std::sync::Mutex::new(Vec::new());
+        let results: std::sync::Mutex<Vec<LoadOutcome>> = std::sync::Mutex::new(Vec::new());
         let stop = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
             for _ in 0..workers {

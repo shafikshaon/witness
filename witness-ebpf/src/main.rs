@@ -19,7 +19,8 @@ use aya_ebpf::{
     programs::{BtfTracePointContext, ProbeContext, RetProbeContext},
 };
 use witness_common::{
-    nop, ConnInfo, InodeKey, NetAddrs, NetEvent, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
+    nop, ConnInfo, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
+    DNS_RESPONSE, RECV_MAX, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
     MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
 };
@@ -43,6 +44,11 @@ static SENSITIVE: HashMap<InodeKey, u8> = HashMap::with_max_entries(SENSITIVE_MA
 /// process" is arbitrary, so they are attributed from here. LRU keeps it bounded.
 #[map]
 static CONNS: LruHashMap<u64, ConnInfo> = LruHashMap::with_max_entries(CONNS_MAX, 0);
+
+/// What an in-flight `udp_recvmsg` was asked to fill, keyed by `pid_tgid`, saved at entry because
+/// the kernel advances the iterator past the data before returning.
+#[map]
+static RECV: LruHashMap<u64, RecvCtx> = LruHashMap::with_max_entries(RECV_MAX, 0);
 
 /// Where paths are assembled before the final bounded copy into a record (one per CPU).
 #[map]
@@ -1081,6 +1087,210 @@ unsafe fn on_state(ctx: &BtfTracePointContext) {
         read_addrs_into(addr_of_mut!((*owner).net), sk, &o);
         emit_net(nop::CONNECT, sk, owner, addr_of_mut!((*owner).net), old, new, &o);
     }
+}
+
+// ---- DNS (UDP) --------------------------------------------------------------------------
+
+const DNS_PORT: u16 = 53;
+
+/// A kernel `struct sockaddr` as `(family, port in host order, 16-byte address)`. Handles
+/// `sockaddr_in` (address at +4) and `sockaddr_in6` (address at +8).
+#[inline(always)]
+unsafe fn sockaddr_parts(name: u64) -> (u16, u16, [u8; 16]) {
+    let raw = rd_or::<[u8; 28]>(name as *const u8, 0, [0; 28]);
+    let family = u16::from_ne_bytes([raw[0], raw[1]]);
+    let port = u16::from_be_bytes([raw[2], raw[3]]);
+    let addr = if family as u32 == AF_INET {
+        [
+            raw[4], raw[5], raw[6], raw[7], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]
+    } else {
+        [
+            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15], raw[16],
+            raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23],
+        ]
+    };
+    (family, port, addr)
+}
+
+/// The first user buffer behind a `msghdr`: `(address, length)`, or zeros if the iterator is
+/// not a plain iovec / single buffer.
+#[inline(always)]
+unsafe fn first_buffer(msg: *const u8, o: &Offsets) -> (u64, u64) {
+    let iter = msg.add(o.msghdr_msg_iter as usize);
+    let kind: u8 = rd_or(iter, o.iov_iter_type, 255);
+    let slot: u64 = rd_or(iter, o.iov_iter_iov, 0);
+    let count: u64 = rd_or(iter, o.iov_iter_count, 0);
+    // The numbering shifted in 6.0 when ITER_UBUF took 0 and ITER_IOVEC became 1.
+    let has_ubuf = o.iov_iter_ubuf != UNAVAILABLE;
+    if has_ubuf && kind == 0 {
+        return (slot, count);
+    }
+    let iovec_kind: u8 = if has_ubuf { 1 } else { 0 };
+    if kind != iovec_kind {
+        return (0, 0);
+    }
+    let v = rd_or::<[u64; 2]>(slot as *const u8, 0, [0; 2]);
+    (v[0], v[1])
+}
+
+/// Emits one DNS packet record. `buf`/`buf_len` is where the packet is in the process's memory.
+#[inline(always)]
+unsafe fn emit_dns(dir: u32, addrs: &NetAddrs, buf: u64, buf_len: u64, o: &Offsets) {
+    let Some(mut entry) = VOLUME.reserve::<DnsEvent>(0) else {
+        count_drop(DROP_CLASS_VOLUME);
+        return;
+    };
+    let ev = entry.as_mut_ptr();
+    let task = generated::bpf_get_current_task() as *const u8;
+    fill_hdr(
+        addr_of_mut!((*ev).hdr),
+        kind::DNS,
+        core::mem::size_of::<DnsEvent>(),
+        task,
+        o,
+    );
+    let b = addr_of_mut!((*ev).body);
+    (*b).dir = dir;
+    (*b).family = addrs.family;
+    (*b).lport = addrs.lport;
+    (*b).rport = addrs.rport;
+    (*b).laddr = addrs.laddr;
+    (*b).raddr = addrs.raddr;
+    (*b).len = 0;
+    let mut n = buf_len;
+    if n > DNS_CAP as u64 {
+        n = DNS_CAP as u64;
+    }
+    let r = generated::bpf_probe_read_user(
+        addr_of_mut!((*b).payload).cast(),
+        n as u32,
+        buf as *const core::ffi::c_void,
+    );
+    if r == 0 {
+        (*b).len = n as u32;
+    }
+    entry.submit(0);
+}
+
+/// Fills `a` with the socket's addresses, overridden by `msg_name` when the call names a
+/// destination (an unconnected socket).
+#[inline(always)]
+unsafe fn udp_addrs(a: *mut NetAddrs, sk: *const u8, name: u64, o: &Offsets) {
+    read_addrs_into(a, sk, o);
+    if name != 0 {
+        let (family, port, addr) = sockaddr_parts(name);
+        (*a).family = family as u32;
+        (*a).rport = port;
+        (*a).raddr = addr;
+    }
+}
+
+/// udp_sendmsg / udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len): a query.
+#[inline(always)]
+unsafe fn on_udp_send(ctx: &ProbeContext) {
+    if is_self() {
+        return;
+    }
+    let sk: *const u8 = ctx.arg(0).unwrap_or(null());
+    let msg: *const u8 = ctx.arg(1).unwrap_or(null());
+    let o = offsets();
+    let name: u64 = rd_or(msg, o.msghdr_msg_name, 0);
+    let mut a = NetAddrs::ZERO;
+    udp_addrs(&mut a, sk, name, &o);
+    if a.rport != DNS_PORT {
+        return;
+    }
+    let (buf, len) = first_buffer(msg, &o);
+    emit_dns(DNS_QUERY, &a, buf, len, &o);
+}
+
+#[kprobe(function = "udp_sendmsg")]
+pub fn udp_send4(ctx: ProbeContext) -> u32 {
+    // SAFETY: kernel memory is only read through the probe-read helper.
+    unsafe { on_udp_send(&ctx) };
+    0
+}
+
+#[kprobe(function = "udpv6_sendmsg")]
+pub fn udp_send6(ctx: ProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe { on_udp_send(&ctx) };
+    0
+}
+
+/// udp_recvmsg / udpv6_recvmsg entry: remember the buffer the answer will land in.
+#[inline(always)]
+unsafe fn on_udp_recv_enter(ctx: &ProbeContext) {
+    let sk: u64 = ctx.arg(0).unwrap_or(0);
+    let msg: *const u8 = ctx.arg(1).unwrap_or(null());
+    let o = offsets();
+    // A socket connected to something other than a resolver cannot be receiving DNS answers;
+    // an unconnected one (port 0) might.
+    let dport = u16::from_be(rd_or::<u16>(sk as *const u8, o.sock_skc_dport, 0));
+    if dport != DNS_PORT && dport != 0 {
+        return;
+    }
+    let (buf, buf_len) = first_buffer(msg, &o);
+    let saved = RecvCtx {
+        sk,
+        msg_name: rd_or(msg, o.msghdr_msg_name, 0),
+        buf,
+        buf_len,
+    };
+    let key = bpf_get_current_pid_tgid();
+    let _ = RECV.insert(&key, &saved, 0);
+}
+
+/// udp_recvmsg return: the answer is now in the buffer.
+#[inline(always)]
+unsafe fn on_udp_recv_return(ctx: &RetProbeContext) {
+    let key = bpf_get_current_pid_tgid();
+    let Some(saved) = RECV.get_ptr(&key) else {
+        return;
+    };
+    let got: i64 = ctx.ret();
+    if got > 0 && !is_self() {
+        let o = offsets();
+        let mut a = NetAddrs::ZERO;
+        udp_addrs(&mut a, (*saved).sk as *const u8, (*saved).msg_name, &o);
+        if a.rport == DNS_PORT {
+            let mut n = got as u64;
+            if n > (*saved).buf_len {
+                n = (*saved).buf_len;
+            }
+            emit_dns(DNS_RESPONSE, &a, (*saved).buf, n, &o);
+        }
+    }
+    let _ = RECV.remove(&key);
+}
+
+#[kprobe(function = "udp_recvmsg")]
+pub fn udp_recv4_enter(ctx: ProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe { on_udp_recv_enter(&ctx) };
+    0
+}
+
+#[kprobe(function = "udpv6_recvmsg")]
+pub fn udp_recv6_enter(ctx: ProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe { on_udp_recv_enter(&ctx) };
+    0
+}
+
+#[kretprobe(function = "udp_recvmsg")]
+pub fn udp_recv4_ret(ctx: RetProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe { on_udp_recv_return(&ctx) };
+    0
+}
+
+#[kretprobe(function = "udpv6_recvmsg")]
+pub fn udp_recv6_ret(ctx: RetProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe { on_udp_recv_return(&ctx) };
+    0
 }
 
 #[panic_handler]

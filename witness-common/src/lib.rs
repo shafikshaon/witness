@@ -109,6 +109,7 @@ pub struct Offsets {
     pub iov_iter_type: u32,
     pub iov_iter_iov: u32,
     pub iov_iter_ubuf: u32,
+    pub iov_iter_count: u32,
 }
 
 impl Offsets {
@@ -166,6 +167,7 @@ impl Offsets {
             iov_iter_type: UNAVAILABLE,
             iov_iter_iov: UNAVAILABLE,
             iov_iter_ubuf: UNAVAILABLE,
+            iov_iter_count: UNAVAILABLE,
         }
     }
 }
@@ -652,7 +654,7 @@ impl ForkBody {
 const _: () = assert!(core::mem::size_of::<ExecBody>() == ExecBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ExitBody>() == ExitBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ForkBody>() == ForkBody::SIZE);
-const _: () = assert!(core::mem::size_of::<Offsets>() == 52 * 4);
+const _: () = assert!(core::mem::size_of::<Offsets>() == 53 * 4);
 const _: () = assert!(core::mem::size_of::<FileBody>() == FileBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileTwoBody>() == FileTwoBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBody::SIZE);

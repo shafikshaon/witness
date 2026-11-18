@@ -51,6 +51,7 @@ const PROGRAMS: [&str; 3] = [
 enum Group {
     Files,
     Net,
+    Dns,
 }
 
 #[derive(Clone, Copy)]
@@ -92,7 +93,7 @@ const fn hook(
 /// All optional hooks. File hooks are kprobes (no fentry/fexit on arm64 before 6.0, and
 /// `kuid_t` by-value arguments); TCP uses kprobes on connect/accept plus the
 /// `inet_sock_set_state` tracepoint.
-const HOOKS: [Hook; 16] = [
+const HOOKS: [Hook; 22] = [
     hook(
         "file_open",
         "security_file_open",
@@ -205,6 +206,48 @@ const HOOKS: [Hook; 16] = [
         Attach::BtfTp,
         Group::Net,
     ),
+    hook(
+        "udp_send4",
+        "udp_sendmsg",
+        Some(3),
+        Attach::KProbe,
+        Group::Dns,
+    ),
+    hook(
+        "udp_send6",
+        "udpv6_sendmsg",
+        Some(3),
+        Attach::KProbe,
+        Group::Dns,
+    ),
+    hook(
+        "udp_recv4_enter",
+        "udp_recvmsg",
+        Some(6),
+        Attach::KProbe,
+        Group::Dns,
+    ),
+    hook(
+        "udp_recv6_enter",
+        "udpv6_recvmsg",
+        Some(6),
+        Attach::KProbe,
+        Group::Dns,
+    ),
+    hook(
+        "udp_recv4_ret",
+        "udp_recvmsg",
+        None,
+        Attach::KProbe,
+        Group::Dns,
+    ),
+    hook(
+        "udp_recv6_ret",
+        "udpv6_recvmsg",
+        None,
+        Attach::KProbe,
+        Group::Dns,
+    ),
 ];
 
 /// Outcome of attaching one optional hook.
@@ -290,6 +333,24 @@ fn missing_net_offsets(o: &Offsets) -> Vec<&'static str> {
     .collect()
 }
 
+/// Offsets the DNS hooks need, beyond the socket ones.
+fn missing_dns_offsets(o: &Offsets) -> Vec<&'static str> {
+    let mut m = missing_net_offsets(o);
+    m.extend(
+        [
+            ("msghdr.msg_name", o.msghdr_msg_name),
+            ("msghdr.msg_iter", o.msghdr_msg_iter),
+            ("iov_iter.iter_type", o.iov_iter_type),
+            ("iov_iter.iov", o.iov_iter_iov),
+            ("iov_iter.count", o.iov_iter_count),
+        ]
+        .into_iter()
+        .filter(|(_, v)| *v == UNAVAILABLE)
+        .map(|(n, _)| n),
+    );
+    m
+}
+
 /// The kernel programs read `d_parent`/`d_name` and `mnt_parent`/`mnt_mountpoint` as
 /// contiguous blocks; refuse file capture on a kernel whose layout differs.
 fn layout_problem(o: &Offsets) -> Option<String> {
@@ -325,6 +386,7 @@ impl Collector {
         volume_bytes: u32,
         files: bool,
         network: bool,
+        dns: bool,
         // Polled between batches of hook loads so a stop request during a slow start (the
         // kernel verifier takes seconds for the file hooks) is honoured promptly.
         interrupted: &dyn Fn() -> bool,
@@ -368,6 +430,7 @@ impl Collector {
         let mut reports: Vec<Option<HookReport>> = (0..HOOKS.len()).map(|_| None).collect();
         let missing_files = missing_file_offsets(&offsets);
         let missing_net = missing_net_offsets(&offsets);
+        let missing_dns = missing_dns_offsets(&offsets);
         // Diagnostic: attach only the named hook (e.g. WITNESS_ONLY_HOOK=security_file_open).
         let only = std::env::var("WITNESS_ONLY_HOOK").ok();
         let mut by_name: std::collections::HashMap<String, &mut aya::programs::Program> = ebpf
@@ -387,6 +450,7 @@ impl Collector {
                 let (enabled, missing, layout) = match h.group {
                     Group::Files => (files, &missing_files, layout_problem(&offsets)),
                     Group::Net => (network, &missing_net, None),
+                    Group::Dns => (dns && network, &missing_dns, None),
                 };
                 if !enabled {
                     return Err("capture of this kind is disabled in the configuration".into());

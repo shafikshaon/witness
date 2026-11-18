@@ -1,0 +1,10 @@
+id: witness.auth.sudo-denied
+title: sudo command refused
+severity: low
+tags: [attack.privilege-escalation, attack.t1548.003]
+event: sudo
+match:
+  all:
+    - { field: data.allowed, op: eq, value: false }
+alert:
+  fields: [data.user, data.command, data.raw]

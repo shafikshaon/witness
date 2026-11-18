@@ -1,0 +1,10 @@
+id: witness.device.usb-attached
+title: USB device attached
+severity: low
+tags: [attack.initial-access, attack.t1091]
+event: usb_device
+match:
+  all:
+    - { field: data.action, op: eq, value: add }
+alert:
+  fields: [data.vendor_id, data.product_id, data.vendor, data.product, data.serial]

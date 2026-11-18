@@ -1,0 +1,29 @@
+id: witness.file.shadow-read
+title: /etc/shadow read by an unexpected program
+description: Password hashes were opened by a program that does not normally need them.
+severity: high
+tags: [attack.credential-access, attack.t1003.008]
+event: file_open_read
+match:
+  all:
+    - { field: data.path, op: eq, value: /etc/shadow }
+    - not:
+        field: actor.exe
+        op: in
+        value:
+          - /usr/sbin/unix_chkpwd
+          - /usr/sbin/sshd
+          - /usr/bin/sudo
+          - /usr/bin/su
+          - /usr/bin/passwd
+          - /usr/bin/chage
+          - /usr/sbin/useradd
+          - /usr/sbin/usermod
+          - /usr/sbin/userdel
+          - /usr/sbin/pwck
+          - /usr/sbin/vipw
+          - /usr/lib/systemd/systemd-logind
+          - /usr/sbin/cron
+alert:
+  fields: [actor.exe, actor.user, actor.cmdline]
+  suppress: 5m

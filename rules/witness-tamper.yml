@@ -1,0 +1,17 @@
+id: witness.self.evidence-touched
+title: Witness evidence directory modified by another program
+description: Only witnessd and the witness CLI may write under /var/lib/witness.
+severity: critical
+tags: [attack.defense-evasion, attack.t1070]
+event: [file_create, file_open_write, file_delete, file_truncate, file_rename]
+match:
+  all:
+    - any:
+        - { field: data.path, op: glob, value: ["/var/lib/witness/**"] }
+        - { field: data.old, op: glob, value: ["/var/lib/witness/**"] }
+    - not:
+        field: actor.exe
+        op: in
+        value: [/usr/bin/witnessd, /usr/bin/witness, /usr/sbin/witnessd]
+alert:
+  fields: [data.path, data.old, actor.exe, actor.user, actor.cmdline]

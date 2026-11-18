@@ -1,0 +1,16 @@
+id: witness.auth.bruteforce
+title: Repeated failed logins from one source
+severity: high
+tags: [attack.credential-access, attack.t1110]
+event: auth_fail
+correlate:
+  type: count
+  group_by: [data.remote_addr]
+  window: 60s
+  threshold: 10
+match:
+  all:
+    - { field: data.service, op: in, value: [sshd, login, gdm] }
+alert:
+  fields: [data.remote_addr, data.user]
+  suppress: 5m

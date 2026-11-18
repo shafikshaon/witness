@@ -1,0 +1,12 @@
+id: witness.self.service-unit-changed
+title: Witness service unit changed
+description: The unit file of witnessd was created, replaced or removed.
+severity: critical
+tags: [attack.defense-evasion, attack.t1562.001]
+event: [file_create, file_delete, file_rename, file_hash]
+match:
+  any:
+    - { field: data.path, op: glob, value: ["**/witnessd.service", "**/witnessd.service.d/**", "/etc/systemd/system/multi-user.target.wants/witnessd.service"] }
+    - { field: data.new, op: glob, value: ["**/witnessd.service"] }
+alert:
+  fields: [data.path, data.new, actor.exe, actor.user]

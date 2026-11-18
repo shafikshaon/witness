@@ -1,0 +1,11 @@
+id: witness.persistence.scheduler-file
+title: Cron or systemd unit file created
+severity: medium
+tags: [attack.persistence, attack.t1053.003, attack.t1543.002]
+event: [file_create, file_rename]
+match:
+  any:
+    - { field: data.path, op: glob, value: ["/etc/cron*/**", "/var/spool/cron/**", "/etc/systemd/system/**", "/usr/lib/systemd/system/**", "/etc/init.d/**", "/etc/rc.local"] }
+    - { field: data.new, op: glob, value: ["/etc/cron*/**", "/var/spool/cron/**", "/etc/systemd/system/**", "/usr/lib/systemd/system/**", "/etc/init.d/**", "/etc/rc.local"] }
+alert:
+  fields: [data.path, data.new, actor.exe, actor.user]

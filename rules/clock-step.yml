@@ -1,0 +1,11 @@
+id: witness.system.clock-step
+title: System clock was stepped
+description: Changing the clock can hide the order of events or defeat time-based controls.
+severity: medium
+tags: [attack.defense-evasion, attack.t1070.006]
+event: clock_change
+match:
+  all:
+    - { field: data.kind, op: eq, value: step }
+alert:
+  fields: [data.delta_ns]

@@ -1395,3 +1395,86 @@ mod auth {
         );
     }
 }
+
+mod rules {
+    use std::fs;
+    use std::process::Command;
+    use std::time::Duration;
+
+    use super::store_mode::{records, spawn_cfg, verify};
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn the_pack_alerts_on_real_activity_and_reloads_without_a_restart() {
+        let t = tempfile::tempdir().unwrap();
+        let rules = t.path().join("rules.d");
+        fs::create_dir(&rules).unwrap();
+        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rules");
+        for e in fs::read_dir(&pack).unwrap() {
+            let p = e.unwrap().path();
+            fs::copy(&p, rules.join(p.file_name().unwrap())).unwrap();
+        }
+        let cfg = t.path().join("config.toml");
+        fs::write(&cfg, format!("[rules]\ndir = \"{}\"\n", rules.display())).unwrap();
+        let data = t.path().join("data");
+        let (mut child, _err) = spawn_cfg(&data, 20, &cfg);
+
+        // 1. Execution from /dev/shm, with a recognisable name.
+        let dropped = "/dev/shm/witness-rule-test";
+        fs::copy("/bin/true", dropped).unwrap();
+        Command::new(dropped).status().unwrap();
+        // 2. Hot reload: a new rule, then a broken one, while the daemon runs.
+        std::thread::sleep(Duration::from_secs(3));
+        fs::write(
+            rules.join("added.yml"),
+            "id: test.added\ntitle: Added live\nseverity: low\nevent: proc_exec\n\
+             match: { field: data.exe, op: endswith, value: /uname }\n",
+        )
+        .unwrap();
+        fs::write(rules.join("broken.yml"), "id: broken\nseverity: nope\n").unwrap();
+        std::thread::sleep(Duration::from_secs(4));
+        Command::new("/bin/uname").output().unwrap();
+        let _ = fs::remove_file(dropped);
+        let _ = child.wait();
+
+        let ev = records(&data);
+        verify(&data);
+        let alerts: Vec<_> = ev.iter().filter(|e| e["type"] == "alert").collect();
+        let tmp = alerts
+            .iter()
+            .find(|a| {
+                a["data"]["rule_id"] == "witness.exec.from-tmp"
+                    && a["data"]["detail"]["data.exe"] == dropped
+            })
+            .unwrap_or_else(|| panic!("no from-tmp alert; alerts: {alerts:?}"));
+        // The alert names the stored record that triggered it.
+        let seq = tmp["data"]["trigger_seqs"][0].as_u64().unwrap();
+        let trigger = ev.iter().find(|e| e["seq"] == seq).unwrap();
+        assert_eq!(trigger["type"], "proc_exec");
+        assert_eq!(trigger["data"]["exe"], dropped);
+
+        assert!(
+            alerts.iter().any(|a| a["data"]["rule_id"] == "test.added"),
+            "the live-added rule never fired; alerts: {alerts:?}"
+        );
+        let changes: Vec<_> = ev
+            .iter()
+            .filter(|e| e["type"] == "rule_set_change")
+            .collect();
+        assert!(changes.len() >= 2, "initial load and reload: {changes:?}");
+        assert!(changes[0]["data"]["rejected"]
+            .as_array()
+            .is_none_or(Vec::is_empty));
+        assert!(
+            changes.iter().any(|c| c["data"]["added"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x == "test.added"))),
+            "{changes:?}"
+        );
+        assert!(changes
+            .iter()
+            .any(|c| c["data"]["rejected"].as_array().is_some_and(|r| r
+                .iter()
+                .any(|x| x.as_str().is_some_and(|s| s.starts_with("broken.yml"))))));
+    }
+}

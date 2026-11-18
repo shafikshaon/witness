@@ -1,0 +1,10 @@
+id: witness.file.sudoers-changed
+title: sudoers configuration changed
+severity: high
+tags: [attack.privilege-escalation, attack.t1548.003]
+event: file_hash
+match:
+  all:
+    - { field: data.path, op: glob, value: ["/etc/sudoers", "/etc/sudoers.d/**"] }
+alert:
+  fields: [data.path, data.sha256, data.prev_sha256, actor.exe, actor.user]

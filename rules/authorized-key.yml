@@ -1,0 +1,10 @@
+id: witness.ssh.authorized-key-added
+title: SSH authorized key added
+severity: high
+tags: [attack.persistence, attack.t1098.004]
+event: authorized_key_change
+match:
+  all:
+    - { field: data.change, op: eq, value: created }
+alert:
+  fields: [data.user, data.path, data.fingerprint, data.key_type]

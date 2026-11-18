@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use serde_json::{json, Value};
 use witness_rules::{load_str, Engine};
 

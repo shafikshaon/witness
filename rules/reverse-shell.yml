@@ -1,0 +1,14 @@
+id: witness.exec.reverse-shell
+title: Command line that looks like a reverse shell
+description: A shell redirected to /dev/tcp, or netcat run with -e/-c, is a common reverse shell.
+severity: high
+tags: [attack.execution, attack.t1059.004]
+event: proc_exec
+match:
+  any:
+    - { field: data.argv, op: contains, value: ["/dev/tcp/", "/dev/udp/"] }
+    - all:
+        - { field: data.exe, op: regex, value: '/(nc|ncat|netcat|socat)$' }
+        - { field: data.argv, op: in, value: ["-e", "-c", "EXEC", "exec"] }
+alert:
+  fields: [data.exe, data.argv, actor.user]

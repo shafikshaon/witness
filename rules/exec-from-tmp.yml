@@ -1,0 +1,13 @@
+id: witness.exec.from-tmp
+title: Execution from /tmp, /dev/shm or /var/tmp
+description: A process was started from a world-writable, non-persistent directory.
+severity: medium
+tags: [attack.execution, attack.t1059]
+event: proc_exec
+match:
+  all:
+    - { field: data.exe, op: glob, value: ["/tmp/**", "/dev/shm/**", "/var/tmp/**"] }
+    - not: { field: data.exe, op: glob, value: ["/tmp/.X11-unix/**", "/tmp/.mount_*/**"] }
+alert:
+  fields: [data.exe, data.argv, actor.user]
+  suppress: 60s

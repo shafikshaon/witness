@@ -13,6 +13,7 @@ pub mod hasher;
 pub mod loader;
 pub mod pipeline;
 pub mod pkglog;
+pub mod rules;
 pub mod sensitive;
 pub mod sources;
 pub mod uevent;

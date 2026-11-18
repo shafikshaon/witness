@@ -1,0 +1,28 @@
+id: witness.seq.drop-chmod-exec
+title: File written, made executable, then executed
+description: A file dropped in a writable location was given exec permission and then run.
+severity: high
+tags: [attack.execution, attack.t1204]
+correlate:
+  type: sequence
+  scope: same_session
+  window: 5m
+  steps:
+    - id: write
+      event: file_create
+      match:
+        all:
+          - { field: data.path, op: glob, value: ["/tmp/**", "/dev/shm/**", "/var/tmp/**", "/home/*/**"] }
+    - id: chmod
+      event: file_attr
+      match:
+        all:
+          - { field: data.new_mode, op: exists }
+          - { field: data.path, op: eq, value: "$write.data.path" }
+    - id: exec
+      event: proc_exec
+      match:
+        all:
+          - { field: data.exe, op: eq, value: "$write.data.path" }
+alert:
+  fields: [data.exe, actor.user]

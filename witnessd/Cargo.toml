@@ -32,6 +32,7 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 witness-common = { path = "../witness-common", features = ["schema"] }
 witness-config = { path = "../witness-config" }
+witness-rules = { path = "../witness-rules" }
 witness-store = { path = "../witness-store" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

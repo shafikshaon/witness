@@ -1125,6 +1125,7 @@ dependencies = [
  "tracing-subscriber",
  "witness-common",
  "witness-config",
+ "witness-rules",
  "witness-store",
 ]
 

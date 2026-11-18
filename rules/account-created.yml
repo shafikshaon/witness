@@ -1,0 +1,11 @@
+id: witness.account.created
+title: User account created
+severity: medium
+tags: [attack.persistence, attack.t1136.001]
+event: account_change
+match:
+  all:
+    - { field: data.kind, op: eq, value: user }
+    - { field: data.change, op: eq, value: created }
+alert:
+  fields: [data.name, data.id, data.shell, data.home]

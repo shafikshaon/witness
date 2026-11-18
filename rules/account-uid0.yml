@@ -1,0 +1,13 @@
+id: witness.account.uid0
+title: Account with UID 0 created or changed
+description: Any account other than root with UID 0 is root-equivalent.
+severity: critical
+tags: [attack.privilege-escalation, attack.persistence, attack.t1136.001]
+event: account_change
+match:
+  all:
+    - { field: data.kind, op: eq, value: user }
+    - { field: data.id, op: eq, value: 0 }
+    - { field: data.name, op: ne, value: root }
+alert:
+  fields: [data.name, data.change, data.shell]

@@ -1,0 +1,11 @@
+id: witness.file.suid-set
+title: setuid or setgid bit set on a file
+severity: high
+tags: [attack.privilege-escalation, attack.t1548.001]
+event: file_attr
+match:
+  any:
+    - { field: data.suid_set, op: eq, value: true }
+    - { field: data.sgid_set, op: eq, value: true }
+alert:
+  fields: [data.path, data.new_mode, actor.exe, actor.user]

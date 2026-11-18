@@ -133,6 +133,8 @@ pub struct Pipeline {
     last_disk: Duration,
     last_anchor: Duration,
     last_seal: Duration,
+    rules: Option<crate::rules::RuleRunner>,
+    last_rules_check: Duration,
     pub stats: Stats,
 }
 
@@ -197,6 +199,8 @@ impl Pipeline {
             last_disk: now,
             last_anchor: now,
             last_seal: now,
+            rules: None,
+            last_rules_check: now,
             stats: Stats::default(),
         };
         for r in recoveries {
@@ -274,7 +278,18 @@ impl Pipeline {
         }
     }
 
-    /// Stores one captured event, subject to the disk-full policy.
+    /// Starts evaluating rules over every stored event. Records the initial rule set (and any
+    /// rejected files) in the chain.
+    pub fn set_rules(&mut self, dir: &std::path::Path) -> Result<usize> {
+        let (runner, change) = crate::rules::RuleRunner::start(dir);
+        let n = runner.rule_count();
+        self.rules = Some(runner);
+        self.write(Body::RuleSetChange(change))?;
+        Ok(n)
+    }
+
+    /// Stores one captured event, subject to the disk-full policy, then evaluates the rules
+    /// over it. Alerts are chained records of their own.
     pub fn ingest(&mut self, ev: &Event) -> Result<()> {
         let fields = ev.to_fields()?;
         match self
@@ -282,7 +297,17 @@ impl Pipeline {
             .append_prio(priority_of(ev.prio), fields)
             .context("storing an event")?
         {
-            Append::Written(_) => self.dirty = true,
+            Append::Written(a) => {
+                self.dirty = true;
+                let alerts = match &mut self.rules {
+                    Some(r) => r.process(a.seq, ev),
+                    None => Vec::new(),
+                };
+                for al in alerts {
+                    tracing::warn!(rule = %al.rule_id, severity = ?al.severity, "ALERT: {}", al.title);
+                    self.write(Body::Alert(al))?;
+                }
+            }
             Append::Dropped => self.stats.shed += 1,
         }
         self.stats.ingested += 1;
@@ -327,6 +352,20 @@ impl Pipeline {
     pub fn tick(&mut self) -> Result<Vec<DiskEvent>> {
         let now = self.clock.mono();
         let mut disk_events = Vec::new();
+        if now.saturating_sub(self.last_rules_check) >= crate::rules::RELOAD_EVERY {
+            self.last_rules_check = now;
+            let change = self.rules.as_mut().and_then(|r| r.reload_if_changed());
+            if let Some(ch) = change {
+                tracing::info!(
+                    added = ch.added.len(),
+                    removed = ch.removed.len(),
+                    modified = ch.modified.len(),
+                    rejected = ch.rejected.len(),
+                    "rule set reloaded"
+                );
+                self.write(Body::RuleSetChange(ch))?;
+            }
+        }
         if now.saturating_sub(self.last_disk) >= Duration::from_secs(1) {
             disk_events = self.store.tick().context("disk policy tick")?;
             self.last_disk = now;

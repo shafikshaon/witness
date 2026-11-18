@@ -1,0 +1,7 @@
+id: witness.kernel.module-load
+title: Kernel module loaded
+severity: medium
+tags: [attack.persistence, attack.t1547.006]
+event: module_load
+alert:
+  fields: [data.name, data.taints, actor.exe, actor.user]

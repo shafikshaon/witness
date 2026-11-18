@@ -307,6 +307,10 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         _ => ("degraded", Some(failed.join("; "))),
     };
     pipeline.source_health("ebpf.files", status, reason)?;
+    match pipeline.set_rules(&cfg.rules.dir) {
+        Ok(n) => tracing::info!(rules = n, dir = %cfg.rules.dir.display(), "rule engine active"),
+        Err(e) => tracing::warn!(error = %e, "rule engine not started"),
+    }
     let sources = cfg
         .capture
         .auth

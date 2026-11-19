@@ -19,7 +19,7 @@ use aya_ebpf::{
     programs::{BtfTracePointContext, ProbeContext, RetProbeContext},
 };
 use witness_common::{
-    nop, modop, ConnInfo, FlowKey, FlowVal, FLOWS_MAX, UdpBody, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
+    nop, modop, ArgvEvent, ConnInfo, MAX_ARGV_CHUNKS, FlowKey, FlowVal, FLOWS_MAX, UdpBody, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
     DNS_RESPONSE, RECV_MAX, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, ModuleEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
     MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
@@ -182,6 +182,17 @@ unsafe fn try_exec(ctx: &BtfTracePointContext) -> Result<(), ()> {
     let bprm: *const u8 = ctx.arg(2);
     let o = offsets();
 
+    // Arguments longer than one record: the remaining chunks go out first, so by the time
+    // userspace reads the exec record they are already in the ring.
+    {
+        let mm: *const u8 = rd_or(task, o.task_mm, null());
+        let start: u64 = rd_or(mm, o.mm_arg_start, 0);
+        let end: u64 = rd_or(mm, o.mm_arg_end, 0);
+        if end > start {
+            emit_argv_chunks(task, start, end - start, &o);
+        }
+    }
+
     let Some(mut entry) = CRITICAL.reserve::<ExecEvent>(0) else {
         count_drop(DROP_CLASS_CRITICAL);
         return Err(());
@@ -249,6 +260,47 @@ unsafe fn try_exec(ctx: &BtfTracePointContext) -> Result<(), ()> {
 
     entry.submit(0);
     Ok(())
+}
+
+/// Emits chunks 1.. of the argument area (`start`, `total` bytes); chunk 0 is in the exec record.
+#[inline(always)]
+unsafe fn emit_argv_chunks(task: *const u8, start: u64, total: u64, o: &Offsets) {
+    let mut i: u64 = 1;
+    while i <= MAX_ARGV_CHUNKS {
+        let off = i * ARGV_CAP as u64;
+        if off >= total {
+            return;
+        }
+        let mut n = total - off;
+        if n > ARGV_CAP as u64 {
+            n = ARGV_CAP as u64;
+        }
+        let Some(mut entry) = CRITICAL.reserve::<ArgvEvent>(0) else {
+            count_drop(DROP_CLASS_CRITICAL);
+            return;
+        };
+        let ev = entry.as_mut_ptr();
+        fill_hdr(
+            addr_of_mut!((*ev).hdr),
+            kind::PROC_ARGV,
+            core::mem::size_of::<ArgvEvent>(),
+            task,
+            o,
+        );
+        let b = addr_of_mut!((*ev).body);
+        (*b).idx = i as u32;
+        (*b).len = 0;
+        let r = generated::bpf_probe_read_user(
+            addr_of_mut!((*b).data).cast(),
+            n as u32,
+            (start + off) as *const core::ffi::c_void,
+        );
+        if r == 0 {
+            (*b).len = n as u32;
+        }
+        entry.submit(0);
+        i += 1;
+    }
 }
 
 #[btf_tracepoint(function = "sched_process_exit")]

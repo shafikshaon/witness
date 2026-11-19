@@ -27,6 +27,9 @@ pub mod kind {
     pub const MODULE: u16 = 22;
     /// A UDP flow summary ([`super::UdpBody`]), assembled in userspace from the flow table.
     pub const NET_UDP: u16 = 23;
+    /// One more chunk of an exec's arguments ([`super::ArgvChunk`]), emitted *before* the
+    /// exec record it belongs to when the arguments do not fit in one record.
+    pub const PROC_ARGV: u16 = 24;
 }
 
 /// File operations carried in [`FileBody::op`] / [`FileTwoBody::op`].
@@ -605,6 +608,49 @@ impl DnsBody {
         &self.payload[..(self.len as usize).min(DNS_CAP)]
     }
 }
+
+/// Chunks after the first that the kernel emits per exec: with [`ARGV_CAP`] bytes each, argv
+/// is captured up to `ARGV_CAP * (1 + MAX_ARGV_CHUNKS)` (about 63 KiB).
+pub const MAX_ARGV_CHUNKS: u64 = 20;
+
+/// Body of a [`kind::PROC_ARGV`] record: bytes `idx * ARGV_CAP ..` of the argument area.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ArgvChunk {
+    /// 1-based: chunk 0 is inside the exec record itself.
+    pub idx: u32,
+    /// Bytes of `data` that are valid.
+    pub len: u32,
+    pub data: [u8; ARGV_CAP],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ArgvEvent {
+    pub hdr: RawHdr,
+    pub body: ArgvChunk,
+}
+
+impl ArgvChunk {
+    pub const SIZE: usize = 8 + ARGV_CAP;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let mut data = [0u8; ARGV_CAP];
+        data.copy_from_slice(&b[8..]);
+        Some(Self {
+            idx: u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+            len: u32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
+            data,
+        })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.data[..(self.len as usize).min(ARGV_CAP)]
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ArgvChunk>() == ArgvChunk::SIZE);
 
 /// Flows tracked at once in the kernel (per process and socket pair).
 pub const FLOWS_MAX: u32 = 8192;

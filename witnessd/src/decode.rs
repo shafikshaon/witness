@@ -6,11 +6,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use witness_common::schema::{
     puid, Actor, AttrOp, Body, ConnOutcome, DnsDir, DnsEvent as DnsBodyOut, Event, FdKind,
     FileAttr, FileLink, FileOp, FileRename, HookResult, LinkKind, Module, NetClose, NetConn,
-    NetListen, OsBytes, Priority, ProcExec, ProcExit, ProcFork, Proto, Source, SCHEMA_VERSION,
+    NetListen, OsBytes, Priority, ProcExec, ProcExit, ProcFork, Proto, Source, UdpFlow,
+    SCHEMA_VERSION,
 };
 use witness_common::{
     flags, fop, kind, modop, nop, DnsBody, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody,
-    ModuleBody, NetBody, RawHdr, AF_INET,
+    ModuleBody, NetBody, RawHdr, UdpBody, AF_INET,
 };
 
 const S_ISUID: u32 = 0o4000;
@@ -64,7 +65,7 @@ fn dns_body(b: &DnsBody) -> Body {
         qtype: parsed.qtype,
         rcode: parsed.rcode,
         answers: parsed.answers,
-        transport: Proto::Udp,
+        transport: if b.proto == 1 { Proto::Tcp } else { Proto::Udp },
         // The kernel copies at most DNS_CAP bytes; a full buffer may mean the packet was cut.
         truncated: packet.len() >= witness_common::DNS_CAP,
     })
@@ -469,6 +470,26 @@ impl Decoder {
                 } else {
                     Body::ModuleUnload(m)
                 }
+            }
+            kind::NET_UDP => {
+                let b = UdpBody::parse(body).ok_or(DecodeError::Short)?;
+                actor.comm = String::from_utf8_lossy(&cstr(&b.comm, 16)).into_owned();
+                self.enrich(&mut actor);
+                if actor.exe.is_none() {
+                    actor.exe = resolve_exe(hdr.pid).map(OsBytes);
+                }
+                Body::UdpFlow(UdpFlow {
+                    laddr: ip(b.family, &b.laddr),
+                    lport: b.lport,
+                    raddr: ip(b.family, &b.raddr),
+                    rport: b.rport,
+                    packets_tx: b.pkts_tx,
+                    bytes_tx: b.bytes_tx,
+                    packets_rx: b.pkts_rx,
+                    bytes_rx: b.bytes_rx,
+                    // How long this entry was active before the summary.
+                    interval_ns: hdr.boot_ns.saturating_sub(b.first_boot_ns),
+                })
             }
             kind::DNS => {
                 let b = DnsBody::parse(body).ok_or(DecodeError::Short)?;

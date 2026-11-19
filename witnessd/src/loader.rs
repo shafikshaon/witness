@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use aya::maps::{HashMap as BpfHashMap, MapData, PerCpuArray, RingBuf};
 use aya::programs::BtfTracePoint;
 use aya::{Btf as AyaBtf, EbpfLoader, VerifierLogLevel};
-use witness_common::{InodeKey, Offsets, UNAVAILABLE};
+use witness_common::{FlowKey, FlowVal, InodeKey, Offsets, UdpBody, UNAVAILABLE};
 
 use crate::btf::Btf;
 
@@ -23,6 +23,21 @@ struct KeyPod(InodeKey);
 // SAFETY: `InodeKey` is `repr(C)`, fully initialised (explicit pad field, no implicit
 // padding) and made of integers, so any bytes copied to or from the kernel are valid.
 unsafe impl aya::Pod for KeyPod {}
+
+/// UDP flow key/value made usable as map types.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct FlowKeyPod(FlowKey);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct FlowValPod(FlowVal);
+
+// SAFETY: both are `repr(C)`, integer-only and fully initialised by the kernel programs
+// (explicit padding fields, no implicit padding; `RawHdr` has the same properties), so any
+// bytes exchanged with the kernel are valid values.
+unsafe impl aya::Pod for FlowKeyPod {}
+// SAFETY: as above.
+unsafe impl aya::Pod for FlowValPod {}
 
 /// SHA-256 of the embedded eBPF object, recorded in `daemon_start`.
 pub fn object_sha256() -> String {
@@ -94,7 +109,7 @@ const fn hook(
 /// All optional hooks. File hooks are kprobes (no fentry/fexit on arm64 before 6.0, and
 /// `kuid_t` by-value arguments); TCP uses kprobes on connect/accept plus the
 /// `inet_sock_set_state` tracepoint.
-const HOOKS: [Hook; 24] = [
+const HOOKS: [Hook; 27] = [
     hook(
         "file_open",
         "security_file_open",
@@ -263,6 +278,29 @@ const HOOKS: [Hook; 24] = [
         Attach::KProbe,
         Group::Dns,
     ),
+    // DNS over TCP. tcp_sendmsg/tcp_recvmsg are hot paths; the programs return after one
+    // port comparison unless the peer is port 53.
+    hook(
+        "tcp_dns_send",
+        "tcp_sendmsg",
+        Some(3),
+        Attach::KProbe,
+        Group::Dns,
+    ),
+    hook(
+        "tcp_dns_recv_enter",
+        "tcp_recvmsg",
+        Some(6),
+        Attach::KProbe,
+        Group::Dns,
+    ),
+    hook(
+        "tcp_dns_recv_ret",
+        "tcp_recvmsg",
+        None,
+        Attach::KProbe,
+        Group::Dns,
+    ),
 ];
 
 /// Outcome of attaching one optional hook.
@@ -389,6 +427,7 @@ pub struct Collector {
     volume: RingBuf<MapData>,
     drops: PerCpuArray<MapData, u64>,
     sensitive: BpfHashMap<MapData, KeyPod, u8>,
+    flows: BpfHashMap<MapData, FlowKeyPod, FlowValPod>,
     // Dropping `Ebpf` detaches the programs, so it must outlive the readers.
     _ebpf: aya::Ebpf,
 }
@@ -584,12 +623,14 @@ impl Collector {
         let volume = RingBuf::try_from(take(&mut ebpf, "VOLUME")?)?;
         let drops = PerCpuArray::try_from(take(&mut ebpf, "DROPS")?)?;
         let sensitive = BpfHashMap::try_from(take(&mut ebpf, "SENSITIVE")?)?;
+        let flows = BpfHashMap::try_from(take(&mut ebpf, "FLOWS")?)?;
         Ok((
             Collector {
                 critical,
                 volume,
                 drops,
                 sensitive,
+                flows,
                 _ebpf: ebpf,
             },
             reports,
@@ -663,6 +704,36 @@ impl Collector {
             let _ = self.sensitive.remove(&KeyPod(*k));
         }
         Ok(())
+    }
+
+    /// Reads and clears the UDP flow table, returning one decoder-ready record per flow.
+    /// `now_boot_ns` stamps the records (the summary is as of now).
+    pub fn take_flows(&mut self, now_boot_ns: u64) -> Vec<Vec<u8>> {
+        let keys: Vec<FlowKeyPod> = self.flows.keys().filter_map(Result::ok).collect();
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            let Ok(v) = self.flows.get(&k, 0) else {
+                continue;
+            };
+            // Removing before the next update is racy by a few packets; that is accepted.
+            let _ = self.flows.remove(&k);
+            let (k, v) = (k.0, v.0);
+            let body = UdpBody {
+                family: k.family,
+                lport: k.lport,
+                rport: k.rport,
+                laddr: k.laddr,
+                raddr: k.raddr,
+                pkts_tx: v.pkts_tx,
+                bytes_tx: v.bytes_tx,
+                pkts_rx: v.pkts_rx,
+                bytes_rx: v.bytes_rx,
+                first_boot_ns: v.first_boot_ns,
+                comm: v.comm,
+            };
+            out.push(body.to_record(&v.hdr, now_boot_ns));
+        }
+        out
     }
 
     /// Events lost in the kernel because a ring buffer was full, `[critical, volume]`.

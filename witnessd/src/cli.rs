@@ -406,6 +406,9 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
     });
     let mut sensitive = Sensitive::new(&cfg.files.sensitive_read);
     let summary_every = Duration::from_secs(60);
+    // UDP flow summaries (the kernel keeps running counters; this reads and clears them).
+    let flows_every = Duration::from_secs(10);
+    let mut last_flows = Instant::now();
     let mut last_summary = Instant::now();
     let resolve = |pid: u32| {
         use std::os::unix::ffi::OsStrExt;
@@ -540,6 +543,21 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                 if let Err(e) = pipeline.record(body) {
                     failure = Some(e);
                     break 'main;
+                }
+            }
+        }
+        if last_flows.elapsed() >= flows_every {
+            last_flows = Instant::now();
+            let now = crate::pipeline::Clock::boot_ns(&clock);
+            for rec in collector.take_flows(now) {
+                match decoder.decode(&rec, &resolve) {
+                    Ok(ev) => {
+                        if let Err(e) = pipeline.ingest(&ev) {
+                            failure = Some(e);
+                            break 'main;
+                        }
+                    }
+                    Err(e) => tracing::warn!("undecodable flow record: {e}"),
                 }
             }
         }

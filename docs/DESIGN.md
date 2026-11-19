@@ -234,6 +234,13 @@ Other gaps from §2.4: ssh `Accepted` lines still produce their own `login` with
 
 **Startup and stop.** All 24 programs load in about 4-5 s on an idle 4-CPU VM (work queue, heaviest verifier jobs first). A SIGTERM during startup is honoured between jobs but cannot interrupt a verifier run already in flight, so a stop during startup takes a few seconds when idle and roughly 30 s with the CPUs saturated (measured); the unit's `TimeoutStopSec` is 60 s for that reason. Nothing is written before attach, so a kill in this window loses no evidence.
 
+### 2.12a Path capture limits and mount roots (found on Fedora and 6.x kernels)
+
+- **Mount roots.** The kernel path walk ended each mount at the *filesystem's* root, which is wrong for bind mounts of subdirectories and btrfs subvolumes (Fedora's `/` and `/var`, containers): a file made through a bind mount was reported as `<mount path><in-filesystem path>`. It now ends a mount at `vfsmount->mnt_root`, as the kernel's `d_path` does. Reproduced and fixed with a real test (`paths_through_bind_mounts_of_subdirectories_...`).
+- **Verifier budget, and what it cost.** The extra comparison pushed the walk over the verifier's 1M-instruction limit (state pruning stopped working, so 40, 32 and 28 levels all failed; 16 passed). Rewriting the loop "branchlessly" in Rust did not help, because the BPF backend turns every comparison into a branch. The working compromise is **24 levels for single-path hooks and 16 per path for the two-path hooks** (`rename`, `link`); `file_open` is the heaviest single-path program and fails at 28. A path deeper than that is reported with `path_truncated: true`, keeping its leaf. This is **fewer levels than before (40)**: very deep trees (for example nested `node_modules`) may now be truncated where they were not.
+- **`ftruncate(fd)` on 6.2+** goes through `security_file_truncate`, which is now hooked (optional: absent on older kernels, skipped without a warning).
+- **Parameter-count guards.** `*_recvmsg` lost `nonblock` (5 parameters from 5.19) and later `addr_len` (4 on 7.x); `inet_csk_accept` has 2 parameters from 6.10. The guard is now a range, which is what kept DNS responses and TCP accept working on current kernels.
+
 ### 2.12b Additions after the first final build
 
 - **stdio and cwd at exec.** The decoder reads `/proc/<pid>/fd/{0,1,2}` and `/proc/<pid>/cwd` right after an exec (best effort: the process may already have changed them or exited) and classifies descriptors as tty/pipe/socket/file/null. The rule `witness.exec.shell-on-socket` uses it. Not verified against a real reverse shell; covered by unit tests and the classifier.

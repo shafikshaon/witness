@@ -2221,3 +2221,149 @@ mod features {
         assert_eq!(boot["data"]["cmdline"], cmdline.trim());
     }
 }
+
+mod load {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::store_mode::{records, spawn, verify};
+
+    /// `(cpu ticks, resident KiB)` of a process, from /proc.
+    fn usage(pid: u32) -> (u64, u64) {
+        let stat = fs_read(&format!("/proc/{pid}/stat"));
+        let rest = &stat[stat.rfind(')').unwrap() + 2..];
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let ticks = f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap();
+        let rss_pages: u64 = fs_read(&format!("/proc/{pid}/statm"))
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        (ticks, rss_pages * 4)
+    }
+
+    fn fs_read(p: &str) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF; takes about a minute"]
+    fn sustained_load_is_either_captured_or_reported_as_dropped_never_silently_lost() {
+        let t = tempfile::tempdir().unwrap();
+        let (mut child, _err) = spawn(t.path(), 45);
+        let dpid = child.id();
+        std::thread::sleep(Duration::from_secs(2));
+        let (cpu0, _) = usage(dpid);
+        let t0 = Instant::now();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let execs = Arc::new(AtomicU64::new(0));
+        let marker = format!("witness-load-{}", std::process::id());
+        let mut workers = Vec::new();
+        // Process churn: as fast as `fork+exec+wait` allows, on several threads.
+        for _ in 0..4 {
+            let (stop, execs, m) = (stop.clone(), execs.clone(), marker.clone());
+            workers.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if Command::new("/bin/true").arg(&m).status().is_ok() {
+                        execs.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        // File churn: create, write, rename, delete.
+        {
+            let (stop, dir) = (stop.clone(), t.path().join("churn"));
+            std::fs::create_dir_all(&dir).unwrap();
+            workers.push(std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let a = dir.join(format!("f{}", i % 64));
+                    let b = dir.join(format!("g{}", i % 64));
+                    let _ = std::fs::write(&a, b"data");
+                    let _ = std::fs::rename(&a, &b);
+                    let _ = std::fs::remove_file(&b);
+                    i += 1;
+                }
+            }));
+        }
+        // Network churn: many short TCP connections and UDP datagrams on loopback.
+        {
+            let stop = stop.clone();
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            l.set_nonblocking(true).unwrap();
+            let stop2 = stop.clone();
+            workers.push(std::thread::spawn(move || {
+                while !stop2.load(Ordering::Relaxed) {
+                    if let Ok((mut c, _)) = l.accept() {
+                        let mut b = [0u8; 16];
+                        let _ = c.read(&mut b);
+                        let _ = c.write_all(b"pong");
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }));
+            workers.push(std::thread::spawn(move || {
+                let u = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let v = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let vaddr = v.local_addr().unwrap();
+                v.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+                let mut b = [0u8; 64];
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(mut c) = TcpStream::connect(("127.0.0.1", port)) {
+                        let _ = c.write_all(b"ping");
+                        let _ = c.read(&mut b);
+                    }
+                    let _ = u.send_to(b"x", vaddr);
+                    let _ = v.recv_from(&mut b);
+                }
+            }));
+        }
+
+        std::thread::sleep(Duration::from_secs(20));
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        let (cpu1, rss) = usage(dpid);
+        let done = execs.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(3));
+        let cpu_pct = (cpu1 - cpu0) as f64 / 100.0 / elapsed * 100.0;
+        let _ = child.wait();
+
+        let ev = records(t.path());
+        verify(t.path());
+        let seen = ev
+            .iter()
+            .filter(|e| e["type"] == "proc_exec" && e["data"]["argv"].to_string().contains(&marker))
+            .count() as u64;
+        let dropped: u64 = ev
+            .iter()
+            .filter(|e| e["type"] == "capture_drop")
+            .map(|e| e["data"]["dropped"].as_u64().unwrap_or(0))
+            .sum();
+        let lost = done.saturating_sub(seen);
+        eprintln!(
+            "LOAD RESULT: {done} execs in {elapsed:.0}s = {:.0}/s; {seen} captured, {lost} lost, {dropped} drops reported; daemon CPU {cpu_pct:.0}% of one core, RSS {} MiB; {} records stored",
+            done as f64 / elapsed,
+            rss / 1024,
+            ev.len()
+        );
+        assert!(done > 1000, "the generator did too little work: {done}");
+        // The invariant: a lost exec must be accounted for by a reported kernel drop.
+        assert!(
+            lost <= dropped,
+            "{lost} execs went missing but only {dropped} drops were reported: silent loss"
+        );
+        // A healthy daemon under this load does not run away with memory.
+        assert!(rss / 1024 < 1024, "RSS {} MiB", rss / 1024);
+    }
+}

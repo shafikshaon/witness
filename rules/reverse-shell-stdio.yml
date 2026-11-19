@@ -1,0 +1,17 @@
+id: witness.exec.shell-on-socket
+title: Shell started with a network socket as its input or output
+description: >
+  A shell whose stdin or stdout is a socket is how a reverse or bind shell is wired up
+  (`bash -i >& /dev/tcp/...`, `nc -e`, a python or perl one-liner with dup2). Detected from
+  the file descriptors read right after the exec, so it does not depend on the command line.
+severity: high
+tags: [attack.execution, attack.t1059.004]
+event: proc_exec
+match:
+  all:
+    - { field: data.exe, op: regex, value: '/(ba|da|z|k|a|c|tc|fi)?sh$' }
+    - any:
+        - { field: data.stdio.0, op: eq, value: socket }
+        - { field: data.stdio.1, op: eq, value: socket }
+alert:
+  fields: [data.exe, data.argv, data.stdio, actor.user, actor.ppid]

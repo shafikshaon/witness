@@ -39,8 +39,57 @@ struct RuleState {
     suppress: HashMap<String, (u64, u64)>,
 }
 
+/// Process ancestry learned from the events themselves (`actor.pid`, `actor.ppid`).
+#[derive(Default)]
+struct Tree {
+    /// Live pid → puid (so a child's `ppid` can be resolved to the parent process).
+    pid_puid: HashMap<u64, String>,
+    /// puid → the root of its tree, fixed when the process is first seen.
+    root: HashMap<String, String>,
+}
+
+/// Entries kept before the maps are cleared wholesale (ancestry is then re-learned).
+const MAX_TREE: usize = 200_000;
+
+impl Tree {
+    /// Records the actor of `v` and returns its tree root. A process whose parent has not been
+    /// seen is grouped under `pid:<ppid>`, so siblings of an unseen parent still share a root.
+    fn observe(&mut self, v: &Value) -> Option<String> {
+        let a = v.get("actor")?;
+        let puid = a.get("puid")?.as_str()?;
+        let pid = a.get("pid").and_then(Value::as_u64);
+        let ppid = a.get("ppid").and_then(Value::as_u64);
+        if self.root.len() >= MAX_TREE {
+            self.root.clear();
+            self.pid_puid.clear();
+        }
+        let root = match self.root.get(puid) {
+            Some(r) => r.clone(),
+            None => {
+                let r = ppid
+                    .and_then(|pp| self.pid_puid.get(&pp))
+                    .and_then(|pu| self.root.get(pu))
+                    .cloned()
+                    .or_else(|| ppid.filter(|p| *p > 1).map(|p| format!("pid:{p}")))
+                    .unwrap_or_else(|| puid.to_string());
+                self.root.insert(puid.to_string(), r.clone());
+                r
+            }
+        };
+        if let Some(pid) = pid {
+            if v.get("type").and_then(Value::as_str) == Some("proc_exit") {
+                self.pid_puid.remove(&pid);
+            } else {
+                self.pid_puid.insert(pid, puid.to_string());
+            }
+        }
+        Some(root)
+    }
+}
+
 pub struct Engine {
     set: RuleSet,
+    tree: Tree,
     state: Vec<RuleState>,
     pub stats: Stats,
 }
@@ -86,6 +135,7 @@ impl Engine {
         let state = set.rules.iter().map(|_| RuleState::default()).collect();
         Engine {
             set,
+            tree: Tree::default(),
             state,
             stats: Stats::default(),
         }
@@ -125,6 +175,8 @@ impl Engine {
 
     pub fn process_value(&mut self, seq: u64, v: &Value) -> Vec<Alert> {
         self.stats.events += 1;
+        // Ancestry is learned from every event, including ones no rule looks at.
+        let root = self.tree.observe(v);
         let Some(idx) = self.set.by_kind.get(kind_of(v)) else {
             return Vec::new();
         };
@@ -137,7 +189,9 @@ impl Engine {
                     .simple(i, v)
                     .then(|| (String::new(), vec![seq], 1, v.clone())),
                 Some(Correlation::Count { .. }) => self.count(i, v, seq, now),
-                Some(Correlation::Sequence { .. }) => self.sequence(i, v, seq, now),
+                Some(Correlation::Sequence { .. }) => {
+                    self.sequence(i, v, seq, now, root.as_deref())
+                }
             };
             if let Some((group, seqs, n, last)) = hit {
                 if let Some(a) = self.alert(i, &group, seqs, n, &last, now) {
@@ -208,6 +262,7 @@ impl Engine {
         v: &Value,
         seq: u64,
         now: u64,
+        root: Option<&str>,
     ) -> Option<(String, Vec<u64>, usize, Value)> {
         let r = &self.set.rules[i];
         let Some(Correlation::Sequence {
@@ -230,6 +285,7 @@ impl Engine {
                 }
             }
             Scope::Process => text_at(v, &["actor".into(), "puid".into()]),
+            Scope::Tree => format!("tree:{}", root.unwrap_or_default()),
         };
         let st = &mut self.state[i];
         if st.partials.len() >= MAX_GROUPS && !st.partials.contains_key(&group) {

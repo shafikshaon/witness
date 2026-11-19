@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use witness_common::schema::{
-    puid, Actor, AttrOp, Body, ConnOutcome, DnsDir, DnsEvent as DnsBodyOut, Event, FileAttr,
-    FileLink, FileOp, FileRename, HookResult, LinkKind, Module, NetClose, NetConn, NetListen,
-    OsBytes, Priority, ProcExec, ProcExit, ProcFork, Proto, Source, SCHEMA_VERSION,
+    puid, Actor, AttrOp, Body, ConnOutcome, DnsDir, DnsEvent as DnsBodyOut, Event, FdKind,
+    FileAttr, FileLink, FileOp, FileRename, HookResult, LinkKind, Module, NetClose, NetConn,
+    NetListen, OsBytes, Priority, ProcExec, ProcExit, ProcFork, Proto, Source, SCHEMA_VERSION,
 };
 use witness_common::{
     flags, fop, kind, modop, nop, DnsBody, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody,
@@ -68,6 +68,44 @@ fn dns_body(b: &DnsBody) -> Body {
         // The kernel copies at most DNS_CAP bytes; a full buffer may mean the packet was cut.
         truncated: packet.len() >= witness_common::DNS_CAP,
     })
+}
+
+/// What a `/proc/<pid>/fd/N` link points at, as a coarse kind.
+pub fn classify_fd_link(link: &[u8]) -> FdKind {
+    let s = String::from_utf8_lossy(link);
+    if s.starts_with("socket:") {
+        FdKind::Socket
+    } else if s.starts_with("pipe:") {
+        FdKind::Pipe
+    } else if s == "/dev/null" {
+        FdKind::Null
+    } else if s.starts_with("/dev/pts/") || s.starts_with("/dev/tty") || s == "/dev/console" {
+        FdKind::Tty
+    } else if s.starts_with('/') {
+        FdKind::File
+    } else {
+        FdKind::Unknown
+    }
+}
+
+/// Kinds of fds 0, 1 and 2, read just after the exec. Best effort: the process may already have
+/// changed them or gone, in which case this is `None` (all unreadable) or partly `Unknown`.
+fn proc_stdio(pid: u32) -> Option<[FdKind; 3]> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = [FdKind::Unknown; 3];
+    for (i, k) in out.iter_mut().enumerate() {
+        if let Ok(l) = std::fs::read_link(format!("/proc/{pid}/fd/{i}")) {
+            *k = classify_fd_link(l.as_os_str().as_bytes());
+        }
+    }
+    (out != [FdKind::Unknown; 3]).then_some(out)
+}
+
+fn proc_cwd(pid: u32) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .map(|p| p.as_os_str().as_bytes().to_vec())
 }
 
 fn net_conn(b: &NetBody, outcome: ConnOutcome) -> NetConn {
@@ -352,9 +390,9 @@ impl Decoder {
                     exe,
                     argv,
                     argv_truncated: truncated,
-                    cwd: None,
+                    cwd: proc_cwd(hdr.pid).map(OsBytes),
                     env: None,
-                    stdio: None,
+                    stdio: proc_stdio(hdr.pid),
                     interactive: !tty.is_empty(),
                 })
             }
@@ -457,6 +495,35 @@ impl Decoder {
             body,
             h: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod stdio_tests {
+    use super::*;
+
+    #[test]
+    fn fd_links_are_classified() {
+        assert_eq!(classify_fd_link(b"socket:[12345]"), FdKind::Socket);
+        assert_eq!(classify_fd_link(b"pipe:[7]"), FdKind::Pipe);
+        assert_eq!(classify_fd_link(b"/dev/null"), FdKind::Null);
+        assert_eq!(classify_fd_link(b"/dev/pts/3"), FdKind::Tty);
+        assert_eq!(classify_fd_link(b"/dev/tty1"), FdKind::Tty);
+        assert_eq!(classify_fd_link(b"/var/log/x.log"), FdKind::File);
+        assert_eq!(classify_fd_link(b"anon_inode:[eventfd]"), FdKind::Unknown);
+    }
+
+    #[test]
+    fn this_process_has_readable_stdio_and_cwd() {
+        // Run under cargo test, fds 0-2 exist; at least one is readable on Linux. On other
+        // systems /proc is absent and the result is None.
+        let pid = std::process::id();
+        if std::path::Path::new("/proc/self/fd").exists() {
+            assert!(proc_stdio(pid).is_some());
+            assert!(proc_cwd(pid).is_some());
+        } else {
+            assert!(proc_stdio(pid).is_none());
+        }
     }
 }
 

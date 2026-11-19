@@ -5,7 +5,7 @@ severity: high
 tags: [attack.execution, attack.t1204]
 correlate:
   type: sequence
-  scope: same_session
+  scope: same_tree
   window: 5m
   steps:
     - id: write

@@ -158,8 +158,10 @@ pub enum Scope {
     /// Steps must come from the same process (`actor.puid`).
     Process,
     /// Steps must come from the same login session (`actor.ses`), falling back to the process.
-    /// Also used for `same_tree`, which this engine approximates by session.
     Session,
+    /// Steps must come from the same process tree: the engine follows `pid`/`ppid` across
+    /// events and ties a process to its topmost known ancestor.
+    Tree,
     /// No tie: any events on the host within the window.
     Host,
 }
@@ -394,7 +396,8 @@ fn compile_correlate(c: RawCorrelate) -> Result<Correlation, String> {
             }
             let scope = match c.scope.as_deref().unwrap_or("same_session") {
                 "same_process" => Scope::Process,
-                "same_session" | "same_tree" => Scope::Session,
+                "same_session" => Scope::Session,
+                "same_tree" => Scope::Tree,
                 "same_host" => Scope::Host,
                 other => return Err(format!("unknown scope `{other}`")),
             };

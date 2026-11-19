@@ -16,9 +16,10 @@ before relying on it.
 | Processes | exec (argv, exe, cwd), fork, exit | eBPF `sched_process_*` |
 | Files | create, open (write), delete, rename, link, chmod/chown, truncate, sensitive reads, SHA-256 of critical files | eBPF kprobes |
 | Network | TCP connect/accept/listen/close with byte counts, attributed to the owning process | eBPF kprobes + `inet_sock_set_state` |
-| DNS | queries and answers over UDP/53, parsed | eBPF kprobes |
-| Auth | sshd logins and failures, sudo/su decisions | journald |
-| System | account and `authorized_keys` changes, package installs, USB and block devices, kernel module load/unload, clock steps | passwd/shadow diffs, dpkg log, uevent netlink, eBPF, clock watch |
+| DNS | queries and answers over UDP/53 and TCP/53, parsed | eBPF kprobes |
+| UDP | per-process flow summaries (packets and bytes each way), every 10 s | eBPF kprobes |
+| Auth | sshd logins and failures, sudo/su decisions, logind session open/close | journald |
+| System | account and `authorized_keys` changes, package installs (dpkg; dnf untested), USB and block devices, kernel module load/unload, clock steps, service start/stop | passwd/shadow diffs, package logs, uevent netlink, eBPF, journald |
 | Daemon | start/stop, capture gaps and drops, source health, rule changes, API access, triage | the daemon |
 
 ## Install (Debian/Ubuntu)
@@ -41,6 +42,7 @@ sudo witness verify --dir /var/lib/witness   # check the hash chain
 witness anchor                               # print the head to store off-host
 witness rules lint                           # check /etc/witness/rules.d
 witness rules test rules/exec-from-tmp.yml   # replay stored events through a rule
+sudo witness bundle --from-seq 1000 --to-seq 2000 -o incident.tar   # evidence for a range, with proofs
 witness-gui                                  # desktop app
 ```
 
@@ -53,7 +55,7 @@ YAML, Sigma-inspired but **not** Sigma-compatible. Field names are Witness's own
 dotted paths you see in stored records (`actor.exe`, `data.path`, …). Operators: `eq ne in
 contains startswith endswith regex glob cidr gt gte lt lte exists`; correlation by `count`
 and `sequence`. A bad rule file is rejected with `file:line:col` and the others still load.
-The built-in pack (17 rules) is in [`rules/`](rules/). Edits are picked up without a restart.
+Correlation also includes `first_seen` (alert once per new value, remembered across restarts) and process-tree scoped sequences. The built-in pack (21 rules) is in [`rules/`](rules/). Edits are picked up without a restart.
 
 ## Threat model
 
@@ -93,6 +95,5 @@ See "What is verified" in [docs/DESIGN.md](docs/DESIGN.md) §14. In short: verif
 
 Userspace: `MIT OR Apache-2.0` ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
 The eBPF programs declare `Dual MIT/GPL`; `witness-ebpf` source is `MIT OR GPL-2.0-only`
-(the GPL-2.0 text is available at <https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt>;
-a copy is not yet bundled). The compiled BPF object embedded in the binary is available
-under `GPL-2.0-only` or `MIT`. This is engineering guidance, not legal advice.
+ The compiled BPF object embedded in the binary is available
+under `GPL-2.0-only` or `MIT`; the GPL text is in [LICENSE-GPL-2.0](LICENSE-GPL-2.0). This is engineering guidance, not legal advice.

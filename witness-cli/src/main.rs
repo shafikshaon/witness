@@ -16,13 +16,16 @@ use witness_store::store::read_head;
 use witness_store::verify::{verify_dirs, Options, Report};
 use witness_store::{Config, Store, StoreError};
 
+mod live;
+
 const DEFAULT_DIR: &str = "/var/lib/witness";
 
 #[derive(Parser)]
 #[command(
     name = "witness",
     version,
-    about = "Witness forensic activity monitor CLI"
+    about = "Witness forensic activity monitor CLI",
+    after_help = "Start with `witness status`. Then `witness alerts`. Evidence checks: `witness verify`."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -158,6 +161,29 @@ enum Cmd {
     /// Create an Ed25519 signing key for bundles: writes the secret to FILE (mode 0600) and
     /// prints the public key to give to whoever will verify.
     Keygen { file: PathBuf },
+    /// Start here: is Witness running, is the evidence intact, does anything need review?
+    /// Asks the running daemon (needs no root for a read-only overview).
+    Status {
+        /// Daemon socket (default: $WITNESS_SOCKET, else /run/witness/witness.sock).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the alerts the rules raised, newest last. Reviewed ones are hidden unless --all.
+    Alerts {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Include alerts already acknowledged or marked false positive.
+        #[arg(long)]
+        all: bool,
+        /// Look at the most recent N alerts.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Check rules and try them against stored evidence.
     Rules {
         #[command(subcommand)]
@@ -204,6 +230,12 @@ enum ConfigCmd {
         #[arg(long, default_value = witness_config::DEFAULT_PATH)]
         file: PathBuf,
     },
+}
+
+/// `--socket`, else `WITNESS_SOCKET`, else the default.
+fn socket_of(arg: Option<PathBuf>) -> PathBuf {
+    arg.or_else(|| std::env::var_os("WITNESS_SOCKET").map(PathBuf::from))
+        .unwrap_or_else(|| witness_client::DEFAULT_SOCKET.into())
 }
 
 fn main() -> ExitCode {
@@ -338,6 +370,25 @@ fn run() -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Status { socket, json } => match live::status(&socket_of(socket), json) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::from(1))
+            }
+        },
+        Cmd::Alerts {
+            socket,
+            all,
+            limit,
+            json,
+        } => match live::alerts(&socket_of(socket), all, limit, json) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::from(1))
+            }
+        },
         Cmd::Rules { cmd } => cmd_rules(cmd),
         Cmd::Anchor { dir } => {
             let (seq, head) = read_head(&dir.join("segments"))

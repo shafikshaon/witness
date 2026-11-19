@@ -30,6 +30,37 @@ pub enum ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+impl ClientError {
+    /// What this means for a person, and the next step to take. The `Display` text stays the
+    /// precise technical error; this is for the first thing a user reads.
+    pub fn hint(&self) -> String {
+        use std::io::ErrorKind::{ConnectionRefused, NotFound, PermissionDenied};
+        match self {
+            ClientError::Connect { path, source } => match source.kind() {
+                NotFound | ConnectionRefused => format!(
+                    "Witness is not running (nothing is listening at {}).\n\
+                     Start it:   sudo systemctl start witnessd\n\
+                     See why it is not up:   systemctl status witnessd   or   journalctl -u witnessd -e",
+                    path.display()
+                ),
+                PermissionDenied => format!(
+                    "Witness is running, but this user may not open {}.\n\
+                     Run the command with sudo, or ask an administrator to add you to the \
+                     `witness-admin` group (then log in again).",
+                    path.display()
+                ),
+                _ => self.to_string(),
+            },
+            ClientError::Api { status: 403, .. } => {
+                "That needs administrator access. Run it with sudo, or as a member of the \
+                 `witness-admin` group."
+                    .into()
+            }
+            _ => self.to_string(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     socket: PathBuf,
@@ -235,5 +266,38 @@ impl Client {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    fn connect(kind: std::io::ErrorKind) -> ClientError {
+        ClientError::Connect {
+            path: "/run/witness/witness.sock".into(),
+            source: std::io::Error::from(kind),
+        }
+    }
+
+    #[test]
+    fn connection_problems_say_what_to_do() {
+        let down = connect(std::io::ErrorKind::NotFound).hint();
+        assert!(down.contains("not running") && down.contains("systemctl start witnessd"));
+        let refused = connect(std::io::ErrorKind::ConnectionRefused).hint();
+        assert!(refused.contains("not running"));
+        let denied = connect(std::io::ErrorKind::PermissionDenied).hint();
+        assert!(denied.contains("witness-admin") && denied.contains("sudo"));
+        let forbidden = ClientError::Api {
+            status: 403,
+            title: "forbidden".into(),
+            detail: String::new(),
+        };
+        assert!(forbidden.hint().contains("administrator"));
+        // Anything else keeps the technical text.
+        assert_eq!(
+            ClientError::Protocol("x".into()).hint(),
+            "malformed response from witnessd: x"
+        );
     }
 }

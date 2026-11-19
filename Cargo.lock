@@ -5649,6 +5649,7 @@ dependencies = [
  "clap",
  "serde_json",
  "tempfile",
+ "witness-client",
  "witness-config",
  "witness-rules",
  "witness-store",

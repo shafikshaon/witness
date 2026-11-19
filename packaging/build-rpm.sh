@@ -24,7 +24,9 @@ for r in "$ROOT"/rules/*.yml; do
 done
 "${WITNESS_HOST_BIN:-$BIN/witness}" config show --file /nonexistent/none.toml > "$S/etc/witness/config.toml"
 chmod 0644 "$S/etc/witness/config.toml"
-cp "$ROOT/README.md" "$ROOT/docs/DESIGN.md" "$ROOT"/LICENSE-* "$S/"
+mkdir -p "$S/usr/share/doc/witness" "$S/usr/share/licenses/witness"
+cp "$ROOT/README.md" "$ROOT/docs/DESIGN.md" "$S/usr/share/doc/witness/"
+cp "$ROOT"/LICENSE-* "$S/usr/share/licenses/witness/"
 printf '[Desktop Entry]\nType=Application\nName=Witness\nComment=Forensic activity viewer\nExec=witness-gui\nCategories=System;Security;\n' > "$S/usr/share/applications/witness.desktop"
 # A package without the GUI binary must not list its files.
 if [ ! -x "$S/usr/bin/witness-gui" ]; then rm -f "$S/usr/share/applications/witness.desktop"; fi

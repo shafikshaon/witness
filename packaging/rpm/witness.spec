@@ -67,8 +67,8 @@ fi
 # The evidence directory /var/lib/witness is never removed, not even on erase.
 
 %files
-%license LICENSE-MIT LICENSE-APACHE LICENSE-GPL-2.0
-%doc README.md DESIGN.md
+%license %{_datadir}/licenses/witness
+%doc %{_datadir}/doc/witness
 %{_sbindir}/witnessd
 %{_bindir}/witness
 %{_prefix}/lib/systemd/system/witnessd.service

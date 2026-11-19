@@ -24,6 +24,21 @@ enum Page {
     Rules,
 }
 
+/// One plain sentence per page: what it is for and what to do there.
+fn lead(p: Page) -> &'static str {
+    match p {
+        Page::Dashboard => "The last 15 minutes at a glance: how busy the machine is and what is unusual. Start here.",
+        Page::Live => "Everything happening on this machine, as it happens. Pause to read; click a row for details.",
+        Page::Search => "Find past activity: a command, a file, a user, an address. Click a result for the full record.",
+        Page::Alerts => "Things the rules flagged as suspicious. Open one to see the evidence, then acknowledge it or mark it a false positive.",
+        Page::Timeline => "How busy the machine was over time, by kind of activity. Pick a period to spot spikes.",
+        Page::Processes => "Which program started which: the family tree of running and finished processes.",
+        Page::Sessions => "Who was logged in, from where, and when. Click one to see what they did.",
+        Page::Integrity => "Proof that the stored evidence has not been altered. A failed check means records were changed or removed.",
+        Page::Rules => "The detection rules in use. Switch a noisy one off, or edit and validate a rule (changing rules needs the witness-admin group).",
+    }
+}
+
 const PAGES: [(Page, &str); 9] = [
     (Page::Dashboard, "Dashboard"),
     (Page::Live, "Live"),
@@ -85,7 +100,7 @@ async fn off<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Optio
 
 async fn get(c: &Client, path: String) -> Result<Value, String> {
     let c = c.clone();
-    off(move || c.get(&path).map_err(|e| e.to_string()))
+    off(move || c.get(&path).map_err(|e| e.hint()))
         .await
         .unwrap_or_else(|| Err("the request was cancelled".into()))
 }
@@ -166,7 +181,7 @@ pub fn App() -> Element {
             nav { class: "nav",
                 div { class: "brand", "Witness" }
                 for (p, name) in PAGES {
-                    button { class: if page() == p { "on" } else { "" }, onclick: move |_| page.set(p), "{name}" }
+                    button { class: if page() == p { "on" } else { "" }, title: lead(p), onclick: move |_| page.set(p), "{name}" }
                 }
                 div { class: "spacer" }
                 button { title: "Show times in your local time zone", onclick: move |_| {
@@ -187,6 +202,15 @@ pub fn App() -> Element {
                 }
             }
             main { class: "main", key: "{local()}",
+                if let Some(Err(why)) = &*up.read() {
+                    div { class: "offline",
+                        h3 { "Witness is not reachable" }
+                        pre { "{why}" }
+                        p { class: "muted", "This window reconnects by itself every few seconds; there is nothing to refresh." }
+                    }
+                } else {
+                    p { class: "lead", "{lead(page())}" }
+                }
                 match page() {
                     Page::Live => rsx! { LivePage {} },
                     Page::Search => rsx! { SearchPage {} },

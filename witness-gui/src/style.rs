@@ -58,6 +58,10 @@ h3 { margin: 16px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; padding: 14px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
 .card .n { font-size: 26px; font-weight: 700; } .card .l { color: var(--muted); }
+.lead { margin: 0; padding: 7px 14px; font-size: 12.5px; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--line); }
+.offline { margin: 18px 14px 0; padding: 14px 18px; border: 1px solid var(--bad); background: var(--bad-bg); border-radius: 8px; }
+.offline h3 { margin: 0 0 8px; color: var(--bad); }
+.offline pre { margin: 0 0 8px; white-space: pre-wrap; font: inherit; line-height: 1.5; }
 .page { overflow: auto; flex: 1; padding-bottom: 20px; }
 .chart { display: flex; align-items: flex-end; gap: 2px; height: 160px; padding: 8px 14px 0; }
 .chart .bar1 { flex: 1; background: var(--accent); min-height: 1px; border-radius: 2px 2px 0 0; opacity: .85; }

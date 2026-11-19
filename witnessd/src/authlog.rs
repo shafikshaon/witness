@@ -10,6 +10,15 @@ use witness_common::schema::{
     AuthFail, Body, Login, Logout, ServiceAction, ServiceChange, Shutdown, Sudo,
 };
 
+/// Ids of logind sessions of class `manager`: systemd's per-user service manager, which logind
+/// opens beside every login on newer systemd. They are not logins, and the matching
+/// "Removed session" line does not say the class, so the ids are remembered (bounded).
+static MANAGER_SESSIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn is_manager_class(msg: &str) -> bool {
+    msg.contains("with class 'manager")
+}
+
 /// Structured journal records from systemd and logind (their fields are more reliable than
 /// their text): service start/stop with the job result, and session open/close.
 pub fn parse_fields(v: &Value) -> Option<Body> {
@@ -38,6 +47,22 @@ pub fn parse_fields(v: &Value) -> Option<Body> {
                 Err(_) => (0, Some(sid.to_string())),
             };
             let user = field("USER_ID")?.to_string();
+            // A poisoned lock only costs the filter, never the event.
+            let mut managers = MANAGER_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            if msg.starts_with("New session ") && is_manager_class(&msg) {
+                if managers.len() >= 256 {
+                    managers.remove(0);
+                }
+                managers.push(sid.to_string());
+                return None;
+            }
+            if msg.starts_with("Removed session ") {
+                if let Some(i) = managers.iter().position(|m| m == sid) {
+                    managers.remove(i);
+                    return None;
+                }
+            }
+            drop(managers);
             if msg.starts_with("New session ") {
                 Some(Body::Login(Login {
                     user,
@@ -264,6 +289,20 @@ mod journal_tests {
         // "logged out" is a precursor, not the end of the session: not reported twice.
         let pre = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Session 3 logged out. Waiting for processes to exit.","SESSION_ID":"3","USER_ID":"shafikshaon"});
         assert!(parse_fields(&pre).is_none());
+    }
+
+    #[test]
+    fn manager_sessions_are_not_logins() {
+        // Text from journald on Fedora 45 (systemd 259): one ssh login opens session 14 (user)
+        // and 15 (manager). Ids are unusual so parallel tests cannot collide with them.
+        let user = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"New session '9014' of user 'ws1' with class 'user' and type 'tty'.","SESSION_ID":"9014","USER_ID":"ws1"});
+        assert!(matches!(parse_fields(&user), Some(Body::Login(_))));
+        let mgr = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"New session '9015' of user 'ws1' with class 'manager' and type 'unspecified'.","SESSION_ID":"9015","USER_ID":"ws1"});
+        assert!(parse_fields(&mgr).is_none());
+        let gone = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Removed session 9015.","SESSION_ID":"9015","USER_ID":"ws1"});
+        assert!(parse_fields(&gone).is_none(), "its removal is skipped too");
+        let gone_user = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Removed session 9014.","SESSION_ID":"9014","USER_ID":"ws1"});
+        assert!(matches!(parse_fields(&gone_user), Some(Body::Logout(_))));
     }
 
     #[test]

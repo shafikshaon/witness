@@ -37,6 +37,8 @@ struct RuleState {
     partials: HashMap<String, Vec<Partial>>,
     /// `group → (last alert time, alerts swallowed since)`.
     suppress: HashMap<String, (u64, u64)>,
+    /// Keys already seen by a `first_seen` rule.
+    seen: std::collections::HashSet<String>,
 }
 
 /// Process ancestry learned from the events themselves (`actor.pid`, `actor.ppid`).
@@ -90,6 +92,7 @@ impl Tree {
 pub struct Engine {
     set: RuleSet,
     tree: Tree,
+    seen_dirty: bool,
     state: Vec<RuleState>,
     pub stats: Stats,
 }
@@ -136,6 +139,7 @@ impl Engine {
         Engine {
             set,
             tree: Tree::default(),
+            seen_dirty: false,
             state,
             stats: Stats::default(),
         }
@@ -159,6 +163,13 @@ impl Engine {
             .iter()
             .map(|r| match old.remove(&r.id) {
                 Some((sha, st)) if sha == r.sha256 => st,
+                // An edited `first_seen` rule keeps what it has learned.
+                Some((_, st)) if matches!(r.correlation, Some(Correlation::FirstSeen { .. })) => {
+                    RuleState {
+                        seen: st.seen,
+                        ..RuleState::default()
+                    }
+                }
                 _ => RuleState::default(),
             })
             .collect();
@@ -189,6 +200,7 @@ impl Engine {
                     .simple(i, v)
                     .then(|| (String::new(), vec![seq], 1, v.clone())),
                 Some(Correlation::Count { .. }) => self.count(i, v, seq, now),
+                Some(Correlation::FirstSeen { .. }) => self.first_seen(i, v, seq),
                 Some(Correlation::Sequence { .. }) => {
                     self.sequence(i, v, seq, now, root.as_deref())
                 }
@@ -200,6 +212,72 @@ impl Engine {
             }
         }
         out
+    }
+
+    fn first_seen(
+        &mut self,
+        i: usize,
+        v: &Value,
+        seq: u64,
+    ) -> Option<(String, Vec<u64>, usize, Value)> {
+        if !self.simple(i, v) {
+            return None;
+        }
+        let Some(Correlation::FirstSeen { group_by }) = &self.set.rules[i].correlation else {
+            return None;
+        };
+        let key = group_by
+            .iter()
+            .map(|g| text_at(v, g))
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        let st = &mut self.state[i];
+        if st.seen.contains(&key) {
+            return None;
+        }
+        if st.seen.len() >= MAX_GROUPS {
+            // Never forget what is already known: stop learning instead. A new key then alerts
+            // every time it appears, which is the safe direction.
+            self.stats.state_evicted += 1;
+        } else {
+            st.seen.insert(key.clone());
+            self.seen_dirty = true;
+        }
+        Some((key, vec![seq], 1, v.clone()))
+    }
+
+    /// Learned keys per `first_seen` rule id, for persisting across restarts.
+    pub fn export_seen(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        self.set
+            .rules
+            .iter()
+            .zip(&self.state)
+            .filter(|(r, _)| matches!(r.correlation, Some(Correlation::FirstSeen { .. })))
+            .map(|(r, st)| {
+                let mut v: Vec<String> = st.seen.iter().cloned().collect();
+                v.sort();
+                (r.id.clone(), v)
+            })
+            .collect()
+    }
+
+    /// Restores keys learned in an earlier run.
+    pub fn import_seen(&mut self, learned: &std::collections::BTreeMap<String, Vec<String>>) {
+        for (r, st) in self.set.rules.iter().zip(self.state.iter_mut()) {
+            if let Some(keys) = learned.get(&r.id) {
+                st.seen.extend(keys.iter().take(MAX_GROUPS).cloned());
+            }
+        }
+    }
+
+    /// Marks the learned set as unsaved again (a failed write is retried).
+    pub fn mark_seen_dirty(&mut self) {
+        self.seen_dirty = true;
+    }
+
+    /// True once if the learned set changed since the last call.
+    pub fn take_seen_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.seen_dirty)
     }
 
     fn simple(&self, i: usize, v: &Value) -> bool {

@@ -281,7 +281,13 @@ impl Pipeline {
     /// Starts evaluating rules over every stored event. Records the initial rule set (and any
     /// rejected files) in the chain.
     pub fn set_rules(&mut self, dir: &std::path::Path) -> Result<usize> {
-        let (runner, change) = crate::rules::RuleRunner::start(dir);
+        let learned = self
+            .store
+            .segment_dir()
+            .parent()
+            .map(|d| d.join("learned.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from("learned.json"));
+        let (runner, change) = crate::rules::RuleRunner::start(dir, &learned);
         let n = runner.rule_count();
         self.rules = Some(runner);
         self.write(Body::RuleSetChange(change))?;
@@ -380,6 +386,9 @@ impl Pipeline {
         let mut disk_events = Vec::new();
         if now.saturating_sub(self.last_rules_check) >= crate::rules::RELOAD_EVERY {
             self.last_rules_check = now;
+            if let Some(r) = self.rules.as_mut() {
+                r.persist_if_dirty();
+            }
             let change = self.rules.as_mut().and_then(|r| r.reload_if_changed());
             if let Some(ch) = change {
                 tracing::info!(
@@ -424,6 +433,10 @@ impl Pipeline {
     /// segment. The stop record is deliberately the last data record so the next start can
     /// tell a clean shutdown from a crash.
     pub fn stop(mut self, reason: &str, signal: Option<u8>) -> Result<Stats> {
+        // Save what first_seen rules learned before exiting.
+        if let Some(r) = self.rules.as_mut() {
+            r.persist_if_dirty();
+        }
         if self.set.sealing {
             self.store.seal_now().context("final seal")?;
         }

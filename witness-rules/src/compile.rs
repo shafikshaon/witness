@@ -102,7 +102,9 @@ struct RawCorrelate {
     kind: String,
     #[serde(default)]
     group_by: Vec<String>,
-    window: String,
+    /// Required for `count` and `sequence`; `first_seen` has no window.
+    #[serde(default)]
+    window: Option<String>,
     #[serde(default)]
     threshold: Option<u32>,
     #[serde(default)]
@@ -173,6 +175,9 @@ pub enum Correlation {
         window_ns: u64,
         threshold: u32,
     },
+    /// Alerts the first time a combination of field values is ever seen. The learned set
+    /// survives restarts when the host persists it (`Engine::export_seen`).
+    FirstSeen { group_by: Vec<Vec<String>> },
     Sequence {
         steps: Vec<Step>,
         scope: Scope,
@@ -372,7 +377,22 @@ fn compile_node(n: RawNode, steps: &[String]) -> Result<Node, String> {
 }
 
 fn compile_correlate(c: RawCorrelate) -> Result<Correlation, String> {
-    let window_ns = parse_duration(&c.window)?.as_nanos() as u64;
+    if c.kind == "first_seen" {
+        if c.group_by.is_empty() {
+            return Err("`first_seen` needs `group_by` fields".into());
+        }
+        let group_by = c
+            .group_by
+            .iter()
+            .map(|g| path_of(g))
+            .collect::<Result<_, _>>()?;
+        return Ok(Correlation::FirstSeen { group_by });
+    }
+    let window = c
+        .window
+        .as_deref()
+        .ok_or("`window` is required (for example 60s)")?;
+    let window_ns = parse_duration(window)?.as_nanos() as u64;
     match c.kind.as_str() {
         "count" => {
             let threshold = c
@@ -421,7 +441,9 @@ fn compile_correlate(c: RawCorrelate) -> Result<Correlation, String> {
                 window_ns,
             })
         }
-        other => Err(format!("unknown correlation type `{other}`")),
+        other => Err(format!(
+            "unknown correlation type `{other}` (use count, sequence or first_seen)"
+        )),
     }
 }
 

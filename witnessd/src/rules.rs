@@ -17,6 +17,8 @@ type Signature = Vec<(String, u64, Option<SystemTime>)>;
 pub struct RuleRunner {
     engine: Engine,
     dir: PathBuf,
+    /// Where `first_seen` rules keep what they have learned.
+    learned: PathBuf,
     sig: Signature,
     /// Rule files that failed to load at the last (re)load.
     pub rejected: Vec<String>,
@@ -74,19 +76,62 @@ fn change(old: &[(String, String)], new: &LoadResult) -> RuleSetChange {
 
 impl RuleRunner {
     /// Loads the rules in `dir`. A missing directory is an empty rule set, not an error.
-    pub fn start(dir: &Path) -> (RuleRunner, RuleSetChange) {
+    pub fn start(dir: &Path, learned: &Path) -> (RuleRunner, RuleSetChange) {
         let loaded = load_dir(dir).unwrap_or_default();
         let ch = change(&[], &loaded);
         let rejected = ch.rejected.clone();
+        let mut engine = Engine::new(loaded.set);
+        match std::fs::read(learned) {
+            Ok(b) => match serde_json::from_slice(&b) {
+                Ok(m) => engine.import_seen(&m),
+                Err(e) => {
+                    tracing::warn!(file = %learned.display(), error = %e, "ignoring unreadable learned.json")
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(file = %learned.display(), error = %e, "cannot read learned.json")
+            }
+        }
         (
             RuleRunner {
-                engine: Engine::new(loaded.set),
+                engine,
                 dir: dir.into(),
+                learned: learned.into(),
                 sig: signature(dir),
                 rejected,
             },
             ch,
         )
+    }
+
+    /// Writes the learned sets if they changed (atomically; readable by root only).
+    pub fn persist_if_dirty(&mut self) {
+        if !self.engine.take_seen_dirty() {
+            return;
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        let Ok(json) = serde_json::to_vec_pretty(&self.engine.export_seen()) else {
+            return;
+        };
+        let tmp = self.learned.with_extension("json.tmp");
+        let write = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(&json)?;
+                f.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, &self.learned));
+        if let Err(e) = write {
+            tracing::warn!(error = %e, "could not save learned.json; it will be retried");
+            // Try again on the next tick rather than losing the change.
+            self.engine.mark_seen_dirty();
+        }
     }
 
     pub fn rule_count(&self) -> usize {
@@ -129,3 +174,51 @@ impl RuleRunner {
 
 /// How often the directory is checked for edits.
 pub const RELOAD_EVERY: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usb_event(serial: &str) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "v": 1, "seq": 0, "boot_id": "b", "boot_ns": 1, "wall_ns": 1, "wall_uncertain": false,
+            "src": "uevent", "prio": 0, "type": "usb_device",
+            "data": {"action": "add", "devpath": "/d", "vendor_id": "0781", "product_id": "5581", "serial": serial}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn learned_devices_survive_a_restart_through_the_file() {
+        let t = tempfile::tempdir().unwrap();
+        let rules = t.path().join("rules.d");
+        std::fs::create_dir(&rules).unwrap();
+        std::fs::write(
+            rules.join("u.yml"),
+            "id: usb.unknown\ntitle: t\nseverity: medium\nevent: usb_device\ncorrelate:\n  type: first_seen\n  group_by: [data.serial]\n",
+        )
+        .unwrap();
+        let learned = t.path().join("learned.json");
+
+        let (mut r, _) = RuleRunner::start(&rules, &learned);
+        assert_eq!(r.process(1, &usb_event("A")).len(), 1);
+        assert!(r.process(2, &usb_event("A")).is_empty());
+        r.persist_if_dirty();
+        assert!(learned.exists());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&learned).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // New process, same file: A is known, B is new.
+        let (mut r2, _) = RuleRunner::start(&rules, &learned);
+        assert!(r2.process(3, &usb_event("A")).is_empty());
+        assert_eq!(r2.process(4, &usb_event("B")).len(), 1);
+
+        // A corrupt file is ignored, not fatal: everything is "new" again.
+        std::fs::write(&learned, b"{not json").unwrap();
+        let (mut r3, _) = RuleRunner::start(&rules, &learned);
+        assert_eq!(r3.process(5, &usb_event("A")).len(), 1);
+    }
+}

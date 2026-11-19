@@ -110,6 +110,14 @@ fn every_pack_rule_loads_and_the_obvious_cases_fire() {
             "witness.device.usb-attached",
         ),
         (
+            ev(
+                "usb_device",
+                "",
+                json!({"action": "add", "vendor_id": "0781", "product_id": "5581", "serial": "S1"}),
+            ),
+            "witness.device.usb-unknown",
+        ),
+        (
             ev("module_load", "/sbin/modprobe", json!({"name": "dummy"})),
             "witness.kernel.module-load",
         ),

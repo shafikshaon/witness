@@ -32,6 +32,8 @@ pub struct Roots {
     pub group: PathBuf,
     pub shadow: PathBuf,
     pub dpkg_log: PathBuf,
+    /// dnf's transaction log (Fedora/RHEL family).
+    pub dnf_log: PathBuf,
     pub poll: Duration,
 }
 
@@ -42,6 +44,7 @@ impl Default for Roots {
             group: "/etc/group".into(),
             shadow: "/etc/shadow".into(),
             dpkg_log: "/var/log/dpkg.log".into(),
+            dnf_log: "/var/log/dnf.rpm.log".into(),
             poll: Duration::from_secs(1),
         }
     }
@@ -86,8 +89,18 @@ impl Sources {
             threads.push(std::thread::spawn(move || account_loop(tx, stop, r)));
         }
         {
-            let (tx, stop, r) = (tx.clone(), stop.clone(), roots);
-            threads.push(std::thread::spawn(move || dpkg_loop(tx, stop, r)));
+            for (path, parse) in [
+                (
+                    roots.dpkg_log.clone(),
+                    crate::pkglog::parse_dpkg as fn(&str) -> Option<Body>,
+                ),
+                (roots.dnf_log.clone(), crate::pkglog::parse_dnf),
+            ] {
+                let (tx, stop, poll) = (tx.clone(), stop.clone(), roots.poll);
+                threads.push(std::thread::spawn(move || {
+                    tail_log_loop(tx, stop, path, poll, parse)
+                }));
+            }
         }
         {
             let (tx, stop) = (tx.clone(), stop.clone());
@@ -345,12 +358,19 @@ fn account_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>, r: Roots) {
     }
 }
 
-fn dpkg_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>, r: Roots) {
-    let mut pos = std::fs::metadata(&r.dpkg_log).map(|m| m.len()).unwrap_or(0);
-    let mut ino = std::fs::metadata(&r.dpkg_log).map(|m| m.ino()).unwrap_or(0);
+/// Follows a text log (new whole lines only, rotation-aware) and turns lines into bodies.
+fn tail_log_loop(
+    tx: Sender<Pending>,
+    stop: Arc<AtomicBool>,
+    path: PathBuf,
+    poll: Duration,
+    parse: fn(&str) -> Option<Body>,
+) {
+    let mut pos = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let mut ino = std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0);
     while !stop.load(Ordering::SeqCst) {
-        sleep_unless_stopped(&stop, r.poll);
-        let Ok(f) = std::fs::File::open(&r.dpkg_log) else {
+        sleep_unless_stopped(&stop, poll);
+        let Ok(f) = std::fs::File::open(&path) else {
             continue;
         };
         let Ok(m) = f.metadata() else { continue };
@@ -376,7 +396,7 @@ fn dpkg_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>, r: Roots) {
         };
         pos += end as u64 + 1;
         for line in String::from_utf8_lossy(&buf[..end]).lines() {
-            if let Some(body) = crate::pkglog::parse_dpkg(line) {
+            if let Some(body) = parse(line) {
                 let p = Pending {
                     src: Source::Daemon,
                     body,
@@ -622,6 +642,7 @@ mod tests {
             group: d.path().join("group"),
             shadow: d.path().join("shadow"),
             dpkg_log: d.path().join("dpkg.log"),
+            dnf_log: d.path().join("dnf.rpm.log"),
             poll: Duration::from_millis(30),
         };
         std::fs::write(
@@ -636,6 +657,7 @@ mod tests {
             "2026-01-01 00:00:00 install old:arm64 <none> 1\n",
         )
         .unwrap();
+        std::fs::write(&r.dnf_log, "").unwrap();
         let s = Sources::start(r.clone(), false);
         std::thread::sleep(Duration::from_millis(200));
         assert!(
@@ -650,6 +672,12 @@ mod tests {
             .open(&r.dpkg_log)
             .unwrap();
         f.write_all(b"2026-01-01 00:00:01 install nginx:arm64 <none> 2\n2026-01-01 00:00:02 inst")
+            .unwrap();
+        let mut d = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&r.dnf_log)
+            .unwrap();
+        d.write_all(b"2026-01-01T00:00:03Z SUBDEBUG Installed: curl-8.0.1-1.fc39.x86_64\n")
             .unwrap();
         std::thread::sleep(Duration::from_millis(400));
         let ev = s.drain("b", 0, 0);
@@ -668,10 +696,11 @@ mod tests {
             "{kinds:?}"
         );
         assert!(kinds.iter().any(|k| k == "account_change"), "{kinds:?}");
+        // One from dpkg (its half-written second line must wait for its newline) and one dnf.
         assert_eq!(
             kinds.iter().filter(|k| *k == "package_change").count(),
-            1,
-            "{kinds:?}: the half-written line must wait for its newline"
+            2,
+            "{kinds:?}"
         );
     }
 }

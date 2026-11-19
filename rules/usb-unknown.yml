@@ -1,0 +1,17 @@
+id: witness.device.usb-unknown
+title: USB device never seen on this machine before
+description: >
+  A USB device with a vendor, product and serial combination that has not been seen before
+  was attached. The set of known devices is learned automatically and kept in
+  /var/lib/witness/learned.json; delete an entry (or the file) to be told about a device again.
+severity: medium
+tags: [attack.initial-access, attack.t1091]
+event: usb_device
+correlate:
+  type: first_seen
+  group_by: [data.vendor_id, data.product_id, data.serial]
+match:
+  all:
+    - { field: data.action, op: eq, value: add }
+alert:
+  fields: [data.vendor_id, data.product_id, data.vendor, data.product, data.serial, data.devpath]

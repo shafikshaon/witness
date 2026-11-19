@@ -431,3 +431,80 @@ correlate:
         )
         .is_empty());
 }
+
+const USB_UNKNOWN: &str = r#"
+id: usb.unknown
+title: Unknown USB device
+severity: medium
+event: usb_device
+correlate:
+  type: first_seen
+  group_by: [data.vendor_id, data.product_id, data.serial]
+match:
+  all:
+    - { field: data.action, op: eq, value: add }
+"#;
+
+fn usb(action: &str, vid: &str, serial: &str) -> Value {
+    json!({"type":"usb_device","boot_ns":S,"actor":{"puid":"k"},"data":{"action":action,"vendor_id":vid,"product_id":"5581","serial":serial}})
+}
+
+#[test]
+fn first_seen_alerts_once_per_device_and_survives_a_restart() {
+    let mut e = engine(&[("u.yml", USB_UNKNOWN)]);
+    assert_eq!(
+        e.process_value(1, &usb("add", "0781", "A")).len(),
+        1,
+        "new device"
+    );
+    assert!(
+        e.process_value(2, &usb("add", "0781", "A")).is_empty(),
+        "same device again"
+    );
+    assert!(
+        e.process_value(3, &usb("remove", "0781", "B")).is_empty(),
+        "a removal is not a first sight"
+    );
+    assert_eq!(
+        e.process_value(4, &usb("add", "0781", "B")).len(),
+        1,
+        "same model, other serial"
+    );
+    assert_eq!(
+        e.process_value(5, &usb("add", "0951", "A")).len(),
+        1,
+        "other vendor"
+    );
+    assert!(e.take_seen_dirty());
+    assert!(!e.take_seen_dirty(), "the flag clears once read");
+
+    // A "restart": a fresh engine given the exported set knows these devices already.
+    let learned = e.export_seen();
+    assert_eq!(learned["usb.unknown"].len(), 3);
+    let mut e2 = engine(&[("u.yml", USB_UNKNOWN)]);
+    e2.import_seen(&learned);
+    assert!(e2.process_value(10, &usb("add", "0781", "A")).is_empty());
+    assert_eq!(e2.process_value(11, &usb("add", "dead", "Z")).len(), 1);
+
+    // Editing the rule keeps what it learned.
+    let edited = USB_UNKNOWN.replace("severity: medium", "severity: high");
+    let r = load_str([("u.yml", edited.as_str())]);
+    e.swap(r.set);
+    assert!(e.process_value(20, &usb("add", "0781", "A")).is_empty());
+}
+
+#[test]
+fn first_seen_needs_group_by_and_other_types_need_a_window() {
+    let no_group = "id: a\ntitle: t\nseverity: low\nevent: x\ncorrelate: { type: first_seen }\n";
+    let no_window = "id: b\ntitle: t\nseverity: low\nevent: x\ncorrelate: { type: count, group_by: [data.a], threshold: 2 }\n";
+    let r = load_str([("a.yml", no_group), ("b.yml", no_window)]);
+    assert_eq!(r.errors.len(), 2);
+    assert!(r
+        .errors
+        .iter()
+        .any(|e| e.to_string().contains("needs `group_by`")));
+    assert!(r
+        .errors
+        .iter()
+        .any(|e| e.to_string().contains("`window` is required")));
+}

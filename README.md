@@ -47,7 +47,7 @@ sudo usermod -aG witness "$USER"                    # allow reading activity dat
 witness status                                      # confirm it works
 ```
 
-Fedora: `sudo dnf install ./witness-0.1.0-1.*.rpm` (the GUI package is Debian/Ubuntu only for now).
+Fedora: no prebuilt RPM is shipped with this build. `packaging/build-rpm.sh` builds one (the daemon was verified on Fedora 45; the GUI package is Debian/Ubuntu only for now).
 
 The service starts at boot, before networking and SSH. Evidence lives in
 `/var/lib/witness` and is **never deleted automatically**, not even by `apt purge`.

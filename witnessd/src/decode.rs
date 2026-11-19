@@ -249,6 +249,61 @@ pub struct Decoder {
     procs: HashMap<String, ProcInfo>,
     /// `(exit time, puid)` in exit order; entries leave `procs` once older than the grace.
     exited: std::collections::VecDeque<(u64, String)>,
+    users: UserNames,
+}
+
+/// uid → login name from a passwd file, reloaded when the file changes (checked at most every
+/// 5 s). A uid with no entry has no name; it is never guessed.
+struct UserNames {
+    path: std::path::PathBuf,
+    names: HashMap<u32, String>,
+    sig: Option<(u64, std::time::SystemTime)>,
+    checked: Option<std::time::Instant>,
+}
+
+impl UserNames {
+    fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        UserNames {
+            path: path.into(),
+            names: HashMap::new(),
+            sig: None,
+            checked: None,
+        }
+    }
+
+    fn name(&mut self, uid: u32) -> Option<String> {
+        let due = self
+            .checked
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+        if due {
+            self.checked = Some(std::time::Instant::now());
+            let sig = std::fs::metadata(&self.path)
+                .ok()
+                .and_then(|m| Some((m.len(), m.modified().ok()?)));
+            if sig != self.sig || self.names.is_empty() {
+                self.sig = sig;
+                if let Ok(t) = std::fs::read_to_string(&self.path) {
+                    self.names = parse_passwd_names(&t);
+                }
+            }
+        }
+        self.names.get(&uid).cloned()
+    }
+}
+
+/// `name:x:uid:...` lines → uid → name (the first entry wins for a shared uid).
+fn parse_passwd_names(text: &str) -> HashMap<u32, String> {
+    let mut m = HashMap::new();
+    for l in text.lines().filter(|l| !l.starts_with('#')) {
+        let mut f = l.split(':');
+        let (Some(name), Some(_), Some(uid)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if let Ok(uid) = uid.parse::<u32>() {
+            m.entry(uid).or_insert_with(|| name.to_string());
+        }
+    }
+    m
 }
 
 fn cstr(buf: &[u8], len: u32) -> Vec<u8> {
@@ -267,6 +322,7 @@ impl Decoder {
             clock_offset_ns: 0,
             procs: HashMap::new(),
             exited: std::collections::VecDeque::new(),
+            users: UserNames::new("/etc/passwd"),
         }
     }
 
@@ -353,7 +409,7 @@ impl Decoder {
             gid: hdr.gid,
             euid: hdr.euid,
             egid: hdr.egid,
-            user: None,
+            user: self.users.name(hdr.uid),
             auid: (hdr.auid != u32::MAX).then_some(hdr.auid),
             ses: (hdr.ses != u32::MAX).then_some(hdr.ses),
             cgroup_id: hdr.cgroup_id,
@@ -516,6 +572,44 @@ impl Decoder {
             body,
             h: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod user_tests {
+    use super::*;
+
+    #[test]
+    fn passwd_text_maps_uids_to_names() {
+        let m = parse_passwd_names("root:x:0:0:r:/root:/bin/bash\n# c\nalice:x:1000:1000::/home/alice:/bin/sh\ndup:x:1000:1000::/x:/bin/sh\nbroken\n");
+        assert_eq!(m.get(&0).map(String::as_str), Some("root"));
+        assert_eq!(
+            m.get(&1000).map(String::as_str),
+            Some("alice"),
+            "the first entry wins"
+        );
+        assert!(!m.contains_key(&7));
+    }
+
+    #[test]
+    fn names_follow_the_file_and_unknown_uids_have_none() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("passwd");
+        std::fs::write(&f, "alice:x:1000:1000::/h:/bin/sh\n").unwrap();
+        let mut u = UserNames::new(&f);
+        assert_eq!(u.name(1000).as_deref(), Some("alice"));
+        assert_eq!(u.name(4242), None);
+        // The file changes; the next refresh (forced by clearing the throttle) sees it.
+        std::fs::write(
+            &f,
+            "alice:x:1000:1000::/h:/bin/sh\nbob:x:4242:4242::/b:/bin/sh\n",
+        )
+        .unwrap();
+        u.checked = None;
+        assert_eq!(u.name(4242).as_deref(), Some("bob"));
+        // A missing file is not an error: no names.
+        let mut none = UserNames::new(d.path().join("nope"));
+        assert_eq!(none.name(0), None);
     }
 }
 

@@ -86,6 +86,9 @@ struct Hook {
     /// signature degrades the hook instead of letting the program read the wrong argument.
     /// `None` for tracepoints (their arguments are typed by BTF).
     params: Option<usize>,
+    /// A second accepted count, for functions whose signature changed between kernel versions
+    /// without moving the arguments the program reads (`*_recvmsg` lost `nonblock` in 5.19).
+    params_alt: Option<usize>,
     attach: Attach,
     group: Group,
 }
@@ -101,6 +104,26 @@ const fn hook(
         prog,
         target,
         params,
+        params_alt: None,
+        attach,
+        group,
+    }
+}
+
+/// Like [`hook`], also accepting `alt` parameters.
+const fn hook_alt(
+    prog: &'static str,
+    target: &'static str,
+    params: usize,
+    alt: usize,
+    attach: Attach,
+    group: Group,
+) -> Hook {
+    Hook {
+        prog,
+        target,
+        params: Some(params),
+        params_alt: Some(alt),
         attach,
         group,
     }
@@ -250,17 +273,19 @@ const HOOKS: [Hook; 27] = [
         Attach::KProbe,
         Group::Dns,
     ),
-    hook(
+    hook_alt(
         "udp_recv4_enter",
         "udp_recvmsg",
-        Some(6),
+        6,
+        5,
         Attach::KProbe,
         Group::Dns,
     ),
-    hook(
+    hook_alt(
         "udp_recv6_enter",
         "udpv6_recvmsg",
-        Some(6),
+        6,
+        5,
         Attach::KProbe,
         Group::Dns,
     ),
@@ -287,10 +312,11 @@ const HOOKS: [Hook; 27] = [
         Attach::KProbe,
         Group::Dns,
     ),
-    hook(
+    hook_alt(
         "tcp_dns_recv_enter",
         "tcp_recvmsg",
-        Some(6),
+        6,
+        5,
         Attach::KProbe,
         Group::Dns,
     ),
@@ -543,7 +569,7 @@ impl Collector {
                 match (h.params, btf.func_param_count(h.target)) {
                     (None, _) => Ok(()),
                     (Some(_), None) => Err(format!("{} is not in the kernel's BTF", h.target)),
-                    (Some(want), Some(n)) if n != want => {
+                    (Some(want), Some(n)) if n != want && Some(n) != h.params_alt => {
                         Err(format!("{} has {n} parameters, expected {want}", h.target))
                     }
                     (Some(_), Some(_)) => Ok(()),

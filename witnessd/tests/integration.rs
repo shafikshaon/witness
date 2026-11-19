@@ -161,9 +161,24 @@ fn signals_and_long_and_binary_arguments() {
                 })
         })
         .expect("long-argument exec not captured");
-    assert_eq!(
-        long["data"]["argv_truncated"], true,
-        "8 KB of arguments exceeds the cap"
+    // 8 KB is over one record's 3 KiB, but the kernel sends the rest as continuation chunks,
+    // so the command line arrives whole. (`argv_truncated` is omitted when false.)
+    assert!(
+        !long["data"]["argv_truncated"].as_bool().unwrap_or(false),
+        "an 8 KB command line must not be truncated: {long:?}"
+    );
+    let arg = long["data"]["argv"]
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .find(|s| s.starts_with(&format!("{marker}-xx")))
+        })
+        .unwrap();
+    assert!(
+        arg.len() >= 8000,
+        "the argument arrived in full: {} bytes",
+        arg.len()
     );
 }
 
@@ -2040,9 +2055,9 @@ mod features {
                 .unwrap_or_else(|| panic!("no exec containing {needle}"))
         };
         let e = exec_with("witness-long-arg-");
-        assert_eq!(
-            e["data"]["argv_truncated"], false,
-            "the whole command line was recovered"
+        assert!(
+            !e["data"]["argv_truncated"].as_bool().unwrap_or(false),
+            "the whole command line was recovered (the field is omitted when false)"
         );
         let arg = e["data"]["argv"][1].as_str().unwrap();
         assert_eq!(

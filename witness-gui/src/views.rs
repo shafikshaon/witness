@@ -439,6 +439,9 @@ fn SearchPage() -> Element {
     let mut extra = use_signal(Vec::<Value>::new);
     let mut cursor = use_signal(|| None::<u64>);
     let mut exported = use_signal(|| None::<String>);
+    let mut saved = use_signal(|| model::load_searches(&model::searches_path()));
+    let mut picked_saved = use_signal(String::new);
+    let mut save_name = use_signal(String::new);
     let mut wrap = use_signal(|| false);
     let mut fmt = use_signal(|| "ndjson".to_string());
 
@@ -516,6 +519,45 @@ fn SearchPage() -> Element {
                 option { value: "86400", "last 24 h" } option { value: "604800", "last 7 days" }
             }
             button { class: "btn primary", onclick: move |_| applied.set(draft()), "Search" }
+            select { title: "Saved searches", value: "{picked_saved}",
+                onchange: move |e| {
+                    let name = e.value();
+                    picked_saved.set(name.clone());
+                    if let Some(s) = saved.read().iter().find(|s| s["name"] == name.as_str()) {
+                        let q = Query {
+                            q: text(s, &["q"]).to_string(),
+                            kind: text(s, &["kind"]).to_string(),
+                            last_secs: s["last_secs"].as_u64(),
+                            ..Query::default()
+                        };
+                        draft.set(q.clone());
+                        applied.set(q);
+                    }
+                },
+                option { value: "", "Saved searches…" }
+                for s in saved.read().iter() { option { key: "{text(s, &[\"name\"])}", value: "{text(s, &[\"name\"])}", "{text(s, &[\"name\"])}" } }
+            }
+            input { placeholder: "name to save as", value: "{save_name}", style: "width:130px", oninput: move |e| save_name.set(e.value()) }
+            button { class: "btn", onclick: move |_| {
+                let name = save_name().trim().to_string();
+                if name.is_empty() { return; }
+                let d = draft();
+                let mut list = saved();
+                model::upsert_search(&mut list, json!({"name": name, "q": d.q, "kind": d.kind, "last_secs": d.last_secs}));
+                let _ = model::save_searches(&model::searches_path(), &list);
+                saved.set(list);
+                picked_saved.set(name);
+                save_name.set(String::new());
+            }, "Save" }
+            button { class: "btn", title: "Delete the selected saved search", onclick: move |_| {
+                let name = picked_saved();
+                if name.is_empty() { return; }
+                let mut list = saved();
+                list.retain(|s| s["name"] != name.as_str());
+                let _ = model::save_searches(&model::searches_path(), &list);
+                saved.set(list);
+                picked_saved.set(String::new());
+            }, "Delete" }
             select { onchange: move |e| fmt.set(e.value()), option { value: "ndjson", "ndjson" } option { value: "json", "json" } option { value: "csv", "csv" } option { value: "bundle", "incident bundle (tar)" } }
             button { class: "btn", onclick: export, "Export results" }
             label { class: "muted", input { r#type: "checkbox", checked: wrap(), onchange: move |e| wrap.set(e.checked()) } " wrap long lines" }

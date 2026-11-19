@@ -416,6 +416,53 @@ pub fn split_command(cmd: &str, comm: &str, max: usize) -> (String, String) {
     (head.to_string(), rest)
 }
 
+/// A named search, as stored: `{name, q, kind, last_secs}`. Process and session filters are
+/// not saved (they refer to one particular process or session).
+pub type SavedSearch = Value;
+
+/// Where saved searches live: `$XDG_CONFIG_HOME/witness-gui/searches.json`, else
+/// `~/.config/witness-gui/searches.json`.
+pub fn searches_path() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("witness-gui").join("searches.json")
+}
+
+/// Reads the saved searches; a missing or unreadable file is simply "none saved".
+pub fn load_searches(path: &std::path::Path) -> Vec<SavedSearch> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok())
+        .map(|v| {
+            v.into_iter()
+                .filter(|s| s["name"].as_str().is_some_and(|n| !n.is_empty()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Writes the list atomically (temp file then rename), creating the directory.
+pub fn save_searches(path: &std::path::Path, list: &[SavedSearch]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(list).unwrap_or_default())?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Adds `s` or replaces the saved search with the same name.
+pub fn upsert_search(list: &mut Vec<SavedSearch>, s: SavedSearch) {
+    match list.iter().position(|x| x["name"] == s["name"]) {
+        Some(i) => list[i] = s,
+        None => list.push(s),
+    }
+    list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+}
+
 /// The event after (`delta` = 1) or before (`-1`) `current` in `list`, by `seq`; the first
 /// event when nothing is selected. Stays on the end of the list rather than wrapping.
 pub fn step(list: &[Value], current: Option<&Value>, delta: i32) -> Option<Value> {
@@ -508,6 +555,41 @@ mod tests {
         assert!(r.ends_with('…'));
         // Multi-byte text is cut on a character boundary, never in the middle of one.
         assert!(split_command("a ééééééééé", "a", 3).1.starts_with("ééé"));
+    }
+
+    #[test]
+    fn saved_searches_round_trip_replace_by_name_and_survive_bad_files() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("cfg/witness-gui/searches.json");
+        assert!(load_searches(&f).is_empty(), "no file: none saved");
+        let mut list = Vec::new();
+        upsert_search(
+            &mut list,
+            json!({"name":"b","q":"x","kind":"","last_secs":null}),
+        );
+        upsert_search(
+            &mut list,
+            json!({"name":"a","q":"y","kind":"dns","last_secs":3600}),
+        );
+        upsert_search(
+            &mut list,
+            json!({"name":"b","q":"changed","kind":"","last_secs":null}),
+        );
+        assert_eq!(list.len(), 2, "same name replaces");
+        assert_eq!(list[0]["name"], "a", "kept sorted by name");
+        save_searches(&f, &list).unwrap();
+        let back = load_searches(&f);
+        assert_eq!(back, list);
+        assert_eq!(back[1]["q"], "changed");
+        // A corrupt file, and entries with no name, are ignored rather than fatal.
+        std::fs::write(&f, b"{ not json").unwrap();
+        assert!(load_searches(&f).is_empty());
+        std::fs::write(
+            &f,
+            br#"[{"name":"ok","q":"1"},{"q":"nameless"},{"name":""}]"#,
+        )
+        .unwrap();
+        assert_eq!(load_searches(&f).len(), 1);
     }
 
     #[test]

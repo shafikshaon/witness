@@ -753,7 +753,7 @@ mod files {
         fs::create_dir_all(&mnt).unwrap();
         let (s2, m2) = (src.clone(), mnt.clone());
         let (ev, _) = capture(8, move || {
-            let ok = Command::new("mount")
+            let ok = std::process::Command::new("mount")
                 .args(["--bind", &format!("{s2}/inner"), &m2])
                 .status()
                 .unwrap()
@@ -761,7 +761,10 @@ mod files {
             assert!(ok, "mount --bind failed");
             fs::write(format!("{m2}/through-the-mount"), b"x").unwrap();
             fs::write(format!("{s2}/inner/direct"), b"x").unwrap();
-            Command::new("umount").arg(&m2).status().unwrap();
+            std::process::Command::new("umount")
+                .arg(&m2)
+                .status()
+                .unwrap();
         });
         fs::remove_dir_all(&src).ok();
         fs::remove_dir_all(&mnt).ok();

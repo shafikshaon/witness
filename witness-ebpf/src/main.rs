@@ -571,8 +571,13 @@ unsafe fn build_path(
     while i < max {
         i += 1;
         let head = read_dentry_head(dentry.add(o.dentry_d_parent as usize));
-        if head.parent == dentry as u64 || head.parent == 0 {
-            // Root of this filesystem: continue at its mount point in the parent mount.
+        // `struct vfsmount` starts with `mnt_root`: the dentry where this *mount* begins. It is
+        // the filesystem's own root for an ordinary mount but a directory in the middle of the
+        // tree for a bind mount or a btrfs subvolume, where the path must stop (and continue
+        // in the parent mount) at that directory, not at the top of the filesystem.
+        let mnt_root: u64 = rd_or(mnt, 0, 0);
+        if dentry as u64 == mnt_root || head.parent == dentry as u64 || head.parent == 0 {
+            // Root of this mount: continue at its mount point in the parent mount.
             if mnt.is_null() || EXP == 4 {
                 at_root = true;
                 break;

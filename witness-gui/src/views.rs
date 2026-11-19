@@ -409,10 +409,10 @@ fn SearchPage() -> Element {
             let out = off(move || c.get_bytes(&url).map_err(|e| e.to_string())).await;
             exported.set(Some(match out {
                 Some(Ok(body)) => {
+                    let ext = if f == "bundle" { "tar" } else { f.as_str() };
                     let name = format!(
-                        "witness-export-{}.{}",
+                        "witness-export-{}.{ext}",
                         model::fmt_time(now_ns()).replace([' ', ':'], "-"),
-                        f
                     );
                     let dir = std::env::var_os("HOME")
                         .map(std::path::PathBuf::from)

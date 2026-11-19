@@ -570,9 +570,7 @@ fn route(sh: &Shared, peer: &Peer, r: &Request) -> Res {
             f.puid = Some((*puid).into());
             list(sh, &f)
         }
-        ("GET", ["v1", "integrity"]) => {
-            ok(sh.verify.lock().map(|v| v.clone()).unwrap_or(Value::Null))
-        }
+        ("GET", ["v1", "integrity"]) => integrity(sh),
         ("POST", ["v1", "integrity", "verify"]) => start_verify(sh),
         ("GET", ["v1", "export"]) => export(sh, r),
         ("GET", ["v1", "rules"]) => rules_list(sh),
@@ -811,6 +809,48 @@ fn triage(sh: &Shared, peer: &Peer, seq: &str, r: &Request) -> Res {
         });
     }
     Ok(Reply::Json(202, json!({"accepted": true})))
+}
+
+/// The current verification state plus the history of checks recorded in the chain. A running
+/// or just-finished on-demand check wins; otherwise the latest recorded check (scheduled or
+/// on request, possibly from before the API started) is reported.
+fn integrity(sh: &Shared) -> Res {
+    let mut cur = sh.verify.lock().map(|v| v.clone()).unwrap_or(Value::Null);
+    let history: Vec<Value> = match open_index(sh) {
+        Ok(ix) => rows_json(
+            sh,
+            &ix,
+            &Filter {
+                kinds: vec!["integrity_check".into()],
+                limit: 12,
+                ..Filter::default()
+            },
+        )
+        .map(|r| r["events"].as_array().cloned().unwrap_or_default())
+        .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let rows: Vec<Value> = history
+        .iter()
+        .map(|e| {
+            let d = &e["data"];
+            json!({
+                "wall_ns": e["wall_ns"], "state": d["state"], "trigger": d["trigger"],
+                "records": d["records"], "segments": d["segments"], "duration_ms": d["duration_ms"],
+                "head_seq": d["head_seq"], "head_hash": d["head_hash"], "problem": d["problem"],
+            })
+        })
+        .collect();
+    if cur["state"] == "never_run" {
+        if let Some(last) = rows.first() {
+            cur = last.clone();
+            cur["finished_wall_ns"] = last["wall_ns"].clone();
+            cur["broken"] = last["problem"].clone();
+            cur["detail"] = last["problem"].clone();
+        }
+    }
+    cur["history"] = Value::Array(rows);
+    ok(cur)
 }
 
 fn start_verify(sh: &Shared) -> Res {

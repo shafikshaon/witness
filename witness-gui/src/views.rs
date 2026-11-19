@@ -737,12 +737,14 @@ fn TreeNode(n: ProcNode, depth: u32) -> Element {
         "▸"
     };
     let when = model::fmt_time(n.started);
+    let (prog, args) = model::split_command(&n.cmd, &n.comm, 110);
     rsx! {
         div { class: "node", class: if exited { "exited" },
             span { onclick: move |_| open.set(!open()), style: "display:inline-block;width:14px", "{arrow}" }
             span { onclick: move |_| { search.set(Query { puid: puid.clone(), ..Query::default() }); page.set(Page::Search); },
-                title: "{n.puid}",
-                "{n.pid} " b { "{n.comm}" } " {n.cmd}" span { class: "muted", "  {n.user} {when}" }
+                title: "{n.cmd}   (process id {n.puid})",
+                "{n.pid} " b { "{prog}" } " {args}" span { class: "muted", "  {n.user} {when}" }
+                if exited { span { class: "muted", "  exited" } }
                 if kids > 0 && !open() { span { class: "muted", "  (+{kids})" } }
             }
         }
@@ -772,7 +774,7 @@ fn ProcessesPage() -> Element {
     });
     rsx! {
         div { class: "bar", h2 { "Process tree" } button { class: "btn", onclick: move |_| tick += 1, "Refresh" }
-            span { class: "muted", "the most recent 1000 process events; click a process for everything it did" } }
+            span { class: "muted", "the most recent 1000 process events · greyed = exited · click a process for everything it did" } }
         match &*res.read() {
             None => rsx! { div { class: "empty", "loading…" } },
             Some(Err(e)) => rsx! { Failure { msg: e.clone() } },
@@ -946,6 +948,20 @@ fn IntegrityPage() -> Element {
                             }
                         }
                         if state == "error" { p { "{text(v, &[\"detail\"])}" } }
+                        if let Some(h) = v["history"].as_array().filter(|h| !h.is_empty()) {
+                            h3 { "Recent checks (recorded in the chain)" }
+                            table {
+                                tr { th { "when" } th { "result" } th { "trigger" } th { "records" } th { "took" } }
+                                for c in h.iter().take(10) {
+                                    tr { key: "{c[\"wall_ns\"]}",
+                                        td { "{model::fmt_time(c[\"wall_ns\"].as_u64().unwrap_or(0))}" }
+                                        td { span { class: if c["state"] == "ok" { "pill ok" } else { "pill bad" }, "{text(c, &[\"state\"])}" } }
+                                        td { "{text(c, &[\"trigger\"])}" }
+                                        td { "{c[\"records\"]}" }
+                                        td { "{c[\"duration_ms\"]} ms" } }
+                                }
+                            }
+                        }
                         p { class: "muted", "This checks the chain as stored on this machine. Someone with root can rewrite history and the chain with it; compare the head against an anchor recorded elsewhere (witness anchor)." }
                     }
                 }

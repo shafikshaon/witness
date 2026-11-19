@@ -397,6 +397,25 @@ pub fn scale_bars(series: &[u64]) -> Vec<u32> {
     series.iter().map(|v| (v * 100 / max) as u32).collect()
 }
 
+/// A command line split for display: the program's base name (or `comm` if the command line
+/// is empty) and the arguments, cut to `max` characters with an ellipsis.
+pub fn split_command(cmd: &str, comm: &str, max: usize) -> (String, String) {
+    let cmd = cmd.trim();
+    let (first, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    let head = first
+        .rsplit('/')
+        .next()
+        .filter(|h| !h.is_empty())
+        .unwrap_or(comm);
+    let rest = if rest.chars().count() > max {
+        let cut: String = rest.chars().take(max).collect();
+        format!("{cut}…")
+    } else {
+        rest.to_string()
+    };
+    (head.to_string(), rest)
+}
+
 /// The event after (`delta` = 1) or before (`-1`) `current` in `list`, by `seq`; the first
 /// event when nothing is selected. Stays on the end of the list rather than wrapping.
 pub fn step(list: &[Value], current: Option<&Value>, delta: i32) -> Option<Value> {
@@ -470,6 +489,26 @@ mod tests {
 
     /// The displayed time zone is global; tests that read or change it take this lock.
     static TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn commands_split_into_a_program_and_trimmed_arguments() {
+        assert_eq!(
+            split_command("/usr/bin/sudo -n /usr/bin/id -u", "sudo", 80),
+            ("sudo".into(), "-n /usr/bin/id -u".into())
+        );
+        assert_eq!(
+            split_command("", "kworker", 80),
+            ("kworker".into(), String::new())
+        );
+        assert_eq!(split_command("ls", "ls", 80), ("ls".into(), String::new()));
+        let long = format!("sh -c {}", "x".repeat(300));
+        let (h, r) = split_command(&long, "sh", 20);
+        assert_eq!(h, "sh");
+        assert_eq!(r.chars().count(), 21, "20 characters and an ellipsis");
+        assert!(r.ends_with('…'));
+        // Multi-byte text is cut on a character boundary, never in the middle of one.
+        assert!(split_command("a ééééééééé", "a", 3).1.starts_with("ééé"));
+    }
 
     #[test]
     fn stepping_moves_by_seq_and_stops_at_the_ends() {

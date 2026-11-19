@@ -66,7 +66,7 @@ h3 { margin: 16px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .tree { padding: 8px 14px; font-family: var(--mono); font-size: 12px; }
 .tree .node { padding: 1px 0; white-space: nowrap; } .tree .node:hover { background: var(--accent-bg); cursor: pointer; }
 .tree .kids { margin-left: 16px; border-left: 1px solid var(--line); padding-left: 8px; }
-.tree .exited { color: var(--muted); }
+.tree .exited { color: var(--muted); opacity: .75; }
 table { border-collapse: collapse; width: 100%; } th { text-align: left; color: var(--muted); font-weight: 600; padding: 6px 14px; border-bottom: 1px solid var(--line); }
 td { padding: 5px 14px; border-bottom: 1px solid var(--line); } tr.click:hover { background: var(--accent-bg); cursor: pointer; }
 .actions { display: flex; gap: 6px; margin: 10px 0; flex-wrap: wrap; }

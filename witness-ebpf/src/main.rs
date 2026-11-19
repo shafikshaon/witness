@@ -19,7 +19,7 @@ use aya_ebpf::{
     programs::{BtfTracePointContext, ProbeContext, RetProbeContext},
 };
 use witness_common::{
-    nop, modop, ArgvEvent, ConnInfo, MAX_ARGV_CHUNKS, FlowKey, FlowVal, FLOWS_MAX, UdpBody, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
+    nop, modop, ArgvEvent, ExecExtraEvent, ConnInfo, MAX_ARGV_CHUNKS, FlowKey, FlowVal, FLOWS_MAX, UdpBody, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
     DNS_RESPONSE, RECV_MAX, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, ModuleEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
     MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
@@ -193,6 +193,8 @@ unsafe fn try_exec(ctx: &BtfTracePointContext) -> Result<(), ()> {
         }
     }
 
+    emit_exec_extra(task, &o);
+
     let Some(mut entry) = CRITICAL.reserve::<ExecEvent>(0) else {
         count_drop(DROP_CLASS_CRITICAL);
         return Err(());
@@ -260,6 +262,70 @@ unsafe fn try_exec(ctx: &BtfTracePointContext) -> Result<(), ()> {
 
     entry.submit(0);
     Ok(())
+}
+
+/// `(i_mode, i_rdev)` of the inode behind descriptor `fd` in the fd array `fdarr`, or zeros.
+#[inline(always)]
+unsafe fn fd_inode(fdarr: *const u8, fd: u32, o: &Offsets) -> (u32, u32) {
+    let file: *const u8 = rd_or(fdarr, fd * 8, null());
+    let inode: *const u8 = rd_or(file, o.file_f_inode, null());
+    (
+        rd_or::<u16>(inode, o.inode_i_mode, 0) as u32,
+        rd_or::<u32>(inode, o.inode_i_rdev, 0),
+    )
+}
+
+/// What the new process inherited that vanishes if it exits quickly: its working directory and
+/// what descriptors 0-2 point at. Userspace could read `/proc`, but not for a process that is
+/// already gone by the time the record is decoded.
+#[inline(always)]
+unsafe fn emit_exec_extra(task: *const u8, o: &Offsets) {
+    let Some(scratch) = SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    let Some(mut entry) = CRITICAL.reserve::<ExecExtraEvent>(0) else {
+        count_drop(DROP_CLASS_CRITICAL);
+        return;
+    };
+    let ev = entry.as_mut_ptr();
+    fill_hdr(
+        addr_of_mut!((*ev).hdr),
+        kind::PROC_EXTRA,
+        core::mem::size_of::<ExecExtraEvent>(),
+        task,
+        o,
+    );
+    let b = addr_of_mut!((*ev).body);
+    (*b).path_len = 0;
+    (*b).trunc = 0;
+
+    // Working directory: task->fs->pwd.
+    let fs: *const u8 = rd_or(task, o.task_fs, null());
+    let pwd = fs.wrapping_add(o.fs_pwd as usize);
+    let mnt: *const u8 = rd_or(pwd, o.path_mnt, null());
+    let dentry: *const u8 = rd_or(pwd, o.path_dentry, null());
+    if !dentry.is_null() && o.fs_pwd != UNAVAILABLE {
+        let (len, trunc) = build_path(
+            scratch.cast(),
+            addr_of_mut!((*b).path).cast::<u8>(),
+            mnt,
+            dentry,
+            o,
+        );
+        (*b).path_len = len;
+        (*b).trunc = trunc;
+    }
+
+    // Descriptors 0-2: task->files->fdt->fd[i]->f_inode.
+    let files: *const u8 = rd_or(task, o.task_files, null());
+    let fdt: *const u8 = rd_or(files, o.files_fdt, null());
+    let fdarr: *const u8 = rd_or(fdt, o.fdt_fd, null());
+    let (m0, r0) = fd_inode(fdarr, 0, o);
+    let (m1, r1) = fd_inode(fdarr, 1, o);
+    let (m2, r2) = fd_inode(fdarr, 2, o);
+    (*b).mode = [m0, m1, m2];
+    (*b).rdev = [r0, r1, r2];
+    entry.submit(0);
 }
 
 /// Emits chunks 1.. of the argument area (`start`, `total` bytes); chunk 0 is in the exec record.

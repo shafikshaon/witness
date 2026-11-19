@@ -347,6 +347,13 @@ impl Btf {
             iov_iter_count: opt("iov_iter", "count"),
             module_name: opt("module", "name"),
             module_taints: opt("module", "taints"),
+            task_fs: opt("task_struct", "fs"),
+            fs_pwd: opt("fs_struct", "pwd"),
+            task_files: opt("task_struct", "files"),
+            files_fdt: opt("files_struct", "fdt"),
+            fdt_fd: opt("fdtable", "fd"),
+            file_f_inode: opt("file", "f_inode"),
+            inode_i_rdev: opt("inode", "i_rdev"),
         };
         Ok(Resolved { offsets, notes })
     }

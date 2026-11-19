@@ -30,6 +30,9 @@ pub mod kind {
     /// One more chunk of an exec's arguments ([`super::ArgvChunk`]), emitted *before* the
     /// exec record it belongs to when the arguments do not fit in one record.
     pub const PROC_ARGV: u16 = 24;
+    /// What an exec inherited that is gone once the process exits ([`super::ExecExtra`]):
+    /// emitted *before* the exec record it belongs to.
+    pub const PROC_EXTRA: u16 = 25;
 }
 
 /// File operations carried in [`FileBody::op`] / [`FileTwoBody::op`].
@@ -119,6 +122,13 @@ pub struct Offsets {
     pub iov_iter_count: u32,
     pub module_name: u32,
     pub module_taints: u32,
+    pub task_fs: u32,
+    pub fs_pwd: u32,
+    pub task_files: u32,
+    pub files_fdt: u32,
+    pub fdt_fd: u32,
+    pub file_f_inode: u32,
+    pub inode_i_rdev: u32,
 }
 
 impl Offsets {
@@ -179,6 +189,13 @@ impl Offsets {
             iov_iter_count: UNAVAILABLE,
             module_name: UNAVAILABLE,
             module_taints: UNAVAILABLE,
+            task_fs: UNAVAILABLE,
+            fs_pwd: UNAVAILABLE,
+            task_files: UNAVAILABLE,
+            files_fdt: UNAVAILABLE,
+            fdt_fd: UNAVAILABLE,
+            file_f_inode: UNAVAILABLE,
+            inode_i_rdev: UNAVAILABLE,
         }
     }
 }
@@ -609,6 +626,51 @@ impl DnsBody {
     }
 }
 
+/// Body of a [`kind::PROC_EXTRA`] record: the working directory and what descriptors 0-2 are.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExecExtra {
+    pub path_len: u32,
+    pub trunc: u32,
+    /// `inode->i_mode` of fd 0, 1, 2 (0 if the fd is not open).
+    pub mode: [u32; 3],
+    /// `inode->i_rdev` of fd 0, 1, 2 (device number, for character devices).
+    pub rdev: [u32; 3],
+    pub path: [u8; PATH_CAP],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExecExtraEvent {
+    pub hdr: RawHdr,
+    pub body: ExecExtra,
+}
+
+impl ExecExtra {
+    pub const SIZE: usize = 32 + PATH_CAP;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut path = [0u8; PATH_CAP];
+        path.copy_from_slice(&b[32..]);
+        Some(Self {
+            path_len: u32_at(0),
+            trunc: u32_at(4),
+            mode: [u32_at(8), u32_at(12), u32_at(16)],
+            rdev: [u32_at(20), u32_at(24), u32_at(28)],
+            path,
+        })
+    }
+
+    /// The working directory (empty if the kernel could not read it).
+    pub fn cwd(&self) -> &[u8] {
+        &self.path[..(self.path_len as usize).min(PATH_CAP)]
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ExecExtra>() == ExecExtra::SIZE);
+
 /// Chunks after the first that the kernel emits per exec: with [`ARGV_CAP`] bytes each, argv
 /// is captured up to `ARGV_CAP * (1 + MAX_ARGV_CHUNKS)` (about 63 KiB).
 pub const MAX_ARGV_CHUNKS: u64 = 20;
@@ -869,7 +931,7 @@ impl ForkBody {
 const _: () = assert!(core::mem::size_of::<ExecBody>() == ExecBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ExitBody>() == ExitBody::SIZE);
 const _: () = assert!(core::mem::size_of::<ForkBody>() == ForkBody::SIZE);
-const _: () = assert!(core::mem::size_of::<Offsets>() == 55 * 4);
+const _: () = assert!(core::mem::size_of::<Offsets>() == 62 * 4);
 const _: () = assert!(core::mem::size_of::<FileBody>() == FileBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileTwoBody>() == FileTwoBody::SIZE);
 const _: () = assert!(core::mem::size_of::<FileEvent>() == RawHdr::SIZE + FileBody::SIZE);

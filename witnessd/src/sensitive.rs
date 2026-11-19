@@ -19,11 +19,31 @@ pub fn kernel_dev(st_dev: u64) -> u32 {
     ((major << 20) | (minor & 0xfffff)) as u32
 }
 
+/// `BTRFS_SUPER_MAGIC`. On btrfs `stat()` reports each subvolume's own anonymous device number,
+/// which the kernel hooks cannot see (they see the filesystem's `s_dev`), so btrfs files are
+/// keyed by inode number alone, with device 0 on both sides.
+pub const BTRFS_MAGIC: u64 = 0x9123_683e;
+
+/// The device half of a key: the kernel-encoded `st_dev`, or 0 on btrfs.
+pub fn key_dev(st_dev: u64, fs_magic: u64) -> u32 {
+    if fs_magic == BTRFS_MAGIC {
+        0
+    } else {
+        kernel_dev(st_dev)
+    }
+}
+
 /// The key for `path` (symlinks followed: the file that gets opened is what matters).
 pub fn key_for(path: &Path) -> Option<InodeKey> {
     let m = std::fs::metadata(path).ok()?;
-    m.is_file().then(|| InodeKey {
-        dev: kernel_dev(m.dev()),
+    if !m.is_file() {
+        return None;
+    }
+    let magic = rustix::fs::statfs(path)
+        .map(|f| f.f_type as u64)
+        .unwrap_or(0);
+    Some(InodeKey {
+        dev: key_dev(m.dev(), magic),
         _pad: 0,
         ino: m.ino(),
     })
@@ -118,6 +138,9 @@ mod tests {
         let st = ((0x12345u64 & !0xff) << 12) | (0x12345 & 0xff) | (8u64 << 8);
         assert_eq!(kernel_dev(st), (8 << 20) | 0x12345);
         assert_eq!(kernel_dev(0), 0);
+        // btrfs: the device is not part of the key; elsewhere it is.
+        assert_eq!(key_dev(0x801, BTRFS_MAGIC), 0);
+        assert_eq!(key_dev(0x801, 0xEF53), (8 << 20) | 1);
     }
 
     #[test]

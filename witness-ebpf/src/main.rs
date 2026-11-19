@@ -639,6 +639,19 @@ unsafe fn build_path(
     (n as u32, trunc)
 }
 
+/// The device half of a sensitive-file key: `s_dev`, except on btrfs where it is 0 (stat()
+/// reports a per-subvolume device the kernel hooks cannot see; userspace uses 0 there too).
+#[inline(always)]
+unsafe fn sensitive_dev(dentry: *const u8, o: &Offsets) -> u32 {
+    let sb: *const u8 = rd_or(dentry, o.dentry_d_sb, null());
+    let magic: u64 = rd_or(sb, o.sb_s_magic, 0);
+    if magic == 0x9123_683e {
+        0
+    } else {
+        rd_or(sb, o.sb_s_dev, 0)
+    }
+}
+
 /// `(noisy filesystem, dev, ino, i_mode)` for a dentry; zeros if a read fails.
 #[inline(always)]
 unsafe fn file_identity(dentry: *const u8, o: &Offsets) -> (bool, u32, u64, u32) {
@@ -821,7 +834,11 @@ pub fn file_open(ctx: ProbeContext) -> u32 {
         }
         if mode & FMODE_WRITE == 0 {
             // A read-only open matters only for files on the sensitive list.
-            let key = InodeKey { dev, _pad: 0, ino };
+            let key = InodeKey {
+                dev: sensitive_dev(dentry, &o),
+                _pad: 0,
+                ino,
+            };
             if SENSITIVE.get_ptr(&key).is_some() {
                 emit_file(fop::OPEN_READ, ret, mnt, dentry, flags, 0, 0, 0);
             }

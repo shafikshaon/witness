@@ -49,9 +49,15 @@ static CONNS: LruHashMap<u64, ConnInfo> = LruHashMap::with_max_entries(CONNS_MAX
 #[map]
 static FLOWS: HashMap<FlowKey, FlowVal> = HashMap::with_max_entries(FLOWS_MAX, 0);
 
-/// Scratch space for building a new flow entry off the 512-byte BPF stack.
+/// A flow key and value built off the 512-byte BPF stack.
+#[repr(C)]
+struct FlowScratch {
+    key: FlowKey,
+    val: FlowVal,
+}
+
 #[map]
-static FLOW_TMP: PerCpuArray<FlowVal> = PerCpuArray::with_max_entries(1, 0);
+static FLOW_TMP: PerCpuArray<FlowScratch> = PerCpuArray::with_max_entries(1, 0);
 
 /// What an in-flight `udp_recvmsg` was asked to fill, keyed by `pid_tgid`, saved at entry because
 /// the kernel advances the iterator past the data before returning.
@@ -1282,40 +1288,40 @@ unsafe fn on_udp_send(ctx: &ProbeContext) {
 /// Concurrent updates from several CPUs are not atomic, so counts are approximate under load.
 #[inline(always)]
 unsafe fn account_flow(a: &NetAddrs, ptx: u64, btx: u64, prx: u64, brx: u64, o: &Offsets) {
-    let key = FlowKey {
-        family: a.family,
-        lport: a.lport,
-        rport: a.rport,
-        laddr: a.laddr,
-        raddr: a.raddr,
-        tgid: (bpf_get_current_pid_tgid() >> 32) as u32,
-        _pad: 0,
+    let Some(t) = FLOW_TMP.get_ptr_mut(0) else {
+        return;
     };
-    if let Some(v) = FLOWS.get_ptr_mut(&key) {
+    let k = addr_of_mut!((*t).key);
+    (*k).family = a.family;
+    (*k).lport = a.lport;
+    (*k).rport = a.rport;
+    (*k).laddr = a.laddr;
+    (*k).raddr = a.raddr;
+    (*k).tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    (*k)._pad = 0;
+    if let Some(v) = FLOWS.get_ptr_mut(&*k) {
         (*v).pkts_tx = (*v).pkts_tx.wrapping_add(ptx);
         (*v).bytes_tx = (*v).bytes_tx.wrapping_add(btx);
         (*v).pkts_rx = (*v).pkts_rx.wrapping_add(prx);
         (*v).bytes_rx = (*v).bytes_rx.wrapping_add(brx);
         return;
     }
-    let Some(t) = FLOW_TMP.get_ptr_mut(0) else {
-        return;
-    };
+    let v = addr_of_mut!((*t).val);
     let task = generated::bpf_get_current_task() as *const u8;
     fill_hdr(
-        addr_of_mut!((*t).hdr),
+        addr_of_mut!((*v).hdr),
         kind::NET_UDP,
         RawHdr::SIZE + UdpBody::SIZE,
         task,
         o,
     );
-    (*t).pkts_tx = ptx;
-    (*t).bytes_tx = btx;
-    (*t).pkts_rx = prx;
-    (*t).bytes_rx = brx;
-    (*t).first_boot_ns = bpf_ktime_get_boot_ns();
-    (*t).comm = comm_or_zero();
-    if FLOWS.insert(&key, &*t, 0).is_err() {
+    (*v).pkts_tx = ptx;
+    (*v).bytes_tx = btx;
+    (*v).pkts_rx = prx;
+    (*v).bytes_rx = brx;
+    (*v).first_boot_ns = bpf_ktime_get_boot_ns();
+    (*v).comm = comm_or_zero();
+    if FLOWS.insert(&*k, &*v, 0).is_err() {
         count_drop(DROP_CLASS_VOLUME);
     }
 }

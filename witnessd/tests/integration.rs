@@ -741,6 +741,46 @@ mod files {
     }
 
     #[test]
+    #[ignore = "needs root, a kernel with BTF and the ability to mount"]
+    fn paths_through_bind_mounts_of_subdirectories_are_reported_as_the_process_sees_them() {
+        // The root of a *mount* is not always the root of its filesystem: a bind mount of a
+        // subdirectory (containers, btrfs subvolumes) starts mid-tree. The path must be the
+        // one through the mount, not the one inside the filesystem.
+        let m = marker("bind");
+        let src = format!("/var/tmp/{m}-src");
+        let mnt = format!("/var/tmp/{m}-mnt");
+        fs::create_dir_all(format!("{src}/inner")).unwrap();
+        fs::create_dir_all(&mnt).unwrap();
+        let (s2, m2) = (src.clone(), mnt.clone());
+        let (ev, _) = capture(8, move || {
+            let ok = Command::new("mount")
+                .args(["--bind", &format!("{s2}/inner"), &m2])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "mount --bind failed");
+            fs::write(format!("{m2}/through-the-mount"), b"x").unwrap();
+            fs::write(format!("{s2}/inner/direct"), b"x").unwrap();
+            Command::new("umount").arg(&m2).status().unwrap();
+        });
+        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&mnt).ok();
+        let mine = about(&ev, &m);
+        let paths: Vec<_> = of(&mine, "file_create")
+            .iter()
+            .map(|e| e["data"]["path"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(
+            paths.contains(&format!("{mnt}/through-the-mount")),
+            "a file made through the bind mount is reported at the mount path: {paths:?}"
+        );
+        assert!(
+            paths.contains(&format!("{src}/inner/direct")),
+            "the same directory reached directly keeps its own path: {paths:?}"
+        );
+    }
+
+    #[test]
     #[ignore = "needs root and a kernel with BTF"]
     fn paths_cross_mounts_and_deep_nesting_correctly() {
         let m = marker("deep");

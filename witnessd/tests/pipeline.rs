@@ -175,16 +175,19 @@ fn first_start_and_clean_stop() {
         types(&r),
         [
             "segment_open",
+            // The first start ever also records the boot it saw.
+            "system_boot",
             "daemon_start",
             "anchor",
             "daemon_stop",
             "segment_seal"
         ]
     );
-    assert_eq!(r[1]["data"]["prev_shutdown"], "none");
     assert_eq!(r[1]["data"]["kernel"], "5.15.0-test");
-    assert_eq!(r[3]["data"]["clean"], true);
-    assert_eq!(r[3]["data"]["signal"], 15);
+    assert_eq!(r[2]["data"]["prev_shutdown"], "none");
+    assert_eq!(r[2]["data"]["kernel"], "5.15.0-test");
+    assert_eq!(r[4]["data"]["clean"], true);
+    assert_eq!(r[4]["data"]["signal"], 15);
     assert!(
         !types(&r).contains(&"capture_gap".to_string()),
         "no gap on a first start"

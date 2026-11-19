@@ -58,7 +58,68 @@ pub struct Pending {
     wall_ns: Option<u64>,
 }
 
+/// How long a login waits for its counterpart from the other source before it is emitted alone.
+const MERGE_WINDOW: Duration = Duration::from_secs(3);
+
+/// One ssh login is reported twice: by sshd (method, remote address, no session id) and by
+/// logind (the session id, no remote address). Logins are held briefly and combined, in either
+/// order, into one record that has both. A login with no counterpart is emitted unchanged.
+#[derive(Default)]
+struct Merger {
+    held: Vec<(std::time::Instant, Pending)>,
+}
+
+impl Merger {
+    fn push(&mut self, p: Pending, now: std::time::Instant) -> Vec<Pending> {
+        let (user, service) = match &p.body {
+            Body::Login(l) => (l.user.clone(), l.service.clone()),
+            _ => return vec![p],
+        };
+        let other = if service == "sshd" { "logind" } else { "sshd" };
+        let found = self.held.iter().position(|(t, h)| {
+            now.duration_since(*t) < MERGE_WINDOW
+                && matches!(&h.body, Body::Login(hl) if hl.user == user && hl.service == other)
+        });
+        let Some(i) = found else {
+            if service == "sshd" || service == "logind" {
+                self.held.push((now, p));
+                return Vec::new();
+            }
+            return vec![p];
+        };
+        let (_, held) = self.held.remove(i);
+        // The sshd record is the base (it knows how the user authenticated and from where);
+        // the logind record supplies the session.
+        let (mut base, session) = if service == "sshd" {
+            (p, held)
+        } else {
+            (held, p)
+        };
+        if let (Body::Login(b), Body::Login(sess)) = (&mut base.body, &session.body) {
+            b.session_id = sess.session_id;
+            b.session = sess.session.clone();
+        }
+        vec![base]
+    }
+
+    /// Emits what has waited out the window.
+    fn flush(&mut self, now: std::time::Instant) -> Vec<Pending> {
+        let mut out = Vec::new();
+        let mut keep = Vec::new();
+        for (t, p) in self.held.drain(..) {
+            if now.duration_since(t) >= MERGE_WINDOW {
+                out.push(p);
+            } else {
+                keep.push((t, p));
+            }
+        }
+        self.held = keep;
+        out
+    }
+}
+
 pub struct Sources {
+    merger: std::sync::Mutex<Merger>,
     rx: Receiver<Pending>,
     stop: Arc<AtomicBool>,
     journal_pid: Arc<AtomicU32>,
@@ -120,6 +181,7 @@ impl Sources {
             unavailable.push(("uevent", "Linux only".into()));
         }
         Sources {
+            merger: Default::default(),
             rx,
             stop,
             journal_pid,
@@ -131,7 +193,15 @@ impl Sources {
     /// Stamps everything the sources have produced since the last call.
     pub fn drain(&self, boot_id: &str, boot_ns: u64, wall_ns: u64) -> Vec<Event> {
         let mut out = Vec::new();
-        while let Ok(p) = self.rx.try_recv() {
+        let now = std::time::Instant::now();
+        let mut ready: Vec<Pending> = Vec::new();
+        if let Ok(mut m) = self.merger.lock() {
+            while let Ok(p) = self.rx.try_recv() {
+                ready.extend(m.push(p, now));
+            }
+            ready.extend(m.flush(now));
+        }
+        for p in ready {
             let (b, w) = match p.wall_ns {
                 // Keep the observed time, and place it on the boot clock by the same offset.
                 Some(w) if w <= wall_ns => (boot_ns.saturating_sub(wall_ns - w), w),
@@ -619,6 +689,7 @@ mod tests {
         })
         .unwrap();
         let s = Sources {
+            merger: Default::default(),
             rx,
             stop: Arc::new(AtomicBool::new(false)),
             journal_pid: Arc::new(AtomicU32::new(0)),
@@ -701,6 +772,88 @@ mod tests {
             kinds.iter().filter(|k| *k == "package_change").count(),
             2,
             "{kinds:?}"
+        );
+    }
+
+    fn login(service: &str, user: &str, session_id: u32, remote: Option<&str>) -> Pending {
+        Pending {
+            src: Source::Journald,
+            body: Body::Login(witness_common::schema::Login {
+                user: user.into(),
+                service: service.into(),
+                method: remote.map(|_| "publickey".to_string()),
+                remote_addr: remote.and_then(|r| r.parse().ok()),
+                remote_port: None,
+                tty: None,
+                session_id,
+                session: None,
+            }),
+            wall_ns: None,
+        }
+    }
+
+    #[test]
+    fn one_ssh_login_becomes_one_record_in_either_order() {
+        let t0 = std::time::Instant::now();
+        for sshd_first in [true, false] {
+            let mut m = Merger::default();
+            let (a, b) = (
+                login("sshd", "alice", 0, Some("10.0.0.5")),
+                login("logind", "alice", 7, None),
+            );
+            let (first, second) = if sshd_first { (a, b) } else { (b, a) };
+            assert!(m.push(first, t0).is_empty(), "held for its counterpart");
+            let out = m.push(second, t0 + Duration::from_millis(40));
+            assert_eq!(out.len(), 1);
+            let Body::Login(l) = &out[0].body else {
+                panic!()
+            };
+            assert_eq!(l.service, "sshd", "sshd is the base: it knows the address");
+            assert_eq!((l.session_id, l.remote_addr), (7, "10.0.0.5".parse().ok()));
+            assert!(
+                m.flush(t0 + Duration::from_secs(10)).is_empty(),
+                "nothing left held"
+            );
+        }
+    }
+
+    #[test]
+    fn unmatched_logins_are_emitted_alone_after_the_window_and_others_pass_through() {
+        let t0 = std::time::Instant::now();
+        let mut m = Merger::default();
+        // A console login has only logind's record; another user's records never combine.
+        assert!(m.push(login("logind", "bob", 3, None), t0).is_empty());
+        assert!(m
+            .push(login("sshd", "carol", 0, Some("1.2.3.4")), t0)
+            .is_empty());
+        assert!(
+            m.flush(t0 + Duration::from_secs(1)).is_empty(),
+            "still inside the window"
+        );
+        let out = m.flush(t0 + Duration::from_secs(4));
+        assert_eq!(out.len(), 2);
+        // Non-login records are not held at all.
+        let su = Pending {
+            src: Source::Journald,
+            body: crate::authlog::parse("su", "(to root) a on pts/0").unwrap(),
+            wall_ns: None,
+        };
+        assert_eq!(m.push(su, t0).len(), 1);
+        // A logind login does not merge with an sshd login of the same user outside the window.
+        let mut m = Merger::default();
+        assert!(m
+            .push(login("sshd", "alice", 0, Some("9.9.9.9")), t0)
+            .is_empty());
+        assert!(m
+            .push(
+                login("logind", "alice", 5, None),
+                t0 + Duration::from_secs(5)
+            )
+            .is_empty());
+        assert_eq!(
+            m.flush(t0 + Duration::from_secs(5)).len(),
+            1,
+            "the stale sshd record, alone"
         );
     }
 }

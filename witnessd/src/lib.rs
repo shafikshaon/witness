@@ -19,3 +19,4 @@ pub mod rules;
 pub mod sensitive;
 pub mod sources;
 pub mod uevent;
+pub mod unitfiles;

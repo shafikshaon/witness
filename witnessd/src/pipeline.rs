@@ -232,6 +232,19 @@ impl Pipeline {
                 source: None,
             }))?;
         }
+        // The first start on a boot (or ever) also records the boot itself.
+        if previous
+            .as_ref()
+            .is_none_or(|pr| pr.same_boot != Some(true))
+        {
+            let cmdline = std::fs::read_to_string("/proc/cmdline")
+                .ok()
+                .map(|c| c.trim().to_string());
+            p.write(Body::SystemBoot(witness_common::schema::Boot {
+                kernel: p.set.kernel.clone(),
+                cmdline,
+            }))?;
+        }
         let s = &p.set;
         let start = Body::DaemonStart(DaemonStart {
             version: s.version.clone(),

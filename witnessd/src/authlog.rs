@@ -6,7 +6,9 @@
 use std::net::IpAddr;
 
 use serde_json::Value;
-use witness_common::schema::{AuthFail, Body, Login, Logout, ServiceAction, ServiceChange, Sudo};
+use witness_common::schema::{
+    AuthFail, Body, Login, Logout, ServiceAction, ServiceChange, Shutdown, Sudo,
+};
 
 /// Structured journal records from systemd and logind (their fields are more reliable than
 /// their text): service start/stop with the job result, and session open/close.
@@ -15,9 +17,27 @@ pub fn parse_fields(v: &Value) -> Option<Body> {
     let ident = field("SYSLOG_IDENTIFIER").or_else(|| field("_COMM"))?;
     match ident {
         "systemd-logind" => {
-            let session_id: u32 = field("SESSION_ID")?.parse().ok()?;
-            let user = field("USER_ID")?.to_string();
             let msg = journal_text(v)?;
+            // Shutdown records carry no session. The kind is what logind says it is doing.
+            let shutdown = if msg.starts_with("System is powering down") {
+                Some("poweroff")
+            } else if msg.starts_with("System is rebooting") {
+                Some("reboot")
+            } else if msg.starts_with("System is halting") {
+                Some("halt")
+            } else {
+                None
+            };
+            if let Some(kind) = shutdown {
+                return Some(Body::SystemShutdown(Shutdown { kind: kind.into() }));
+            }
+            let sid = field("SESSION_ID")?;
+            // Numeric ids are logins; others (`c1`) are kept as a label with id 0.
+            let (session_id, session) = match sid.parse::<u32>() {
+                Ok(n) => (n, None),
+                Err(_) => (0, Some(sid.to_string())),
+            };
+            let user = field("USER_ID")?.to_string();
             if msg.starts_with("New session ") {
                 Some(Body::Login(Login {
                     user,
@@ -27,9 +47,14 @@ pub fn parse_fields(v: &Value) -> Option<Body> {
                     remote_port: None,
                     tty: None,
                     session_id,
+                    session,
                 }))
             } else if msg.starts_with("Removed session ") {
-                Some(Body::Logout(Logout { user, session_id }))
+                Some(Body::Logout(Logout {
+                    user,
+                    session_id,
+                    session,
+                }))
             } else {
                 None
             }
@@ -129,6 +154,7 @@ fn sshd(msg: &str) -> Option<Body> {
             remote_port,
             tty: None,
             session_id: 0,
+            session: None,
         }));
     }
     let fail = |user: Option<&str>, method: Option<&str>, tail: &str| {
@@ -238,6 +264,30 @@ mod journal_tests {
         // "logged out" is a precursor, not the end of the session: not reported twice.
         let pre = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Session 3 logged out. Waiting for processes to exit.","SESSION_ID":"3","USER_ID":"shafikshaon"});
         assert!(parse_fields(&pre).is_none());
+    }
+
+    #[test]
+    fn shutdown_and_non_numeric_sessions() {
+        // Verbatim from journald on Ubuntu 22.04.
+        let down = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"System is powering down.","MESSAGE_ID":"98268866d1d54a499c4e98921d93bc40"});
+        let Some(Body::SystemShutdown(s)) = parse_fields(&down) else {
+            panic!()
+        };
+        assert_eq!(s.kind, "poweroff");
+        let reboot = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"System is rebooting."});
+        assert!(
+            matches!(parse_fields(&reboot), Some(Body::SystemShutdown(s)) if s.kind == "reboot")
+        );
+        // A session that is not a login has a non-numeric id: kept as a label.
+        let open = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"New session c1 of user gdm.","SESSION_ID":"c1","USER_ID":"gdm"});
+        let Some(Body::Login(l)) = parse_fields(&open) else {
+            panic!()
+        };
+        assert_eq!((l.session_id, l.session.as_deref()), (0, Some("c1")));
+        let close = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Removed session c1.","SESSION_ID":"c1","USER_ID":"gdm"});
+        assert!(
+            matches!(parse_fields(&close), Some(Body::Logout(o)) if o.session.as_deref() == Some("c1"))
+        );
     }
 
     #[test]

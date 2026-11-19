@@ -517,13 +517,19 @@ pub struct Login {
     pub remote_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tty: Option<String>,
+    /// 0 when logind's id is not a number (see `session`).
     pub session_id: u32,
+    /// logind's own id when it is not numeric (`c1` for sessions that are not logins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Logout {
     pub user: String,
     pub session_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

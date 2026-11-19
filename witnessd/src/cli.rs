@@ -390,6 +390,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
     );
 
     let mut decoder = Decoder::new(boot.clone());
+    decoder.set_argv_max(cfg.capture.argv_max_bytes as usize);
     for ev in &snapshot {
         decoder.learn(ev);
     }
@@ -409,6 +410,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
     // UDP flow summaries (the kernel keeps running counters; this reads and clears them).
     let flows_every = Duration::from_secs(10);
     let mut last_flows = Instant::now();
+    let mut masked_units: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_summary = Instant::now();
     let resolve = |pid: u32| {
         use std::os::unix::ffi::OsStrExt;
@@ -451,6 +453,11 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                         }
                         if let Err(e) = pipeline.ingest(&ev) {
                             err = Some(e);
+                        } else if let Some(d) = crate::unitfiles::derive(&ev, &mut masked_units) {
+                            // systemctl enable/disable/mask, seen as the symlink it creates.
+                            if let Err(e) = pipeline.ingest(&d) {
+                                err = Some(e);
+                            }
                         }
                     }
                 }

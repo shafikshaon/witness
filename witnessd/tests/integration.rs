@@ -1741,13 +1741,21 @@ mod system {
             "service events: {svc:?}"
         );
         assert!(ssh_ok, "the test's own ssh login failed");
-        let login = ev.iter().find(|e| {
-            e["type"] == "login"
-                && e["data"]["service"] == "logind"
-                && e["data"]["user"] == user.as_str()
-        });
-        assert!(login.is_some(), "no logind login for {user}");
-        let sid = login.unwrap()["data"]["session_id"].clone();
+        // One ssh login is one record: sshd's method and remote address merged with logind's
+        // session id.
+        let logins: Vec<_> = ev
+            .iter()
+            .filter(|e| e["type"] == "login" && e["data"]["user"] == user.as_str())
+            .collect();
+        assert_eq!(logins.len(), 1, "one login record expected: {logins:?}");
+        let login = logins[0];
+        assert_eq!(login["data"]["service"], "sshd");
+        assert_eq!(login["data"]["remote_addr"], "127.0.0.1");
+        let sid = login["data"]["session_id"].clone();
+        assert!(
+            sid.as_u64().is_some_and(|n| n > 0),
+            "no session id: {login:?}"
+        );
         assert!(
             ev.iter().any(|e| e["type"] == "logout"
                 && e["data"]["user"] == user.as_str()

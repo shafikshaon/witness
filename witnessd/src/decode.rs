@@ -71,6 +71,43 @@ fn dns_body(b: &DnsBody) -> Body {
     })
 }
 
+/// `starttime` (field 22, clock ticks since boot) from the text of `/proc/<pid>/stat`. The
+/// process name (field 2) may contain spaces and parentheses, so count from the last `)`.
+pub fn stat_start_ticks(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // After the name: state is field 3, so starttime is the 20th token here.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// The full command line of `pid`, if it is still the process that started at `start_boot_ns`
+/// (a reused pid has a different start time). Returns the arguments and whether the whole
+/// command line fit within `max` bytes. Best effort: a process that re-executed in the meantime
+/// shows its newer command line.
+fn recover_argv(pid: u32, start_boot_ns: u64, max: usize) -> Option<(Vec<OsBytes>, bool)> {
+    use std::io::Read;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // puid quantises the start time to 10 ms, the resolution of /proc (100 ticks per second).
+    if stat_start_ticks(&stat)? != start_boot_ns / 10_000_000 {
+        return None;
+    }
+    let mut f = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
+    let mut buf = Vec::new();
+    f.by_ref().take(max as u64 + 1).read_to_end(&mut buf).ok()?;
+    let complete = buf.len() <= max;
+    buf.truncate(max);
+    if buf.is_empty() {
+        return None;
+    }
+    let mut args: Vec<OsBytes> = buf
+        .split(|&c| c == 0)
+        .map(|a| OsBytes(a.to_vec()))
+        .collect();
+    if buf.last() == Some(&0) {
+        args.pop();
+    }
+    Some((args, complete))
+}
+
 /// What a `/proc/<pid>/fd/N` link points at, as a coarse kind.
 pub fn classify_fd_link(link: &[u8]) -> FdKind {
     let s = String::from_utf8_lossy(link);
@@ -250,6 +287,8 @@ pub struct Decoder {
     /// `(exit time, puid)` in exit order; entries leave `procs` once older than the grace.
     exited: std::collections::VecDeque<(u64, String)>,
     users: UserNames,
+    /// Longest argv read back from /proc when the kernel's copy was cut short.
+    argv_max: usize,
 }
 
 /// uid → login name from a passwd file, reloaded when the file changes (checked at most every
@@ -259,6 +298,10 @@ struct UserNames {
     names: HashMap<u32, String>,
     sig: Option<(u64, std::time::SystemTime)>,
     checked: Option<std::time::Instant>,
+    /// Names the system's name service (LDAP, SSSD, ...) knows but the passwd file does not,
+    /// resolved on a background thread so a slow directory can never stall capture.
+    nss: std::sync::Arc<std::sync::Mutex<HashMap<u32, Option<String>>>>,
+    nss_tx: Option<std::sync::mpsc::SyncSender<u32>>,
 }
 
 impl UserNames {
@@ -268,7 +311,43 @@ impl UserNames {
             names: HashMap::new(),
             sig: None,
             checked: None,
+            nss: Default::default(),
+            nss_tx: None,
         }
+    }
+
+    /// Starts the resolver thread on first need.
+    fn nss_lookup(&mut self, uid: u32) -> Option<String> {
+        if let Some(found) = self.nss.lock().ok().and_then(|m| m.get(&uid).cloned()) {
+            return found;
+        }
+        let tx = self.nss_tx.get_or_insert_with(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(256);
+            let cache = self.nss.clone();
+            std::thread::spawn(move || {
+                while let Ok(uid) = rx.recv() {
+                    let name = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+                        .ok()
+                        .flatten()
+                        .map(|u| u.name);
+                    if let Ok(mut m) = cache.lock() {
+                        if m.len() > 10_000 {
+                            m.clear();
+                        }
+                        m.insert(uid, name);
+                    }
+                }
+            });
+            tx
+        });
+        // Queue it once; until the answer arrives the event simply has no name.
+        if let Ok(mut m) = self.nss.lock() {
+            if !m.contains_key(&uid) && tx.try_send(uid).is_ok() {
+                // Placeholder so the same uid is not queued again while in flight.
+                m.insert(uid, None);
+            }
+        }
+        None
     }
 
     fn name(&mut self, uid: u32) -> Option<String> {
@@ -287,7 +366,10 @@ impl UserNames {
                 }
             }
         }
-        self.names.get(&uid).cloned()
+        match self.names.get(&uid) {
+            Some(n) => Some(n.clone()),
+            None => self.nss_lookup(uid),
+        }
     }
 }
 
@@ -323,7 +405,13 @@ impl Decoder {
             procs: HashMap::new(),
             exited: std::collections::VecDeque::new(),
             users: UserNames::new("/etc/passwd"),
+            argv_max: 65_536,
         }
+    }
+
+    /// `capture.argv_max_bytes`: how much of an over-long command line to recover.
+    pub fn set_argv_max(&mut self, n: usize) {
+        self.argv_max = n;
     }
 
     fn remember(&mut self, a: &Actor) {
@@ -432,7 +520,17 @@ impl Decoder {
                 if argv_bytes.last() == Some(&0) {
                     argv.pop();
                 }
-                let truncated = hdr.flags & flags::TRUNCATED != 0;
+                let mut truncated = hdr.flags & flags::TRUNCATED != 0;
+                if truncated {
+                    // The kernel copies at most ARGV_CAP bytes; the rest is still in the
+                    // process's memory, so read the full command line back from /proc.
+                    if let Some((full, complete)) =
+                        recover_argv(hdr.pid, hdr.start_boot_ns, self.argv_max)
+                    {
+                        argv = full;
+                        truncated = !complete;
+                    }
+                }
                 let exe = resolve_exe(hdr.pid)
                     .map(OsBytes)
                     .unwrap_or_else(|| filename.clone());
@@ -576,6 +674,36 @@ impl Decoder {
 }
 
 #[cfg(test)]
+mod argv_tests {
+    use super::*;
+
+    #[test]
+    fn start_ticks_survive_awkward_process_names() {
+        let stat = "123 (my (weird) name) S 1 123 123 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 100 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        assert_eq!(stat_start_ticks(stat), Some(987_654));
+        assert_eq!(stat_start_ticks("garbage"), None);
+        assert_eq!(stat_start_ticks("1 (x) S"), None);
+    }
+
+    #[test]
+    fn this_process_argv_is_recoverable_and_a_wrong_start_time_is_refused() {
+        if !std::path::Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let pid = std::process::id();
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let ticks = stat_start_ticks(&stat).unwrap();
+        let (args, complete) = recover_argv(pid, ticks * 10_000_000, 1 << 20).unwrap();
+        assert!(!args.is_empty() && complete);
+        // A different start time means a different (pid-reusing) process: not read.
+        assert!(recover_argv(pid, (ticks + 5) * 10_000_000, 1 << 20).is_none());
+        // A tiny limit reports an incomplete command line.
+        let (_, complete) = recover_argv(pid, ticks * 10_000_000, 4).unwrap();
+        assert!(!complete);
+    }
+}
+
+#[cfg(test)]
 mod user_tests {
     use super::*;
 
@@ -607,9 +735,24 @@ mod user_tests {
         .unwrap();
         u.checked = None;
         assert_eq!(u.name(4242).as_deref(), Some("bob"));
-        // A missing file is not an error: no names.
+        // A missing file is not an error.
         let mut none = UserNames::new(d.path().join("nope"));
-        assert_eq!(none.name(0), None);
+        // root is resolved through the system's name service, off the calling thread: the
+        // first call has no answer yet, a later one does.
+        let first = none.name(0);
+        let mut later = first.clone();
+        for _ in 0..100 {
+            if later.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            later = none.name(0);
+        }
+        assert_eq!(
+            later.as_deref(),
+            Some("root"),
+            "first call returned {first:?}"
+        );
     }
 }
 

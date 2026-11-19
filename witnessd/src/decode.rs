@@ -10,8 +10,8 @@ use witness_common::schema::{
     SCHEMA_VERSION,
 };
 use witness_common::{
-    flags, fop, kind, modop, nop, ArgvChunk, DnsBody, ExecBody, ExitBody, FileBody, FileTwoBody,
-    ForkBody, ModuleBody, NetBody, RawHdr, UdpBody, AF_INET,
+    flags, fop, kind, modop, nop, ArgvChunk, DnsBody, ExecBody, ExecExtra, ExitBody, FileBody,
+    FileTwoBody, ForkBody, ModuleBody, NetBody, RawHdr, UdpBody, AF_INET,
 };
 
 const S_ISUID: u32 = 0o4000;
@@ -127,6 +127,37 @@ pub fn classify_fd_link(link: &[u8]) -> FdKind {
     } else {
         FdKind::Unknown
     }
+}
+
+/// What an inode is, from `i_mode` and (for character devices) `i_rdev`; 0 means the descriptor
+/// was not open.
+pub fn classify_mode(mode: u32, rdev: u32) -> FdKind {
+    match mode & 0o170000 {
+        0o140000 => FdKind::Socket,
+        0o010000 => FdKind::Pipe,
+        0o020000 => {
+            let (major, minor) = (rdev >> 20, rdev & 0xFFFFF);
+            if (major, minor) == (1, 3) {
+                FdKind::Null
+            } else if matches!(major, 4 | 5 | 136..=143) {
+                FdKind::Tty
+            } else {
+                FdKind::File
+            }
+        }
+        0o100000 | 0o040000 | 0o060000 => FdKind::File,
+        _ => FdKind::Unknown,
+    }
+}
+
+/// stdio kinds from the kernel's inode values; `None` if no descriptor was readable.
+fn stdio_of(mode: &[u32; 3], rdev: &[u32; 3]) -> Option<[FdKind; 3]> {
+    let k = [
+        classify_mode(mode[0], rdev[0]),
+        classify_mode(mode[1], rdev[1]),
+        classify_mode(mode[2], rdev[2]),
+    ];
+    (k != [FdKind::Unknown; 3]).then_some(k)
 }
 
 /// Kinds of fds 0, 1 and 2, read just after the exec. Best effort: the process may already have
@@ -295,6 +326,8 @@ pub struct Decoder {
     /// Argument chunks that arrived ahead of their exec record, by `(pid, start time)`, with
     /// the kernel time of the first one (stale entries are dropped).
     argv_chunks: HashMap<(u32, u64), PendingArgv>,
+    /// Each exec's inherited cwd and stdio, which arrive just before the exec record.
+    exec_extra: HashMap<(u32, u64), (u64, Box<ExecExtra>)>,
 }
 
 /// Chunks of one exec's arguments seen so far: the kernel time of the first, and `(index, bytes)`.
@@ -416,6 +449,7 @@ impl Decoder {
             users: UserNames::new("/etc/passwd"),
             argv_max: 65_536,
             argv_chunks: HashMap::new(),
+            exec_extra: HashMap::new(),
         }
     }
 
@@ -501,6 +535,8 @@ impl Decoder {
         // Chunks whose exec record never arrived (it was dropped) must not accumulate.
         self.argv_chunks
             .retain(|_, (t, _)| hdr.boot_ns.saturating_sub(*t) < 10_000_000_000);
+        self.exec_extra
+            .retain(|_, (t, _)| hdr.boot_ns.saturating_sub(*t) < 10_000_000_000);
         let mut actor = Actor {
             puid: puid(&self.boot_id, hdr.pid, hdr.start_boot_ns),
             pid: hdr.pid,
@@ -533,6 +569,10 @@ impl Decoder {
                 if argv_bytes.last() == Some(&0) {
                     argv.pop();
                 }
+                let extra = self
+                    .exec_extra
+                    .remove(&(hdr.pid, hdr.start_boot_ns))
+                    .map(|(_, x)| x);
                 let mut truncated = hdr.flags & flags::TRUNCATED != 0;
                 if truncated {
                     // The kernel sent the rest of the arguments as chunks just before this record.
@@ -582,9 +622,20 @@ impl Decoder {
                     exe,
                     argv,
                     argv_truncated: truncated,
-                    cwd: proc_cwd(hdr.pid).map(OsBytes),
+                    // Taken in the kernel when the process started; /proc is only the fallback
+                    // for kernels that could not read them (and is empty for a process that
+                    // has already exited).
+                    cwd: extra
+                        .as_ref()
+                        .map(|x| x.cwd().to_vec())
+                        .filter(|c| !c.is_empty())
+                        .or_else(|| proc_cwd(hdr.pid))
+                        .map(OsBytes),
                     env: None,
-                    stdio: proc_stdio(hdr.pid),
+                    stdio: extra
+                        .as_ref()
+                        .and_then(|x| stdio_of(&x.mode, &x.rdev))
+                        .or_else(|| proc_stdio(hdr.pid)),
                     interactive: !tty.is_empty(),
                 })
             }
@@ -661,6 +712,15 @@ impl Decoder {
                 } else {
                     Body::ModuleUnload(m)
                 }
+            }
+            kind::PROC_EXTRA => {
+                let b = ExecExtra::parse(body).ok_or(DecodeError::Short)?;
+                if self.exec_extra.len() > 4096 {
+                    self.exec_extra.clear();
+                }
+                self.exec_extra
+                    .insert((hdr.pid, hdr.start_boot_ns), (hdr.boot_ns, Box::new(b)));
+                return Err(DecodeError::Continuation);
             }
             kind::PROC_ARGV => {
                 let b = ArgvChunk::parse(body).ok_or(DecodeError::Short)?;
@@ -808,6 +868,36 @@ mod user_tests {
 #[cfg(test)]
 mod stdio_tests {
     use super::*;
+
+    #[test]
+    fn inode_modes_are_classified() {
+        assert_eq!(classify_mode(0o140777, 0), FdKind::Socket);
+        assert_eq!(classify_mode(0o010600, 0), FdKind::Pipe);
+        assert_eq!(classify_mode(0o020666, (1 << 20) | 3), FdKind::Null);
+        assert_eq!(
+            classify_mode(0o020620, (136 << 20) | 5),
+            FdKind::Tty,
+            "a pty"
+        );
+        assert_eq!(
+            classify_mode(0o020620, (4 << 20) | 1),
+            FdKind::Tty,
+            "a console tty"
+        );
+        assert_eq!(
+            classify_mode(0o020666, (1 << 20) | 5),
+            FdKind::File,
+            "/dev/zero is just a device"
+        );
+        assert_eq!(classify_mode(0o100644, 0), FdKind::File);
+        assert_eq!(classify_mode(0o040755, 0), FdKind::File);
+        assert_eq!(classify_mode(0, 0), FdKind::Unknown, "a closed descriptor");
+        assert!(stdio_of(&[0; 3], &[0; 3]).is_none());
+        assert_eq!(
+            stdio_of(&[0o140000, 0o140000, 0o010000], &[0; 3]),
+            Some([FdKind::Socket, FdKind::Socket, FdKind::Pipe])
+        );
+    }
 
     #[test]
     fn fd_links_are_classified() {

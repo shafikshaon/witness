@@ -1841,3 +1841,126 @@ mod integrity {
         );
     }
 }
+
+mod net2 {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::time::Duration;
+
+    use super::store_mode::{records, spawn, verify};
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn udp_flows_are_summarised_per_process_with_byte_counts() {
+        let t = tempfile::tempdir().unwrap();
+        let (mut child, _err) = spawn(t.path(), 24);
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sport = server.local_addr().unwrap().port();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let cport = client.local_addr().unwrap().port();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let srv = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            for _ in 0..5 {
+                let (_, from) = server.recv_from(&mut buf).unwrap();
+                server.send_to(&[7u8; 40], from).unwrap();
+            }
+        });
+        for _ in 0..5 {
+            client.send_to(&[1u8; 100], ("127.0.0.1", sport)).unwrap();
+            let mut b = [0u8; 64];
+            client.recv_from(&mut b).unwrap();
+        }
+        srv.join().unwrap();
+        // The next flush is within 10 s; keep the sockets open until after it.
+        std::thread::sleep(Duration::from_secs(13));
+        drop((client,));
+        let _ = child.wait();
+
+        let ev = records(t.path());
+        verify(t.path());
+        let mine: Vec<_> = ev
+            .iter()
+            .filter(|e| e["type"] == "udp_flow" && e["actor"]["pid"] == std::process::id())
+            .collect();
+        let sum = |lp: u64, rp: u64, f: &str| -> u64 {
+            mine.iter()
+                .filter(|e| e["data"]["lport"] == lp && e["data"]["rport"] == rp)
+                .map(|e| e["data"][f].as_u64().unwrap())
+                .sum()
+        };
+        let (cp, sp) = (cport as u64, sport as u64);
+        // The client's view: sent 5 x 100, received 5 x 40.
+        assert_eq!(sum(cp, sp, "bytes_tx"), 500, "flows: {mine:?}");
+        assert_eq!(sum(cp, sp, "packets_tx"), 5);
+        assert_eq!(sum(cp, sp, "bytes_rx"), 200);
+        assert_eq!(sum(cp, sp, "packets_rx"), 5);
+        // The server's view of the same conversation, from the other socket.
+        assert_eq!(sum(sp, cp, "bytes_tx"), 200);
+        assert_eq!(sum(sp, cp, "bytes_rx"), 500);
+        assert!(mine[0]["actor"]["exe"].as_str().is_some());
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn dns_over_tcp_is_captured_and_parsed() {
+        let t = tempfile::tempdir().unwrap();
+        let (mut child, _err) = spawn(t.path(), 12);
+        let srv = TcpListener::bind("127.0.0.1:53").unwrap();
+        let th = std::thread::spawn(move || {
+            let (mut s, _) = srv.accept().unwrap();
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).unwrap();
+            let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut q).unwrap();
+            // Answer in one write: length prefix + response with a single A record.
+            let mut r = q.clone();
+            r[2] = 0x81;
+            r[3] = 0x80;
+            r[7] = 1;
+            r.extend([0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 1, 2, 3]);
+            let mut out = (r.len() as u16).to_be_bytes().to_vec();
+            out.extend(r);
+            s.write_all(&out).unwrap();
+        });
+        let mut c = TcpStream::connect("127.0.0.1:53").unwrap();
+        let mut q = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for l in ["tcp-witness", "example"] {
+            q.push(l.len() as u8);
+            q.extend(l.as_bytes());
+        }
+        q.extend([0, 0, 1, 0, 1]);
+        let mut out = (q.len() as u16).to_be_bytes().to_vec();
+        out.extend(&q);
+        c.write_all(&out).unwrap();
+        let mut resp = [0u8; 256];
+        let n = c.read(&mut resp).unwrap();
+        assert!(n > 14);
+        th.join().unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        let _ = child.wait();
+
+        let ev = records(t.path());
+        let dns: Vec<_> = ev
+            .iter()
+            .filter(|e| e["type"] == "dns" && e["actor"]["pid"] == std::process::id())
+            .collect();
+        let query = dns
+            .iter()
+            .find(|e| e["data"]["direction"] == "query")
+            .unwrap_or_else(|| panic!("no tcp query; dns events: {dns:?}"));
+        assert_eq!(query["data"]["transport"], "tcp");
+        assert_eq!(query["data"]["qname"], "tcp-witness.example");
+        let resp = dns
+            .iter()
+            .find(|e| e["data"]["direction"] == "response")
+            .unwrap_or_else(|| panic!("no tcp response; dns events: {dns:?}"));
+        assert_eq!(resp["data"]["transport"], "tcp");
+        assert_eq!(resp["data"]["answers"][0]["data"], "10.1.2.3");
+    }
+}

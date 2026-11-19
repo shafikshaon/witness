@@ -401,8 +401,12 @@ fn SearchPage() -> Element {
     let export = move |_| {
         let (c, q, f) = (c.clone(), applied(), fmt());
         spawn(async move {
-            let url = format!("{}&format={f}&max=50000", q.url(None, 1000));
-            let out = off(move || c.get_text(&url).map_err(|e| e.to_string())).await;
+            let url = if f == "bundle" {
+                "/v1/export?format=bundle".to_string()
+            } else {
+                format!("{}&format={f}&max=50000", q.url(None, 1000))
+            };
+            let out = off(move || c.get_bytes(&url).map_err(|e| e.to_string())).await;
             exported.set(Some(match out {
                 Some(Ok(body)) => {
                     let name = format!(
@@ -444,7 +448,7 @@ fn SearchPage() -> Element {
                 option { value: "86400", "last 24 h" } option { value: "604800", "last 7 days" }
             }
             button { class: "btn primary", onclick: move |_| applied.set(draft()), "Search" }
-            select { onchange: move |e| fmt.set(e.value()), option { value: "ndjson", "ndjson" } option { value: "json", "json" } option { value: "csv", "csv" } }
+            select { onchange: move |e| fmt.set(e.value()), option { value: "ndjson", "ndjson" } option { value: "json", "json" } option { value: "csv", "csv" } option { value: "bundle", "incident bundle (tar)" } }
             button { class: "btn", onclick: export, "Export results" }
         }
         if let Some(m) = exported() { div { class: "conn", "{m}" } }

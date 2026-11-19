@@ -125,6 +125,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Write an incident bundle (tar): a contiguous range of stored records with a chain proof,
+    /// alerts, anchors, a verification report and a manifest of hashes.
+    Bundle {
+        #[arg(long, default_value = DEFAULT_DIR)]
+        dir: PathBuf,
+        /// Also read segments from this archive directory (repeatable).
+        #[arg(long = "include")]
+        include: Vec<PathBuf>,
+        /// First record (default: the first in the store).
+        #[arg(long)]
+        from_seq: Option<u64>,
+        /// Last record (default: the last).
+        #[arg(long)]
+        to_seq: Option<u64>,
+        /// Output file.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// Check rules and try them against stored evidence.
     Rules {
         #[command(subcommand)]
@@ -226,6 +244,35 @@ fn run() -> Result<ExitCode> {
             last,
             json,
         } => cmd_show(&dir, &include, &types, last, json),
+        Cmd::Bundle {
+            dir,
+            include,
+            from_seq,
+            to_seq,
+            out,
+        } => {
+            let mut dirs = vec![dir.join("segments")];
+            dirs.extend(include.iter().map(|d| d.join("segments")));
+            let opts = witness_store::bundle::BundleOptions {
+                from_seq,
+                to_seq,
+                tool_version: env!("CARGO_PKG_VERSION").into(),
+                exported_wall_ns: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+            };
+            let tar = witness_store::bundle::build(&dirs, &dir, &opts)
+                .with_context(|| format!("bundling {}", dir.display()))?;
+            fs::write(&out, &tar).with_context(|| format!("writing {}", out.display()))?;
+            println!(
+                "wrote {} ({} bytes); unpack with: tar -xf {}",
+                out.display(),
+                tar.len(),
+                out.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Cmd::Rules { cmd } => cmd_rules(cmd),
         Cmd::Anchor { dir } => {
             let (seq, head) = read_head(&dir.join("segments"))

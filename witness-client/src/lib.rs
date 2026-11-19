@@ -191,6 +191,15 @@ impl Client {
         serde_json::from_slice(&bytes).map_err(|e| ClientError::Protocol(e.to_string()))
     }
 
+    /// GET a binary body (the incident bundle).
+    pub fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let (status, bytes) = self.request("GET", path, None)?;
+        if !(200..300).contains(&status) {
+            return Err(api_error(status, &bytes));
+        }
+        Ok(bytes)
+    }
+
     /// GET a text body (raw records, exports).
     pub fn get_text(&self, path: &str) -> Result<String> {
         let (status, bytes) = self.request("GET", path, None)?;

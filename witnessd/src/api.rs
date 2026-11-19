@@ -87,6 +87,7 @@ type StreamFn = Box<dyn FnOnce(&mut dyn FnMut(&[u8]) -> bool) + Send>;
 enum Reply {
     Json(u16, Value),
     Text(u16, &'static str, String),
+    Bytes(u16, &'static str, Vec<u8>),
     /// A chunked NDJSON body produced by the closure, which writes lines until it returns.
     Stream(StreamFn),
 }
@@ -398,6 +399,7 @@ fn serve(conn: UnixStream, sh: &Shared) -> std::io::Result<()> {
             respond(&conn, code, "application/json", v.to_string().as_bytes())
         }
         Ok(Reply::Text(code, ctype, t)) => respond(&conn, code, ctype, t.as_bytes()),
+        Ok(Reply::Bytes(code, ctype, b)) => respond(&conn, code, ctype, &b),
         Ok(Reply::Stream(f)) => {
             conn.set_write_timeout(Some(Duration::from_secs(10)))?;
             let mut w = &conn;
@@ -856,11 +858,26 @@ fn start_verify(sh: &Shared) -> Res {
     Ok(Reply::Json(202, json!({"state": "running"})))
 }
 
+fn bundle(sh: &Shared, r: &Request) -> Res {
+    let opts = witness_store::bundle::BundleOptions {
+        from_seq: num(r, "from_seq")?,
+        to_seq: num(r, "to_seq")?,
+        tool_version: env!("CARGO_PKG_VERSION").into(),
+        exported_wall_ns: now_ns(),
+    };
+    let tar = witness_store::bundle::build(&[segs(sh)], &sh.cfg.data_dir, &opts)
+        .map_err(|e| bad(e.to_string()))?;
+    Ok(Reply::Bytes(200, "application/x-tar", tar))
+}
+
 fn export(sh: &Shared, r: &Request) -> Res {
+    if param(r, "format") == Some("bundle") {
+        return bundle(sh, r);
+    }
     let mut f = filter_of(r)?;
     let format = param(r, "format").unwrap_or("ndjson").to_string();
     if !["ndjson", "json", "csv"].contains(&format.as_str()) {
-        return Err(bad("format must be ndjson, json or csv"));
+        return Err(bad("format must be ndjson, json, csv or bundle"));
     }
     let max = num::<usize>(r, "max")?.unwrap_or(10_000).min(EXPORT_MAX);
     f.limit = 1000;

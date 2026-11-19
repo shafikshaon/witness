@@ -246,6 +246,8 @@ pub const MAX_COMPONENTS: usize = 24;
 /// Levels walked per path by hooks that report one path; two-path hooks (rename, link) walk two
 /// paths in one program and get fewer each so the verifier accepts them.
 pub const PATH_LEVELS: usize = 24;
+/// `file_open` also looks up the sensitive-file list and is the heaviest single-path program.
+pub const PATH_LEVELS_OPEN: usize = 20;
 pub const PATH_LEVELS_TWO: usize = 16;
 /// The per-CPU buffer the kernel walks paths into, right to left. Large enough that
 /// `MAX_COMPONENTS` components of `COMP_CAP + 1` bytes can never wrap it, which is what lets

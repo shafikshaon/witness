@@ -22,7 +22,7 @@ use witness_common::{
     nop, modop, ArgvEvent, ExecExtraEvent, ConnInfo, MAX_ARGV_CHUNKS, FlowKey, FlowVal, FLOWS_MAX, UdpBody, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
     DNS_RESPONSE, RECV_MAX, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, ModuleEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
-    PATH_CAP, PATH_LEVELS, PATH_LEVELS_TWO, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
+    PATH_CAP, PATH_LEVELS, PATH_LEVELS_OPEN, PATH_LEVELS_TWO, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
 };
 
 /// P0 events: process lifecycle. Sized by the loader (`map_max_entries`).
@@ -678,6 +678,24 @@ unsafe fn emit_file(
     uid: u32,
     gid: u32,
 ) {
+    emit_file_levels(op, ret, mnt, dentry, flags, mode, uid, gid, PATH_LEVELS);
+}
+
+/// [`emit_file`] with an explicit walk depth: `file_open` also does the sensitive-file lookup and
+/// sits closest to the verifier's budget, so it walks fewer levels than the other hooks.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn emit_file_levels(
+    op: u32,
+    ret: i32,
+    mnt: *const u8,
+    dentry: *const u8,
+    flags: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    levels: usize,
+) {
     if is_self() || dentry.is_null() {
         return;
     }
@@ -718,7 +736,7 @@ unsafe fn emit_file(
         mnt,
         dentry,
         &o,
-        PATH_LEVELS,
+        levels,
     );
     (*b).path_len = len;
     (*b).trunc = trunc;
@@ -840,11 +858,11 @@ pub fn file_open(ctx: ProbeContext) -> u32 {
                 ino,
             };
             if SENSITIVE.get_ptr(&key).is_some() {
-                emit_file(fop::OPEN_READ, ret, mnt, dentry, flags, 0, 0, 0);
+                emit_file_levels(fop::OPEN_READ, ret, mnt, dentry, flags, 0, 0, 0, PATH_LEVELS_OPEN);
             }
             return 0;
         }
-        emit_file(fop::OPEN_WRITE, ret, mnt, dentry, flags, 0, 0, 0);
+        emit_file_levels(fop::OPEN_WRITE, ret, mnt, dentry, flags, 0, 0, 0, PATH_LEVELS_OPEN);
     }
     0
 }

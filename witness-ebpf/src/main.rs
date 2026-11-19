@@ -931,6 +931,20 @@ pub fn path_truncate(ctx: ProbeContext) -> u32 {
     0
 }
 
+/// security_file_truncate(struct file *file): `ftruncate(fd)` on kernels 6.2 and later, where it
+/// no longer passes through `security_path_truncate`.
+#[kprobe(function = "security_file_truncate")]
+pub fn file_truncate(ctx: ProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe {
+        let file: *const u8 = ctx.arg(0).unwrap_or(null());
+        let o = offsets();
+        let (mnt, dentry) = path_parts(file.add(o.file_f_path as usize), &o);
+        emit_file(fop::TRUNCATE, RESULT_UNKNOWN, mnt, dentry, 0, 0, 0, 0);
+    }
+    0
+}
+
 /// security_path_rename(old_dir, old_dentry, new_dir, new_dentry, unsigned int flags)
 #[kprobe(function = "security_path_rename")]
 pub fn path_rename(ctx: ProbeContext) -> u32 {

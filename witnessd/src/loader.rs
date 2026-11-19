@@ -90,6 +90,9 @@ struct Hook {
     /// shrank at the end between kernel versions (`*_recvmsg` lost `nonblock` in 5.19 and
     /// `addr_len` later) still have the arguments the program reads in the same places.
     params_max: Option<usize>,
+    /// The kernel may simply not have this function (a newer hook alongside an older one that
+    /// covers the same operation on older kernels). Absent is then normal, not a failure.
+    optional: bool,
     attach: Attach,
     group: Group,
 }
@@ -106,6 +109,27 @@ const fn hook(
         target,
         params,
         params_max: None,
+        optional: false,
+        attach,
+        group,
+    }
+}
+
+/// Like [`hook`] for a function newer kernels have and older ones lack; where it is absent the
+/// hook is skipped without being reported as a failure.
+const fn hook_optional(
+    prog: &'static str,
+    target: &'static str,
+    params: usize,
+    attach: Attach,
+    group: Group,
+) -> Hook {
+    Hook {
+        prog,
+        target,
+        params: Some(params),
+        params_max: None,
+        optional: true,
         attach,
         group,
     }
@@ -126,6 +150,7 @@ const fn hook_range(
         target,
         params: Some(min),
         params_max: Some(max),
+        optional: false,
         attach,
         group,
     }
@@ -134,7 +159,7 @@ const fn hook_range(
 /// All optional hooks. File hooks are kprobes (no fentry/fexit on arm64 before 6.0, and
 /// `kuid_t` by-value arguments); TCP uses kprobes on connect/accept plus the
 /// `inet_sock_set_state` tracepoint.
-const HOOKS: [Hook; 27] = [
+const HOOKS: [Hook; 28] = [
     hook(
         "file_open",
         "security_file_open",
@@ -263,6 +288,14 @@ const HOOKS: [Hook; 27] = [
         None,
         Attach::BtfTp,
         Group::System,
+    ),
+    // ftruncate(fd) on 6.2+ goes through this hook instead of security_path_truncate.
+    hook_optional(
+        "file_truncate",
+        "security_file_truncate",
+        1,
+        Attach::KProbe,
+        Group::Files,
     ),
     hook(
         "udp_send4",
@@ -552,6 +585,15 @@ impl Collector {
                 reports[idx] = Some(HookReport {
                     hook: h.target,
                     status: Err("skipped (WITNESS_ONLY_HOOK)".into()),
+                });
+                continue;
+            }
+            if h.optional && btf.func_param_count(h.target).is_none() {
+                // Nothing to attach on this kernel, and nothing wrong.
+                by_name.remove(h.prog);
+                reports[idx] = Some(HookReport {
+                    hook: h.target,
+                    status: Ok(()),
                 });
                 continue;
             }

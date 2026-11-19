@@ -2096,11 +2096,12 @@ mod features {
         std::thread::sleep(Duration::from_millis(600));
         assert!(sh(&format!("systemctl disable {unit} >/dev/null 2>&1")));
         std::thread::sleep(Duration::from_millis(600));
+        // systemd will not mask over a real unit file, so remove ours first.
+        fs::remove_file(&path).unwrap();
         assert!(sh(&format!("systemctl mask {unit} >/dev/null 2>&1")));
         std::thread::sleep(Duration::from_millis(600));
         assert!(sh(&format!("systemctl unmask {unit} >/dev/null 2>&1")));
         std::thread::sleep(Duration::from_secs(2));
-        let _ = fs::remove_file(&path);
         let _ = child.wait();
 
         let ev = records(t.path());

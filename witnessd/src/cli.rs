@@ -146,6 +146,7 @@ pub fn tail(seconds: Option<u64>) -> Result<()> {
                         let _ = writeln!(out, "{line}");
                     }
                 }
+                Err(crate::decode::DecodeError::Continuation) => {}
                 Err(e) => tracing::warn!("undecodable record: {e}"),
             }
         })?;
@@ -461,6 +462,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                         }
                     }
                 }
+                Err(crate::decode::DecodeError::Continuation) => {}
                 Err(e) => tracing::warn!("undecodable record: {e}"),
             }
         });

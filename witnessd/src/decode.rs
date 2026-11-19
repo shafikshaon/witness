@@ -10,8 +10,8 @@ use witness_common::schema::{
     SCHEMA_VERSION,
 };
 use witness_common::{
-    flags, fop, kind, modop, nop, DnsBody, ExecBody, ExitBody, FileBody, FileTwoBody, ForkBody,
-    ModuleBody, NetBody, RawHdr, UdpBody, AF_INET,
+    flags, fop, kind, modop, nop, ArgvChunk, DnsBody, ExecBody, ExitBody, FileBody, FileTwoBody,
+    ForkBody, ModuleBody, NetBody, RawHdr, UdpBody, AF_INET,
 };
 
 const S_ISUID: u32 = 0o4000;
@@ -39,6 +39,9 @@ pub enum DecodeError {
     Short,
     #[error("unknown event kind {0}")]
     UnknownKind(u16),
+    /// Not an event: a chunk of an exec's arguments, held until its exec record arrives.
+    #[error("argument continuation (not an event)")]
+    Continuation,
 }
 
 fn ip(family: u32, a: &[u8; 16]) -> IpAddr {
@@ -289,7 +292,13 @@ pub struct Decoder {
     users: UserNames,
     /// Longest argv read back from /proc when the kernel's copy was cut short.
     argv_max: usize,
+    /// Argument chunks that arrived ahead of their exec record, by `(pid, start time)`, with
+    /// the kernel time of the first one (stale entries are dropped).
+    argv_chunks: HashMap<(u32, u64), PendingArgv>,
 }
+
+/// Chunks of one exec's arguments seen so far: the kernel time of the first, and `(index, bytes)`.
+type PendingArgv = (u64, Vec<(u32, Vec<u8>)>);
 
 /// uid → login name from a passwd file, reloaded when the file changes (checked at most every
 /// 5 s). A uid with no entry has no name; it is never guessed.
@@ -406,6 +415,7 @@ impl Decoder {
             exited: std::collections::VecDeque::new(),
             users: UserNames::new("/etc/passwd"),
             argv_max: 65_536,
+            argv_chunks: HashMap::new(),
         }
     }
 
@@ -488,6 +498,9 @@ impl Decoder {
         }
         let body = &rec[RawHdr::SIZE..hdr.len as usize];
         self.forget_expired(hdr.boot_ns);
+        // Chunks whose exec record never arrived (it was dropped) must not accumulate.
+        self.argv_chunks
+            .retain(|_, (t, _)| hdr.boot_ns.saturating_sub(*t) < 10_000_000_000);
         let mut actor = Actor {
             puid: puid(&self.boot_id, hdr.pid, hdr.start_boot_ns),
             pid: hdr.pid,
@@ -521,6 +534,30 @@ impl Decoder {
                     argv.pop();
                 }
                 let mut truncated = hdr.flags & flags::TRUNCATED != 0;
+                if truncated {
+                    // The kernel sent the rest of the arguments as chunks just before this record.
+                    let chunks = self.argv_chunks.remove(&(hdr.pid, hdr.start_boot_ns));
+                    if let Some((_, mut parts)) = chunks {
+                        parts.sort_by_key(|(i, _)| *i);
+                        let mut all = argv_bytes.to_vec();
+                        for (want, (i, data)) in (1u32..).zip(parts) {
+                            if i != want {
+                                break; // a gap: keep what is contiguous
+                            }
+                            all.extend_from_slice(&data);
+                        }
+                        let complete = all.len() as u32 >= b.argv_total;
+                        let mut v: Vec<OsBytes> = all
+                            .split(|&c| c == 0)
+                            .map(|a| OsBytes(a.to_vec()))
+                            .collect();
+                        if all.last() == Some(&0) {
+                            v.pop();
+                        }
+                        argv = v;
+                        truncated = !complete;
+                    }
+                }
                 if truncated {
                     // The kernel copies at most ARGV_CAP bytes; the rest is still in the
                     // process's memory, so read the full command line back from /proc.
@@ -624,6 +661,18 @@ impl Decoder {
                 } else {
                     Body::ModuleUnload(m)
                 }
+            }
+            kind::PROC_ARGV => {
+                let b = ArgvChunk::parse(body).ok_or(DecodeError::Short)?;
+                if self.argv_chunks.len() > 4096 {
+                    self.argv_chunks.clear();
+                }
+                let e = self
+                    .argv_chunks
+                    .entry((hdr.pid, hdr.start_boot_ns))
+                    .or_insert_with(|| (hdr.boot_ns, Vec::new()));
+                e.1.push((b.idx, b.bytes().to_vec()));
+                return Err(DecodeError::Continuation);
             }
             kind::NET_UDP => {
                 let b = UdpBody::parse(body).ok_or(DecodeError::Short)?;
@@ -877,6 +926,75 @@ mod tests {
         assert!(x.argv_truncated);
         assert_eq!(x.argv.len(), 1);
         assert_eq!(x.argv[0].0.len(), ARGV_CAP);
+    }
+
+    fn chunk_record(idx: u32, data: &[u8], boot_ns: u64) -> Vec<u8> {
+        let mut body = vec![0u8; ArgvChunk::SIZE];
+        body[0..4].copy_from_slice(&idx.to_ne_bytes());
+        body[4..8].copy_from_slice(&(data.len() as u32).to_ne_bytes());
+        body[8..8 + data.len()].copy_from_slice(data);
+        let mut h = hdr(kind::PROC_ARGV, RawHdr::SIZE + body.len());
+        h.boot_ns = boot_ns;
+        let mut rec = h.to_bytes().to_vec();
+        rec.extend(body);
+        rec
+    }
+
+    #[test]
+    fn long_arguments_are_reassembled_from_chunks_that_precede_the_exec() {
+        // argv = "x" + a 7000-byte argument: 3072 bytes in the exec record, then two chunks.
+        let mut all = b"x\0".to_vec();
+        all.extend(std::iter::repeat_n(b'a', 7000));
+        all.push(0);
+        let total = all.len() as u32;
+        let first = &all[..ARGV_CAP];
+        let (c1, c2) = (&all[ARGV_CAP..2 * ARGV_CAP], &all[2 * ARGV_CAP..]);
+
+        // Chunks arrive first (and out of order); each yields "not an event".
+        let mut d = dec();
+        assert_eq!(
+            d.decode(&chunk_record(2, c2, 4_000), &|_| None)
+                .unwrap_err(),
+            DecodeError::Continuation
+        );
+        assert_eq!(
+            d.decode(&chunk_record(1, c1, 4_001), &|_| None)
+                .unwrap_err(),
+            DecodeError::Continuation
+        );
+        let rec = exec_record(b"/bin/x", first, total, flags::TRUNCATED, b"");
+        let Body::ProcExec(x) = d.decode(&rec, &|_| None).unwrap().body else {
+            panic!()
+        };
+        assert!(!x.argv_truncated, "all bytes arrived");
+        assert_eq!(x.argv.len(), 2);
+        assert_eq!(x.argv[1].0.len(), 7000);
+        assert!(x.argv[1].0.iter().all(|&b| b == b'a'));
+
+        // A missing middle chunk keeps what is contiguous and says the rest is missing.
+        let mut d = dec();
+        d.decode(&chunk_record(2, c2, 4_000), &|_| None)
+            .unwrap_err();
+        let rec = exec_record(b"/bin/x", first, total, flags::TRUNCATED, b"");
+        let Body::ProcExec(x) = d.decode(&rec, &|_| None).unwrap().body else {
+            panic!()
+        };
+        assert!(x.argv_truncated);
+        assert_eq!(
+            x.argv[1].0.len(),
+            ARGV_CAP - 2,
+            "only the first record's share"
+        );
+
+        // Chunks whose exec never arrives are dropped once stale, not kept forever.
+        let mut d = dec();
+        d.decode(&chunk_record(1, c1, 4_000), &|_| None)
+            .unwrap_err();
+        let mut later = exec_record(b"/bin/y", b"y\0", 2, 0, b"");
+        // Make this record 11 s later than the orphaned chunk.
+        later[8..16].copy_from_slice(&11_000_004_000u64.to_ne_bytes());
+        d.decode(&later, &|_| None).unwrap();
+        assert!(d.argv_chunks.is_empty());
     }
 
     #[test]

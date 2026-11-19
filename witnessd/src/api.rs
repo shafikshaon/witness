@@ -565,6 +565,7 @@ fn route(sh: &Shared, peer: &Peer, r: &Request) -> Res {
             f.ses = Some(ses.parse().map_err(|_| bad("ses must be a number"))?);
             list(sh, &f)
         }
+        ("GET", ["v1", "processes", "tree"]) => process_tree(sh, r),
         ("GET", ["v1", "processes", puid]) => {
             let mut f = filter_of(r)?;
             f.puid = Some((*puid).into());
@@ -594,6 +595,96 @@ fn route(sh: &Shared, peer: &Peer, r: &Request) -> Res {
         )),
         _ => Err((404, "not found", "the API lives under /v1".into())),
     }
+}
+
+/// Flat process nodes with parent links, built from `proc_exec`/`proc_exit` events (oldest
+/// first). A process is attached to the live process that had its `ppid` when it started, so a
+/// reused pid never inherits an unrelated child. Re-execs keep one node with the latest command.
+pub fn process_nodes(events: &[Value]) -> Vec<Value> {
+    use std::collections::HashMap;
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let mut order: Vec<String> = Vec::new();
+    let mut nodes: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
+    let mut live: HashMap<u64, String> = HashMap::new();
+    for e in events {
+        let a = &e["actor"];
+        let puid = text(&a["puid"]);
+        let wall = e["wall_ns"].as_u64().unwrap_or(0);
+        if e["type"] == "proc_exit" {
+            if let Some(n) = nodes.get_mut(&puid) {
+                n.insert("exited_ns".into(), json!(wall));
+                if let Some(pid) = a["pid"].as_u64() {
+                    live.remove(&pid);
+                }
+            }
+            continue;
+        }
+        let cmd = e["data"]["argv"]
+            .as_array()
+            .map(|v| {
+                v.iter()
+                    .map(|x| x.as_str().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        if let Some(n) = nodes.get_mut(&puid) {
+            n.insert("cmd".into(), json!(cmd));
+            n.insert("comm".into(), a["comm"].clone());
+            continue;
+        }
+        let (pid, ppid) = (
+            a["pid"].as_u64().unwrap_or(0),
+            a["ppid"].as_u64().unwrap_or(0),
+        );
+        let parent = live.get(&ppid).cloned();
+        let mut n = serde_json::Map::new();
+        n.insert("puid".into(), json!(puid));
+        n.insert("pid".into(), json!(pid));
+        n.insert("ppid".into(), json!(ppid));
+        n.insert(
+            "parent_puid".into(),
+            parent.map(Value::from).unwrap_or(Value::Null),
+        );
+        n.insert("comm".into(), a["comm"].clone());
+        n.insert("cmd".into(), json!(cmd));
+        n.insert("user".into(), a["user"].clone());
+        n.insert("started_ns".into(), json!(wall));
+        n.insert("exited_ns".into(), Value::Null);
+        live.insert(pid, puid.clone());
+        order.push(puid.clone());
+        nodes.insert(puid, n);
+    }
+    order
+        .into_iter()
+        .filter_map(|p| nodes.remove(&p).map(Value::Object))
+        .collect()
+}
+
+/// `GET /v1/processes/tree?from=&to=&limit=`: process nodes with `parent_puid` links over a
+/// time range (default: the most recent 2000 process events).
+fn process_tree(sh: &Shared, r: &Request) -> Res {
+    let ix = open_index(sh)?;
+    let mut f = filter_of(r)?;
+    f.kinds = vec!["proc_exec".into(), "proc_exit".into()];
+    f.limit = 1000;
+    let want = num::<usize>(r, "limit")?.unwrap_or(2000).clamp(1, 20_000);
+    let mut events: Vec<Value> = Vec::new();
+    while events.len() < want {
+        let page = rows_json(sh, &ix, &f)?;
+        let got = page["events"].as_array().cloned().unwrap_or_default();
+        if got.is_empty() {
+            break;
+        }
+        events.extend(got);
+        match page["next_cursor"].as_u64() {
+            Some(c) => f.before_seq = Some(c),
+            None => break,
+        }
+    }
+    events.truncate(want);
+    events.reverse(); // newest-first pages → oldest first
+    ok(json!({"nodes": process_nodes(&events), "events_used": events.len()}))
 }
 
 fn status(sh: &Shared, peer: &Peer) -> Res {
@@ -891,6 +982,8 @@ fn bundle(sh: &Shared, r: &Request) -> Res {
         to_seq: num(r, "to_seq")?,
         tool_version: env!("CARGO_PKG_VERSION").into(),
         exported_wall_ns: now_ns(),
+        // Never signed here: a signing key must not live on the host being investigated.
+        sign_seed: None,
     };
     let tar = witness_store::bundle::build(&[segs(sh)], &sh.cfg.data_dir, &opts)
         .map_err(|e| bad(e.to_string()))?;
@@ -1142,5 +1235,35 @@ mod tests {
         let err = Api::start(cfg(precious.clone(), t.path())).err().unwrap();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read_to_string(&precious).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn process_nodes_link_children_to_the_live_parent_and_survive_pid_reuse() {
+        let ex = |seq: u64, puid: &str, pid: u64, ppid: u64, cmd: &str| json!({"seq":seq,"type":"proc_exec","wall_ns":seq*10,"actor":{"puid":puid,"pid":pid,"ppid":ppid,"comm":cmd,"user":"u"},"data":{"argv":[cmd,"-x"]}});
+        let exit = |seq: u64, puid: &str, pid: u64| json!({"seq":seq,"type":"proc_exit","wall_ns":seq*10,"actor":{"puid":puid,"pid":pid}});
+        let ev = vec![
+            ex(1, "a", 10, 1, "bash"),
+            ex(2, "b", 20, 10, "ls"),
+            exit(3, "b", 20),
+            // pid 20 is reused by a process whose parent is 1, not 10.
+            ex(4, "c", 20, 1, "later"),
+            ex(5, "b", 20, 10, "ls-again"),
+        ];
+        let n = process_nodes(&ev);
+        let by = |p: &str| n.iter().find(|x| x["puid"] == p).unwrap().clone();
+        assert_eq!(by("a")["parent_puid"], Value::Null);
+        assert_eq!(by("b")["parent_puid"], "a");
+        assert_eq!(by("b")["exited_ns"], 30);
+        assert_eq!(
+            by("c")["parent_puid"],
+            Value::Null,
+            "a reused pid does not inherit"
+        );
+        assert_eq!(
+            by("b")["cmd"],
+            "ls-again -x",
+            "a re-exec updates the command"
+        );
+        assert_eq!(n.len(), 3);
     }
 }

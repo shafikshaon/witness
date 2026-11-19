@@ -142,7 +142,22 @@ enum Cmd {
         /// Output file.
         #[arg(long, short)]
         out: PathBuf,
+        /// Sign the manifest with this Ed25519 key (a file holding 64 hex digits; see `keygen`).
+        /// Keep the key off the monitored host.
+        #[arg(long)]
+        sign_key: Option<PathBuf>,
     },
+    /// Check a bundle on its own: file hashes, the hash chain over its records and, if signed,
+    /// the signature. `--pubkey` requires that exact signer.
+    BundleVerify {
+        bundle: PathBuf,
+        /// Hex public key the bundle must be signed by.
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
+    /// Create an Ed25519 signing key for bundles: writes the secret to FILE (mode 0600) and
+    /// prints the public key to give to whoever will verify.
+    Keygen { file: PathBuf },
     /// Check rules and try them against stored evidence.
     Rules {
         #[command(subcommand)]
@@ -250,6 +265,7 @@ fn run() -> Result<ExitCode> {
             from_seq,
             to_seq,
             out,
+            sign_key,
         } => {
             let mut dirs = vec![dir.join("segments")];
             dirs.extend(include.iter().map(|d| d.join("segments")));
@@ -261,6 +277,7 @@ fn run() -> Result<ExitCode> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0),
+                sign_seed: sign_key.as_deref().map(read_seed).transpose()?,
             };
             let tar = witness_store::bundle::build(&dirs, &dir, &opts)
                 .with_context(|| format!("bundling {}", dir.display()))?;
@@ -270,6 +287,54 @@ fn run() -> Result<ExitCode> {
                 out.display(),
                 tar.len(),
                 out.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::BundleVerify { bundle, pubkey } => {
+            let tar = fs::read(&bundle).with_context(|| format!("reading {}", bundle.display()))?;
+            match witness_store::bundle::verify_bundle(&tar, pubkey.as_deref()) {
+                Ok(c) => {
+                    println!(
+                        "OK: {} records (#{}..#{}) verify{}",
+                        c.records,
+                        c.first_seq,
+                        c.last_seq,
+                        match &c.signer {
+                            Some(k) => format!(", signed by {k}"),
+                            None => ", not signed".to_string(),
+                        }
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(e) => {
+                    eprintln!("FAILED: {e}");
+                    Ok(ExitCode::from(1))
+                }
+            }
+        }
+        Cmd::Keygen { file } => {
+            use std::io::{Read, Write};
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut seed = [0u8; 32];
+            fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut seed))
+                .context("reading random bytes from /dev/urandom")?;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&file)
+                .with_context(|| {
+                    format!("creating {} (it must not already exist)", file.display())
+                })?;
+            writeln!(f, "{}", to_hex(&seed)).context("writing the key")?;
+            println!(
+                "secret key written to {} (keep it off the monitored host)",
+                file.display()
+            );
+            println!(
+                "public key: {}",
+                witness_store::bundle::public_key_hex(&seed)
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -541,6 +606,13 @@ fn cmd_show(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Reads an Ed25519 seed: 64 hex digits in a file.
+fn read_seed(path: &Path) -> Result<[u8; 32]> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    chain::from_hex(text.trim().as_bytes())
+        .with_context(|| format!("{} must hold 64 hex digits", path.display()))
 }
 
 fn cmd_rules(cmd: RulesCmd) -> Result<ExitCode> {

@@ -44,6 +44,9 @@ pub struct BundleOptions {
     pub tool_version: String,
     /// Export time (wall clock ns), recorded in the manifest.
     pub exported_wall_ns: u64,
+    /// Ed25519 seed: when set, `manifest.json` is signed (`manifest.sig`). The manifest lists
+    /// the SHA-256 of every other file, so one signature covers the whole bundle.
+    pub sign_seed: Option<[u8; 32]>,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -246,19 +249,173 @@ pub fn build(dirs: &[PathBuf], data_dir: &Path, o: &BundleOptions) -> Result<Vec
         "store_head": {"seq": head_seq, "hash": hex(&head_hash), "first_record_seq": first_seen},
         "files": files.iter().map(|(n, d)| json!({"name": n, "bytes": d.len(), "sha256": hex(&Sha256::digest(d))})).collect::<Vec<_>>(),
         "note": "events.ndjson holds the stored lines verbatim. To check them: start from chain-proof.json prev_hash and apply the algorithm line by line; each result must equal that line's h.",
-        "signature": null,
+        "signature": o.sign_seed.map(|seed| json!({
+            "algorithm": "ed25519",
+            "file": "manifest.sig",
+            "public_key": public_key_hex(&seed),
+        })),
     });
     let mtime = o.exported_wall_ns / 1_000_000_000;
     let mut tar = Vec::new();
     for (n, d) in &files {
         tar_entry(&mut tar, n, d, mtime)?;
     }
-    tar_entry(
-        &mut tar,
-        "manifest.json",
-        &serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
-        mtime,
-    )?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap_or_default();
+    tar_entry(&mut tar, "manifest.json", &manifest_bytes, mtime)?;
+    if let Some(seed) = o.sign_seed {
+        use ed25519_dalek::Signer;
+        let sig = ed25519_dalek::SigningKey::from_bytes(&seed).sign(&manifest_bytes);
+        let line = format!("{}\n", hex(&sig.to_bytes()));
+        tar_entry(&mut tar, "manifest.sig", line.as_bytes(), mtime)?;
+    }
     tar.resize(tar.len() + 1024, 0); // end-of-archive marker
     Ok(tar)
+}
+
+/// The public key (hex) for an Ed25519 seed.
+pub fn public_key_hex(seed: &[u8; 32]) -> String {
+    hex(ed25519_dalek::SigningKey::from_bytes(seed)
+        .verifying_key()
+        .as_bytes())
+}
+
+/// What [`verify_bundle`] established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleCheck {
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub records: u64,
+    /// The hex public key that signed the manifest, if it is signed.
+    pub signer: Option<String>,
+}
+
+fn parse_hex(s: &str, n: usize) -> Option<Vec<u8>> {
+    let s = s.trim();
+    (s.len() == n * 2 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| {
+        (0..n)
+            .filter_map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
+            .collect()
+    })
+}
+
+/// Reads the regular files of a ustar archive.
+fn tar_files(tar: &[u8]) -> Result<HashMap<String, Vec<u8>>, BundleError> {
+    let mut out = HashMap::new();
+    let mut at = 0;
+    while at + 512 <= tar.len() {
+        let h = &tar[at..at + 512];
+        if h.iter().all(|&b| b == 0) {
+            break;
+        }
+        let name_end = h[..100].iter().position(|&b| b == 0).unwrap_or(100);
+        let name = String::from_utf8_lossy(&h[..name_end]).into_owned();
+        let size = std::str::from_utf8(&h[124..135])
+            .ok()
+            .and_then(|s| usize::from_str_radix(s.trim_matches(|c| c == '\0' || c == ' '), 8).ok())
+            .ok_or_else(|| BundleError::Invalid(format!("bad size in tar entry {name}")))?;
+        let start = at + 512;
+        let data = tar
+            .get(start..start + size)
+            .ok_or_else(|| BundleError::Invalid(format!("tar entry {name} is truncated")))?;
+        out.insert(name, data.to_vec());
+        at = start + size.div_ceil(512) * 512;
+    }
+    Ok(out)
+}
+
+/// Checks a bundle on its own: manifest hashes, the hash chain over the included lines from the
+/// recorded starting hash, and the signature if there is one. `expect_pubkey` (hex) requires
+/// that exact signer; a bundle that is unsigned then fails.
+pub fn verify_bundle(tar: &[u8], expect_pubkey: Option<&str>) -> Result<BundleCheck, BundleError> {
+    let bad = |m: String| BundleError::Invalid(m);
+    let files = tar_files(tar)?;
+    let get = |n: &str| {
+        files
+            .get(n)
+            .ok_or_else(|| bad(format!("the bundle has no {n}")))
+    };
+    let manifest_bytes = get("manifest.json")?;
+    let manifest: Value =
+        serde_json::from_slice(manifest_bytes).map_err(|e| bad(format!("manifest.json: {e}")))?;
+
+    for f in manifest["files"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let name = f["name"].as_str().unwrap_or("");
+        let want = f["sha256"].as_str().unwrap_or("");
+        if hex(&Sha256::digest(get(name)?)) != want {
+            return Err(bad(format!(
+                "{name} does not match its hash in the manifest"
+            )));
+        }
+    }
+
+    let signer = match manifest["signature"].as_object() {
+        Some(sig) => {
+            use ed25519_dalek::Verifier;
+            let pk_hex = sig.get("public_key").and_then(Value::as_str).unwrap_or("");
+            let pk: [u8; 32] = parse_hex(pk_hex, 32)
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| bad("bad public key in the manifest".into()))?;
+            let raw = String::from_utf8_lossy(get("manifest.sig")?).into_owned();
+            let sig_bytes: [u8; 64] = parse_hex(&raw, 64)
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| bad("bad manifest.sig".into()))?;
+            let key = ed25519_dalek::VerifyingKey::from_bytes(&pk)
+                .map_err(|e| bad(format!("public key: {e}")))?;
+            key.verify(
+                manifest_bytes,
+                &ed25519_dalek::Signature::from_bytes(&sig_bytes),
+            )
+            .map_err(|_| bad("the signature does not match the manifest".into()))?;
+            Some(pk_hex.to_ascii_lowercase())
+        }
+        None => None,
+    };
+    if let Some(want) = expect_pubkey {
+        match &signer {
+            Some(s) if s.eq_ignore_ascii_case(want.trim()) => {}
+            Some(s) => return Err(bad(format!("signed by {s}, not by the expected key"))),
+            None => {
+                return Err(bad(
+                    "the bundle is not signed, but a signer was required".into()
+                ))
+            }
+        }
+    }
+
+    let proof: Value = serde_json::from_slice(get("chain-proof.json")?)
+        .map_err(|e| bad(format!("chain-proof.json: {e}")))?;
+    let mut prev: Hash = parse_hex(proof["prev_hash"].as_str().unwrap_or(""), 32)
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| bad("bad prev_hash".into()))?;
+    let events = String::from_utf8_lossy(get("events.ndjson")?).into_owned();
+    let mut n = 0u64;
+    for line in events.lines() {
+        let l = line.as_bytes();
+        if l.len() <= 72 {
+            return Err(bad(format!("record {} is too short", n + 1)));
+        }
+        let (body, recorded) =
+            chain::decode_line(l).map_err(|e| bad(format!("record {}: {e}", n + 1)))?;
+        prev = chain::link(&prev, &body);
+        if prev != recorded {
+            return Err(bad(format!(
+                "record {} does not follow from the one before it",
+                n + 1
+            )));
+        }
+        n += 1;
+    }
+    if proof["last_hash"].as_str() != Some(&hex(&prev)) || proof["records"].as_u64() != Some(n) {
+        return Err(bad("chain-proof.json does not match events.ndjson".into()));
+    }
+    Ok(BundleCheck {
+        first_seq: proof["first_seq"].as_u64().unwrap_or(0),
+        last_seq: proof["last_seq"].as_u64().unwrap_or(0),
+        records: n,
+        signer,
+    })
 }

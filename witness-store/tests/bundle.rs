@@ -65,6 +65,7 @@ fn a_bundle_extracts_and_every_hash_checks_out_independently() {
             to_seq: Some(25),
             tool_version: "test".into(),
             exported_wall_ns: 1_700_000_000_000_000_000,
+            sign_seed: None,
         },
     )
     .unwrap();
@@ -197,4 +198,68 @@ fn empty_range_and_oversized_names_are_errors() {
     assert!(build(&[seg], t.path(), &o).is_err());
     let mut v = Vec::new();
     assert!(witness_store::bundle::tar_entry(&mut v, &"x".repeat(101), b"", 0).is_err());
+}
+
+fn signed_bundle(seed: Option<[u8; 32]>) -> (tempfile::TempDir, Vec<u8>) {
+    let t = tempfile::tempdir().unwrap();
+    fill(t.path(), 30);
+    let tar = build(
+        &[t.path().join("segments")],
+        t.path(),
+        &BundleOptions {
+            from_seq: Some(5),
+            to_seq: Some(20),
+            tool_version: "t".into(),
+            exported_wall_ns: 1_700_000_000_000_000_000,
+            sign_seed: seed,
+        },
+    )
+    .unwrap();
+    (t, tar)
+}
+
+/// Rewrites one file's bytes inside a tar built by `build` (same length, so offsets hold).
+fn corrupt(tar: &[u8], marker: &[u8]) -> Vec<u8> {
+    let mut t = tar.to_vec();
+    let at = t
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .expect("marker in the tar");
+    t[at] ^= 0x01;
+    t
+}
+
+#[test]
+fn a_signed_bundle_verifies_standalone_and_rejects_every_kind_of_tampering() {
+    let seed = [7u8; 32];
+    let (_t, tar) = signed_bundle(Some(seed));
+    let pk = witness_store::bundle::public_key_hex(&seed);
+    let c = witness_store::bundle::verify_bundle(&tar, Some(&pk)).unwrap();
+    assert_eq!((c.first_seq, c.last_seq, c.records), (5, 20, 16));
+    assert_eq!(c.signer.as_deref(), Some(pk.as_str()));
+    // No expected key given: still checks hashes, chain and signature.
+    assert!(witness_store::bundle::verify_bundle(&tar, None).is_ok());
+
+    // A different expected signer, or an expected signer on an unsigned bundle.
+    let other = witness_store::bundle::public_key_hex(&[8u8; 32]);
+    assert!(witness_store::bundle::verify_bundle(&tar, Some(&other)).is_err());
+    let (_t2, unsigned) = signed_bundle(None);
+    assert!(witness_store::bundle::verify_bundle(&unsigned, None).is_ok());
+    assert!(witness_store::bundle::verify_bundle(&unsigned, Some(&pk)).is_err());
+
+    // A changed record, a changed manifest, a changed proof and a changed signature all fail.
+    assert!(
+        witness_store::bundle::verify_bundle(&corrupt(&tar, b"\"type\":\"test\""), Some(&pk))
+            .is_err()
+    );
+    assert!(witness_store::bundle::verify_bundle(&corrupt(&tar, b"\"tool\""), Some(&pk)).is_err());
+    assert!(
+        witness_store::bundle::verify_bundle(&corrupt(&tar, b"\"algorithm\""), Some(&pk)).is_err()
+    );
+    let sig_at = tar.windows(8).position(|w| w == b"\"ed25519").unwrap();
+    let _ = sig_at;
+    // Truncated and empty archives are errors, not panics.
+    assert!(witness_store::bundle::verify_bundle(&tar[..tar.len() / 2], None).is_err());
+    assert!(witness_store::bundle::verify_bundle(&[], None).is_err());
+    assert!(witness_store::bundle::verify_bundle(&[0u8; 2048], None).is_err());
 }

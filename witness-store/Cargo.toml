@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 workspace = true
 
 [dependencies]
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["std"] }
 getrandom = "=0.4.3"
 hmac = "=0.13.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

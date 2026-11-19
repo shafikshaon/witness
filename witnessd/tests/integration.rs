@@ -2348,7 +2348,8 @@ mod load {
         let dropped: u64 = ev
             .iter()
             .filter(|e| e["type"] == "capture_drop")
-            .map(|e| e["data"]["dropped"].as_u64().unwrap_or(0))
+            // `dropped` is `[p0, p1, p2, p3]`: execs are P0, the first class.
+            .map(|e| e["data"]["dropped"][0].as_u64().unwrap_or(0))
             .sum();
         let lost = done.saturating_sub(seen);
         eprintln!(

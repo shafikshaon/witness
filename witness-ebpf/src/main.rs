@@ -22,7 +22,7 @@ use witness_common::{
     nop, modop, ArgvEvent, ExecExtraEvent, ConnInfo, MAX_ARGV_CHUNKS, FlowKey, FlowVal, FLOWS_MAX, UdpBody, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
     DNS_RESPONSE, RECV_MAX, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, ModuleEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
-    MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
+    PATH_CAP, PATH_LEVELS, PATH_LEVELS_TWO, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
 };
 
 /// P0 events: process lifecycle. Sized by the loader (`map_max_entries`).
@@ -311,6 +311,7 @@ unsafe fn emit_exec_extra(task: *const u8, o: &Offsets) {
             mnt,
             dentry,
             o,
+            PATH_LEVELS,
         );
         (*b).path_len = len;
         (*b).trunc = trunc;
@@ -549,6 +550,7 @@ unsafe fn build_path(
     mnt: *const u8,
     dentry: *const u8,
     o: &Offsets,
+    levels: usize,
 ) -> (u32, u32) {
     if EXP == 1 {
         return (0, 0);
@@ -558,7 +560,7 @@ unsafe fn build_path(
     } else if EXP == 3 {
         4
     } else {
-        MAX_COMPONENTS
+        levels
     };
     let mut off: usize = SCRATCH_LEN;
     let mut wide = 0u32;
@@ -703,6 +705,7 @@ unsafe fn emit_file(
         mnt,
         dentry,
         &o,
+        PATH_LEVELS,
     );
     (*b).path_len = len;
     (*b).trunc = trunc;
@@ -770,6 +773,7 @@ unsafe fn emit_two(
             old_mnt,
             old_dentry,
             &o,
+            PATH_LEVELS_TWO,
         );
         (*b).old_len = len;
         trunc |= t;
@@ -780,6 +784,7 @@ unsafe fn emit_two(
         new_mnt,
         new_dentry,
         &o,
+        PATH_LEVELS_TWO,
     );
     (*b).new_len = len;
     (*b).trunc = trunc | t;

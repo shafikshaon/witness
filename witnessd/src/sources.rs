@@ -32,8 +32,10 @@ pub struct Roots {
     pub group: PathBuf,
     pub shadow: PathBuf,
     pub dpkg_log: PathBuf,
-    /// dnf's transaction log (Fedora/RHEL family).
+    /// dnf 4's transaction log (older Fedora, RHEL 9; format not verified on a real system).
     pub dnf_log: PathBuf,
+    /// dnf 5's log (Fedora 41 and later; format verified on Fedora 45).
+    pub dnf5_log: PathBuf,
     pub poll: Duration,
 }
 
@@ -45,6 +47,7 @@ impl Default for Roots {
             shadow: "/etc/shadow".into(),
             dpkg_log: "/var/log/dpkg.log".into(),
             dnf_log: "/var/log/dnf.rpm.log".into(),
+            dnf5_log: "/var/log/dnf5.log".into(),
             poll: Duration::from_secs(1),
         }
     }
@@ -150,13 +153,22 @@ impl Sources {
             threads.push(std::thread::spawn(move || account_loop(tx, stop, r)));
         }
         {
-            for (path, parse) in [
+            type Parser = Box<dyn FnMut(&str) -> Vec<Body> + Send>;
+            let parsers: [(PathBuf, Parser); 3] = [
                 (
                     roots.dpkg_log.clone(),
-                    crate::pkglog::parse_dpkg as fn(&str) -> Option<Body>,
+                    Box::new(|l| crate::pkglog::parse_dpkg(l).into_iter().collect()),
                 ),
-                (roots.dnf_log.clone(), crate::pkglog::parse_dnf),
-            ] {
+                (
+                    roots.dnf_log.clone(),
+                    Box::new(|l| crate::pkglog::parse_dnf(l).into_iter().collect()),
+                ),
+                (roots.dnf5_log.clone(), {
+                    let mut p = crate::pkglog::Dnf5Parser::default();
+                    Box::new(move |l| p.feed(l))
+                }),
+            ];
+            for (path, parse) in parsers {
                 let (tx, stop, poll) = (tx.clone(), stop.clone(), roots.poll);
                 threads.push(std::thread::spawn(move || {
                     tail_log_loop(tx, stop, path, poll, parse)
@@ -434,7 +446,7 @@ fn tail_log_loop(
     stop: Arc<AtomicBool>,
     path: PathBuf,
     poll: Duration,
-    parse: fn(&str) -> Option<Body>,
+    mut parse: impl FnMut(&str) -> Vec<Body>,
 ) {
     let mut pos = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let mut ino = std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0);
@@ -466,7 +478,7 @@ fn tail_log_loop(
         };
         pos += end as u64 + 1;
         for line in String::from_utf8_lossy(&buf[..end]).lines() {
-            if let Some(body) = parse(line) {
+            for body in parse(line) {
                 let p = Pending {
                     src: Source::Daemon,
                     body,
@@ -714,6 +726,7 @@ mod tests {
             shadow: d.path().join("shadow"),
             dpkg_log: d.path().join("dpkg.log"),
             dnf_log: d.path().join("dnf.rpm.log"),
+            dnf5_log: d.path().join("dnf5.log"),
             poll: Duration::from_millis(30),
         };
         std::fs::write(

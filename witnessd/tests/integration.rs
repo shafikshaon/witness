@@ -2204,6 +2204,75 @@ mod features {
     }
 
     #[test]
+    #[ignore = "needs root, a package manager and network access to its repository"]
+    fn installing_and_removing_a_package_is_recorded_from_the_real_package_log() {
+        let have = |c: &str| {
+            Command::new("sh")
+                .args(["-c", &format!("command -v {c} >/dev/null")])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let (install, remove, manager) = if have("dnf") {
+            ("dnf -y -q install hello", "dnf -y -q remove hello", "dnf")
+        } else if have("apt-get") {
+            (
+                "DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq hello",
+                "DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 remove -y -qq hello",
+                "dpkg",
+            )
+        } else {
+            eprintln!("skipped: no supported package manager");
+            return;
+        };
+        let sh = |c: &str| {
+            Command::new("sh")
+                .args(["-c", c])
+                .status()
+                .unwrap()
+                .success()
+        };
+        // Start from a known state: hello not installed.
+        sh(remove);
+        let t = tempfile::tempdir().unwrap();
+        let (mut child, _err) = spawn(t.path(), 70);
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(sh(install), "could not install hello (no network?)");
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(sh(remove));
+        std::thread::sleep(Duration::from_secs(4));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let ev = records(t.path());
+        let actions: Vec<String> = ev
+            .iter()
+            .filter(|e| e["type"] == "package_change" && e["data"]["name"] == "hello")
+            .map(|e| e["data"]["action"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(
+            actions.iter().any(|a| a == "install"),
+            "{manager}: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| a == "remove"),
+            "{manager}: {actions:?}"
+        );
+        let first = ev
+            .iter()
+            .find(|e| {
+                e["type"] == "package_change"
+                    && e["data"]["name"] == "hello"
+                    && e["data"]["action"] == "install"
+            })
+            .unwrap();
+        assert_eq!(first["data"]["manager"], manager);
+        assert!(first["data"]["version"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()));
+    }
+
+    #[test]
     #[ignore = "needs root and a kernel with BTF"]
     fn the_first_start_on_a_boot_records_the_boot() {
         let t = tempfile::tempdir().unwrap();

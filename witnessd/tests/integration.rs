@@ -1972,3 +1972,236 @@ mod net2 {
         assert_eq!(resp["data"]["answers"][0]["data"], "10.1.2.3");
     }
 }
+
+mod features {
+    use std::fs;
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use super::store_mode::{records, spawn, spawn_cfg, verify};
+
+    /// A config whose rules directory holds the named rules from the pack.
+    fn cfg_with_rules(t: &Path, rules: &[&str]) -> PathBuf {
+        let dir = t.join("rules.d");
+        fs::create_dir_all(&dir).unwrap();
+        let pack = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rules");
+        for r in rules {
+            fs::copy(pack.join(r), dir.join(r)).unwrap();
+        }
+        let cfg = t.join("config.toml");
+        fs::write(&cfg, format!("[rules]\ndir = \"{}\"\n", dir.display())).unwrap();
+        cfg
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn exec_records_the_whole_argv_cwd_and_stdio_and_a_shell_on_a_socket_alerts() {
+        let t = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_rules(t.path(), &["reverse-shell-stdio.yml"]);
+        let data = t.path().join("data");
+        let cwd = fs::canonicalize(t.path()).unwrap();
+        let (mut child, _err) = spawn_cfg(&data, 14, &cfg);
+
+        // 1. A command line far over the kernel's 3 KiB capture limit.
+        let long = format!("witness-long-arg-{}", "x".repeat(10_000));
+        Command::new("/bin/true")
+            .arg(&long)
+            .current_dir(&cwd)
+            .status()
+            .unwrap();
+
+        // 2. A shell whose stdin and stdout are a socket: the shape of a reverse shell.
+        let (a, _b) = UnixStream::pair().unwrap();
+        let (a2, a3) = (a.try_clone().unwrap(), a.try_clone().unwrap());
+        Command::new("/bin/sh")
+            .args(["-c", "exit 0", "witness-sock-shell"])
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(a)))
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(a2)))
+            .stderr(Stdio::from(std::os::fd::OwnedFd::from(a3)))
+            .status()
+            .unwrap();
+        // 3. An ordinary shell on pipes does not alert.
+        Command::new("/bin/sh")
+            .args(["-c", "exit 0", "witness-pipe-shell"])
+            .output()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        let _ = child.wait();
+
+        let ev = records(&data);
+        verify(&data);
+        let exec_with = |needle: &str| {
+            ev.iter()
+                .find(|e| {
+                    e["type"] == "proc_exec" && e["data"]["argv"].to_string().contains(needle)
+                })
+                .unwrap_or_else(|| panic!("no exec containing {needle}"))
+        };
+        let e = exec_with("witness-long-arg-");
+        assert_eq!(
+            e["data"]["argv_truncated"], false,
+            "the whole command line was recovered"
+        );
+        let arg = e["data"]["argv"][1].as_str().unwrap();
+        assert_eq!(
+            arg.len(),
+            long.len(),
+            "no byte of the long argument was lost"
+        );
+        assert_eq!(e["data"]["cwd"], cwd.to_str().unwrap());
+
+        let sock = exec_with("witness-sock-shell");
+        assert_eq!(sock["data"]["stdio"][0], "socket");
+        assert_eq!(sock["data"]["stdio"][1], "socket");
+        let pipe = exec_with("witness-pipe-shell");
+        assert_eq!(pipe["data"]["stdio"][1], "pipe");
+
+        let alerts: Vec<_> = ev
+            .iter()
+            .filter(|e| {
+                e["type"] == "alert" && e["data"]["rule_id"] == "witness.exec.shell-on-socket"
+            })
+            .collect();
+        assert_eq!(
+            alerts.len(),
+            1,
+            "exactly the socket shell alerts: {alerts:?}"
+        );
+        let trig = alerts[0]["data"]["trigger_seqs"][0].as_u64().unwrap();
+        assert!(ev
+            .iter()
+            .any(|e| e["seq"] == trig
+                && e["data"]["argv"].to_string().contains("witness-sock-shell")));
+    }
+
+    #[test]
+    #[ignore = "needs root and systemd"]
+    fn enabling_disabling_and_masking_a_unit_are_recorded() {
+        let t = tempfile::tempdir().unwrap();
+        let unit = "witness-feature-test.service";
+        let path = format!("/etc/systemd/system/{unit}");
+        fs::write(&path, "[Unit]\nDescription=witness test\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n").unwrap();
+        let sh = |c: &str| {
+            Command::new("sh")
+                .args(["-c", c])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let (mut child, _err) = spawn(t.path(), 22);
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(sh(&format!("systemctl enable {unit} >/dev/null 2>&1")));
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(sh(&format!("systemctl disable {unit} >/dev/null 2>&1")));
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(sh(&format!("systemctl mask {unit} >/dev/null 2>&1")));
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(sh(&format!("systemctl unmask {unit} >/dev/null 2>&1")));
+        std::thread::sleep(Duration::from_secs(2));
+        let _ = fs::remove_file(&path);
+        let _ = child.wait();
+
+        let ev = records(t.path());
+        verify(t.path());
+        let actions: Vec<String> = ev
+            .iter()
+            .filter(|e| e["type"] == "service_change" && e["data"]["unit"] == unit)
+            .map(|e| e["data"]["action"].as_str().unwrap_or("").to_string())
+            .collect();
+        for want in ["enable", "disable", "mask", "unmask"] {
+            assert!(
+                actions.iter().any(|a| a == want),
+                "missing {want}; got {actions:?}"
+            );
+        }
+        // In the order they were done.
+        let pos = |w: &str| actions.iter().position(|a| a == w).unwrap();
+        assert!(
+            pos("enable") < pos("disable")
+                && pos("disable") < pos("mask")
+                && pos("mask") < pos("unmask")
+        );
+    }
+
+    #[test]
+    #[ignore = "needs root and a USB host controller"]
+    fn a_kernel_usb_add_event_is_recorded_once_and_an_unknown_device_alerts_once() {
+        let hub = Path::new("/sys/bus/usb/devices/usb1");
+        if !hub.exists() {
+            eprintln!("skipped: no USB host controller on this machine");
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_rules(t.path(), &["usb-unknown.yml"]);
+        let data = t.path().join("data");
+        let (mut child, _err) = spawn_cfg(&data, 12, &cfg);
+        // Ask the kernel to re-announce the device: a real `add` uevent for a real device
+        // (not a hot-plug). Twice, to see that a known device alerts only once.
+        for _ in 0..2 {
+            fs::write(hub.join("uevent"), "add").unwrap();
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        let _ = child.wait();
+        let read = |f: &str| {
+            fs::read_to_string(hub.join(f))
+                .map(|s| s.trim().to_string())
+                .ok()
+        };
+        let (vid, pid) = (read("idVendor").unwrap(), read("idProduct").unwrap());
+
+        let ev = records(&data);
+        verify(&data);
+        let usb: Vec<_> = ev
+            .iter()
+            .filter(|e| {
+                e["type"] == "usb_device"
+                    && e["data"]["action"] == "add"
+                    && e["data"]["vendor_id"]
+                        .as_str()
+                        .is_some_and(|v| v.trim_start_matches('0') == vid.trim_start_matches('0'))
+            })
+            .collect();
+        assert!(usb.len() >= 2, "both re-announcements recorded: {usb:?}");
+        assert_eq!(
+            usb[0]["data"]["product_id"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches('0'),
+            pid.trim_start_matches('0')
+        );
+        assert_eq!(
+            usb[0]["data"]["product"].as_str().map(str::to_string),
+            read("product")
+        );
+        let alerts = ev
+            .iter()
+            .filter(|e| {
+                e["type"] == "alert" && e["data"]["rule_id"] == "witness.device.usb-unknown"
+            })
+            .count();
+        assert_eq!(alerts, 1, "a device alerts the first time only");
+        // The learned set was saved for the next run.
+        let learned = fs::read_to_string(data.join("learned.json")).unwrap();
+        assert!(learned.contains("witness.device.usb-unknown"), "{learned}");
+    }
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn the_first_start_on_a_boot_records_the_boot() {
+        let t = tempfile::tempdir().unwrap();
+        let (mut child, _err) = spawn(t.path(), 6);
+        let _ = child.wait();
+        let ev = records(t.path());
+        let boot = ev
+            .iter()
+            .find(|e| e["type"] == "system_boot")
+            .expect("a system_boot record");
+        let uname =
+            String::from_utf8(Command::new("uname").arg("-r").output().unwrap().stdout).unwrap();
+        assert_eq!(boot["data"]["kernel"], uname.trim());
+        let cmdline = fs::read_to_string("/proc/cmdline").unwrap();
+        assert_eq!(boot["data"]["cmdline"], cmdline.trim());
+    }
+}

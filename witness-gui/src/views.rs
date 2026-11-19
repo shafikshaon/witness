@@ -963,9 +963,9 @@ fn IntegrityPage() -> Element {
                                 dt { "records" } dd { "{v[\"records\"]}" }
                                 dt { "segments" } dd { "{v[\"segments\"]}" }
                                 dt { "head" } dd { "#{v[\"head_seq\"]}  {text(v, &[\"head_hash\"])}" }
-                                dt { "seals" } dd { "{v[\"seals\"]}" }
-                                dt { "anchors checked" } dd { "{v[\"anchors_checked\"]}" }
-                                dt { "seal MACs" } dd { if v["macs_checked"] == true { "verified" } else { "not checked (needs the admin-held key: witness verify --key)" } }
+                                if !v["seals"].is_null() { dt { "seals" } dd { "{v[\"seals\"]}" } }
+                                if !v["anchors_checked"].is_null() { dt { "anchors checked" } dd { "{v[\"anchors_checked\"]}" } }
+                                if !v["macs_checked"].is_null() { dt { "seal MACs" } dd { if v["macs_checked"] == true { "verified" } else { "not checked (needs the admin-held key: witness verify --key)" } } }
                                 if v["partial_start"] == true { dt { "history" } dd { "starts after pruned or archived segments" } }
                                 if !v["broken"].is_null() { dt { "problem" } dd { "{v[\"broken\"]}" } }
                             }

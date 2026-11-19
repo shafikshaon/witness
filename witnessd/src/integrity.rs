@@ -61,6 +61,7 @@ impl Scheduler {
         let s = stop.clone();
         let thread = std::thread::spawn(move || {
             let mut wait = first_delay;
+            let mut first = true;
             loop {
                 let until = Instant::now() + wait;
                 while Instant::now() < until {
@@ -69,11 +70,8 @@ impl Scheduler {
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
-                let trigger = if wait == first_delay {
-                    "startup"
-                } else {
-                    "schedule"
-                };
+                let trigger = if first { "startup" } else { "schedule" };
+                first = false;
                 if tx.send(check(&seg_dir, trigger)).is_err() {
                     return;
                 }
@@ -159,6 +157,32 @@ mod tests {
         let c = check(&seg, "schedule");
         assert_eq!(c.state, "broken");
         assert!(c.problem.is_some());
+    }
+
+    #[test]
+    fn the_first_check_is_startup_and_later_ones_are_scheduled_even_with_equal_delays() {
+        let t = tempfile::tempdir().unwrap();
+        fill(t.path());
+        // First delay equals the interval: this used to label every check `startup`.
+        let s = Scheduler::start(
+            t.path().join("segments"),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
+        let mut got = Vec::new();
+        let until = Instant::now() + Duration::from_secs(10);
+        while got.len() < 3 && Instant::now() < until {
+            got.extend(s.drain());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        s.stop();
+        let triggers: Vec<&str> = got.iter().map(|c| c.trigger.as_str()).collect();
+        assert!(triggers.len() >= 3, "{triggers:?}");
+        assert_eq!(triggers[0], "startup");
+        assert!(
+            triggers[1..].iter().all(|t| *t == "schedule"),
+            "{triggers:?}"
+        );
     }
 
     #[test]

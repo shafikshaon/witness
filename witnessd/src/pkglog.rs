@@ -154,10 +154,33 @@ pub fn rpm_evr_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 pub struct Dnf5Parser {
     installed: Vec<(String, String)>,
     removed: Vec<(String, String)>,
+    /// When the last package callback arrived, for the idle flush.
+    last: Option<std::time::Instant>,
 }
+
+/// A transaction with no callback for this long is finished. (dnf5 writes `transaction stop`
+/// *before* the uninstall callbacks of a removal, so that line alone cannot end one.)
+const DNF5_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Dnf5Parser {
     pub fn feed(&mut self, line: &str) -> Vec<Body> {
+        self.feed_at(line, std::time::Instant::now())
+    }
+
+    /// Reports a transaction that has gone quiet. Call periodically, also when there are no
+    /// new lines.
+    pub fn idle(&mut self) -> Vec<Body> {
+        self.idle_at(std::time::Instant::now())
+    }
+
+    pub fn idle_at(&mut self, now: std::time::Instant) -> Vec<Body> {
+        match self.last {
+            Some(t) if now.duration_since(t) >= DNF5_IDLE => self.flush(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn feed_at(&mut self, line: &str, now: std::time::Instant) -> Vec<Body> {
         let Some((_, msg)) = line.split_once(" INFO RPM callback ") else {
             return Vec::new();
         };
@@ -168,11 +191,13 @@ impl Dnf5Parser {
         };
         if msg.starts_with("install stop ") {
             self.installed.extend(quoted(msg));
+            self.last = Some(now);
         } else if msg.starts_with("uninstall stop ") {
             self.removed.extend(quoted(msg));
-        } else if msg.starts_with("transaction stop") {
-            return self.flush();
+            self.last = Some(now);
         }
+        // A transaction is reported when it goes quiet (`idle`), because `transaction stop` is
+        // not at the end of a removal.
         Vec::new()
     }
 
@@ -217,6 +242,7 @@ impl Dnf5Parser {
         }
         self.installed.clear();
         self.removed.clear();
+        self.last = None;
         out
     }
 }
@@ -256,11 +282,13 @@ mod dnf5_tests {
     const UNINST: &str = "2026-11-19T17:59:54+0000 [5383] INFO RPM callback uninstall stop \"nmap-ncat-4:7.92-12.fc45.aarch64\" amount 28 total 28";
     const TX: &str = "2026-11-19T17:59:43+0000 [5285] INFO RPM callback transaction stop";
 
+    /// Feeds the lines, then lets the transaction go quiet.
     fn changes(lines: &[&str]) -> Vec<(String, String, Option<String>, Option<String>)> {
+        let t0 = std::time::Instant::now();
         let mut p = Dnf5Parser::default();
-        lines
-            .iter()
-            .flat_map(|l| p.feed(l))
+        let mut out: Vec<Body> = lines.iter().flat_map(|l| p.feed_at(l, t0)).collect();
+        out.extend(p.idle_at(t0 + std::time::Duration::from_secs(3)));
+        out.into_iter()
             .map(|b| match b {
                 Body::PackageChange(c) => (c.action, c.name, c.version, c.old_version),
                 _ => panic!(),
@@ -284,13 +312,42 @@ mod dnf5_tests {
         assert_eq!(r[0].0, "remove");
         // Same version installed and removed in one transaction is a reinstall.
         assert_eq!(changes(&[UNINST, INST, TX])[0].0, "reinstall");
-        // Nothing is reported until the transaction ends, and a bare callback is ignored.
-        assert!(changes(&[INST]).is_empty());
+        // Nothing is reported while the transaction is still active, and a bare callback is ignored.
+        let mut p = Dnf5Parser::default();
+        let t0 = std::time::Instant::now();
+        assert!(p.feed_at(INST, t0).is_empty());
+        assert!(p
+            .idle_at(t0 + std::time::Duration::from_millis(500))
+            .is_empty());
+        assert_eq!(p.idle_at(t0 + std::time::Duration::from_secs(3)).len(), 1);
+        assert!(
+            p.idle_at(t0 + std::time::Duration::from_secs(9)).is_empty(),
+            "reported once"
+        );
         assert!(changes(&[
             "2026-11-19T17:59:43+0000 [5285] INFO RPM callback open file \"/x.rpm\""
         ])
         .is_empty());
         assert!(changes(&["garbage", ""]).is_empty());
+    }
+
+    #[test]
+    fn a_removal_is_reported_although_transaction_stop_comes_first() {
+        // The order dnf5 really writes for `dnf remove hello` (Fedora 45).
+        let lines = [
+            "2026-11-19T18:42:33+0000 [51951] INFO RPM callback transaction start, total 2",
+            "2026-11-19T18:42:33+0000 [51951] INFO RPM callback transaction stop, total 2",
+            "2026-11-19T18:42:33+0000 [51951] INFO RPM callback uninstall start \"info-0:7.3-3.fc45.aarch64\" total 16",
+            "2026-11-19T18:42:33+0000 [51951] INFO RPM callback uninstall stop \"info-0:7.3-3.fc45.aarch64\" amount 16 total 16",
+            "2026-11-19T18:42:33+0000 [51951] INFO RPM callback uninstall stop \"hello-0:2.12.3-2.fc45.aarch64\" amount 54 total 54",
+        ];
+        let r = changes(&lines);
+        assert_eq!(
+            r.iter()
+                .map(|c| (c.0.as_str(), c.1.as_str()))
+                .collect::<Vec<_>>(),
+            [("remove", "hello"), ("remove", "info")]
+        );
     }
 
     #[test]

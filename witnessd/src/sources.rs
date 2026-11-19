@@ -153,19 +153,22 @@ impl Sources {
             threads.push(std::thread::spawn(move || account_loop(tx, stop, r)));
         }
         {
-            type Parser = Box<dyn FnMut(&str) -> Vec<Body> + Send>;
+            type Parser = Box<dyn FnMut(Option<&str>) -> Vec<Body> + Send>;
             let parsers: [(PathBuf, Parser); 3] = [
                 (
                     roots.dpkg_log.clone(),
-                    Box::new(|l| crate::pkglog::parse_dpkg(l).into_iter().collect()),
+                    Box::new(|l| l.and_then(crate::pkglog::parse_dpkg).into_iter().collect()),
                 ),
                 (
                     roots.dnf_log.clone(),
-                    Box::new(|l| crate::pkglog::parse_dnf(l).into_iter().collect()),
+                    Box::new(|l| l.and_then(crate::pkglog::parse_dnf).into_iter().collect()),
                 ),
                 (roots.dnf5_log.clone(), {
                     let mut p = crate::pkglog::Dnf5Parser::default();
-                    Box::new(move |l| p.feed(l))
+                    Box::new(move |l| match l {
+                        Some(l) => p.feed(l),
+                        None => p.idle(),
+                    })
                 }),
             ];
             for (path, parse) in parsers {
@@ -446,12 +449,24 @@ fn tail_log_loop(
     stop: Arc<AtomicBool>,
     path: PathBuf,
     poll: Duration,
-    mut parse: impl FnMut(&str) -> Vec<Body>,
+    mut parse: impl FnMut(Option<&str>) -> Vec<Body>,
 ) {
     let mut pos = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let mut ino = std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0);
     while !stop.load(Ordering::SeqCst) {
         sleep_unless_stopped(&stop, poll);
+        // A tick without new lines still lets the parser report a transaction that went quiet.
+        let idle = parse(None);
+        for body in idle {
+            let p = Pending {
+                src: Source::Daemon,
+                body,
+                wall_ns: None,
+            };
+            if tx.send(p).is_err() {
+                return;
+            }
+        }
         let Ok(f) = std::fs::File::open(&path) else {
             continue;
         };
@@ -478,7 +493,7 @@ fn tail_log_loop(
         };
         pos += end as u64 + 1;
         for line in String::from_utf8_lossy(&buf[..end]).lines() {
-            for body in parse(line) {
+            for body in parse(Some(line)) {
                 let p = Pending {
                     src: Source::Daemon,
                     body,

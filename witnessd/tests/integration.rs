@@ -1777,7 +1777,13 @@ mod system {
         )));
         let (mut child, _err) = spawn(&t.path().join("data"), 30);
         std::thread::sleep(std::time::Duration::from_secs(3));
-        sh("systemctl restart cron.service");
+        // Debian calls the cron daemon `cron`, Fedora `crond`.
+        let cron = if sh("systemctl cat crond.service >/dev/null 2>&1") {
+            "crond.service"
+        } else {
+            "cron.service"
+        };
+        sh(&format!("systemctl restart {cron}"));
         let ssh_ok = sh(&format!(
             "ssh -i {} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
              -o ConnectTimeout=10 {user}@127.0.0.1 true",
@@ -1791,7 +1797,7 @@ mod system {
         verify(&t.path().join("data"));
         let svc: Vec<_> = ev
             .iter()
-            .filter(|e| e["type"] == "service_change" && e["data"]["unit"] == "cron.service")
+            .filter(|e| e["type"] == "service_change" && e["data"]["unit"] == cron)
             .map(|e| e["data"]["action"].as_str().unwrap_or("").to_string())
             .collect();
         assert!(

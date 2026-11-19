@@ -31,7 +31,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
 .bar h2 { margin: 0 12px 0 0; font-size: 15px; }
 input, select, button.btn { font: inherit; padding: 5px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
 input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-button.btn { cursor: pointer; } button.btn:hover { border-color: var(--accent); }
+button.btn { cursor: pointer; } button.btn:disabled { opacity: .45; cursor: not-allowed; } button.btn:hover { border-color: var(--accent); }
 button.btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
 .split { display: grid; grid-template-columns: 1fr minmax(320px, 38%); flex: 1; min-height: 0; }
 .list { overflow: auto; min-width: 0; }

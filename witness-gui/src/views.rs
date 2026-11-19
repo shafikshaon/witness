@@ -148,6 +148,7 @@ pub fn App() -> Element {
 
     // Connection indicator: asks the daemon every few seconds.
     let mut up = use_signal(|| None::<Result<Value, String>>);
+    use_context_provider(|| up);
     let c2 = client.clone();
     use_future(move || {
         let c = c2.clone();
@@ -342,6 +343,28 @@ fn LivePage() -> Element {
             std::thread::sleep(Duration::from_secs(2));
         });
         feed
+    });
+
+    // Start with what just happened, so the page is not blank on a quiet machine.
+    let c3 = client.clone();
+    use_future(move || {
+        let c = c3.clone();
+        async move {
+            if let Ok(v) = get(&c, "/v1/events?limit=100".into()).await {
+                let mut recent = events_of(&v);
+                recent.reverse(); // the API is newest first; the list is oldest first
+                let newest = recent
+                    .last()
+                    .map(|e| e["seq"].as_u64().unwrap_or(0))
+                    .unwrap_or(0);
+                let mut r = rows.write();
+                // Anything the stream already delivered that is older than this is a duplicate.
+                r.retain(|e| e["seq"].as_u64().unwrap_or(0) > newest);
+                let tail = std::mem::take(&mut *r);
+                *r = recent;
+                r.extend(tail);
+            }
+        }
     });
 
     use_future(move || {
@@ -975,6 +998,9 @@ fn IntegrityPage() -> Element {
 #[component]
 fn RulesPage() -> Element {
     let client = use_context::<Client>();
+    let up = use_context::<Signal<Option<Result<Value, String>>>>();
+    // Changing rules needs the witness-admin group or root; everyone else can look.
+    let admin = matches!(&*up.read(), Some(Ok(s)) if s["tier"] == "admin");
     let mut tick = use_signal(|| 0u32);
     let mut draft = use_signal(|| {
         "id: my.rule\ntitle: My rule\nseverity: low\nevent: proc_exec\nmatch:\n  all:\n    - { field: data.exe, op: endswith, value: /example }\n".to_string()
@@ -1052,9 +1078,9 @@ fn RulesPage() -> Element {
                                     let id = text(&r, &["id"]).to_string();
                                     let on = r["enabled"] == true;
                                     let (c, id2) = (client.clone(), id.clone());
-                                    rsx! { tr { key: "{id}", td { "{id}" } td { "{text(&r, &[\"title\"])}" } td { "{text(&r, &[\"severity\"])}" }
+                                    rsx! { tr { key: "{id}", td { "{id}" } td { "{text(&r, &[\"title\"])}" } td { span { class: match text(&r, &["severity"]) { "critical" | "high" => "pill bad", "medium" => "pill warn", _ => "pill note" }, "{text(&r, &[\"severity\"])}" } }
                                         td { span { class: if on { "pill ok" } else { "pill warn" }, if on { "enabled" } else { "disabled" } } }
-                                        td { button { class: "btn", onclick: move |_| {
+                                        td { button { class: "btn", disabled: !admin, title: if admin { "" } else { "Changing rules needs the witness-admin group" }, onclick: move |_| {
                                             let (c, id, act) = (c.clone(), id2.clone(), if on { "disable" } else { "enable" });
                                             spawn(async move {
                                                 let _ = off(move || c.post(&format!("/v1/rules/{}/{act}", encode(&id)), &json!({}))).await;
@@ -1070,7 +1096,8 @@ fn RulesPage() -> Element {
                             textarea { value: "{draft}", oninput: move |e| draft.set(e.value()) }
                             div { class: "actions",
                                 button { class: "btn", onclick: validate, "Validate" }
-                                button { class: "btn primary", onclick: save, "Save (needs admin)" }
+                                button { class: "btn primary", disabled: !admin, onclick: save, "Save" }
+                                if !admin { span { class: "muted", "Read-only: saving or changing rules needs the witness-admin group (or root)." } }
                             }
                             if let Some(m) = verdict() { pre { class: "json", "{m}" } }
                         }

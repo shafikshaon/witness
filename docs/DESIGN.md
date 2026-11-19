@@ -940,7 +940,7 @@ I develop on macOS and cannot load eBPF there, so every claim below says where i
 | API | real-kernel end-to-end test; tiers checked with real group membership |
 | GUI | compiled on macOS and Linux; Dashboard viewed on both; other pages not visually checked |
 | .deb install, upgrade, reboot persistence | real VM |
-| x86_64 | cross-built from the arm64 VM and run under QEMU emulation (Ubuntu 22.04, kernel 5.15.0-198): the 24 programs of that build passed the verifier; 26 of 29 privileged tests passed first time and the other three passed after fixing test-setup problems and one over-strict assertion; the amd64 `.deb` installs and runs under the hardened unit. **Emulated, not native hardware, and the UDP-flow/TCP-DNS/service/integrity work was not re-run on x86_64.** |
+| x86_64 | cross-built from the arm64 VM and run under QEMU emulation (Ubuntu 22.04, kernel 5.15.0-198). **All 33 privileged tests pass** on the final code, including UDP flows, DNS over TCP, tamper detection, service/session events and the rule engine, and the amd64 `.deb` installs and runs under the hardened unit. **Emulated, not native Intel/AMD hardware** (so timing-sensitive behaviour and performance figures are not representative; the first emulated run also showed that a clock step's measured size can be lost when the daemon is scheduled late). No amd64 GUI package. |
 | Kernels other than 5.15 (incl. 6.x `ITER_UBUF` DNS path, fentry) | **not run** |
 | RPM, other distros, SELinux/AppArmor interaction | **not done** |
 | Load: sustained high event rates, many-user hosts, `authorized_keys` at scale | **not measured** beyond the rule benchmark and the file/open overhead measured earlier |

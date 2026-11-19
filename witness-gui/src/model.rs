@@ -762,3 +762,79 @@ mod tests {
         assert_eq!(scale_bars(&[0, 0]), vec![0, 0]);
     }
 }
+
+/// A plain-language name for an event type, for places aimed at people who do not know the
+/// internal names. Unknown types fall back to the name with spaces, never to nothing.
+pub fn kind_label(kind: &str) -> String {
+    match kind {
+        "proc_exec" => "Program started",
+        "proc_fork" => "Process created",
+        "proc_exit" => "Program ended",
+        "cred_change" => "Privileges changed",
+        "shell_command" => "Shell command",
+        "file_create" => "File created",
+        "file_open_write" => "File opened for writing",
+        "file_open_read" => "Sensitive file read",
+        "file_close_write" => "File written and closed",
+        "file_delete" => "File deleted",
+        "file_truncate" => "File emptied",
+        "file_rename" => "File renamed",
+        "file_attr" => "Permissions or owner changed",
+        "file_link" => "Link created",
+        "file_hash" => "Important file fingerprinted",
+        "file_activity_summary" => "File activity summary",
+        "net_connect" => "Outgoing connection",
+        "net_accept" => "Incoming connection",
+        "net_close" => "Connection closed",
+        "net_listen" => "Started listening",
+        "net_listen_close" => "Stopped listening",
+        "udp_flow" => "UDP traffic",
+        "dns" => "DNS lookup",
+        "login" => "Login",
+        "logout" => "Logout",
+        "auth_fail" => "Failed login",
+        "sudo" => "sudo command",
+        "su" => "su (switch user)",
+        "usb_device" => "USB device",
+        "block_device" => "Disk attached or removed",
+        "module_load" => "Kernel module loaded",
+        "module_unload" => "Kernel module removed",
+        "service_change" => "Service started or stopped",
+        "scheduler_change" => "Scheduled job changed",
+        "package_change" => "Software installed or removed",
+        "account_change" => "User account changed",
+        "authorized_key_change" => "SSH key changed",
+        "clock_change" => "Clock changed",
+        "system_boot" => "System started",
+        "system_shutdown" => "System shutting down",
+        "daemon_start" => "Witness started",
+        "daemon_stop" => "Witness stopped",
+        "capture_gap" => "Recording gap",
+        "capture_drop" => "Events lost under load",
+        "source_health" => "Source status check",
+        "config_change" => "Configuration changed",
+        "recovery" => "Store recovered after a crash",
+        "rule_set_change" => "Rules changed",
+        "alert" => "Alert",
+        "triage_action" => "Alert reviewed",
+        "baseline" => "Starting snapshot",
+        "clock_sync" => "Clock synchronised",
+        "api_access" => "Someone used the API",
+        "integrity_check" => "Evidence check",
+        other => return other.replace('_', " "),
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+mod kind_label_tests {
+    use super::kind_label;
+
+    #[test]
+    fn known_kinds_read_as_sentences_and_unknown_ones_degrade_gracefully() {
+        assert_eq!(kind_label("proc_exec"), "Program started");
+        assert_eq!(kind_label("baseline"), "Starting snapshot");
+        assert_eq!(kind_label("some_new_kind"), "some new kind");
+        assert_eq!(kind_label(""), "");
+    }
+}

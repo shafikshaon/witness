@@ -970,7 +970,7 @@ fn DashboardPage() -> Element {
                         h3 { style: "padding:0 14px", "Busiest event kinds" }
                         table {
                             for (i, (k, c)) in kinds.iter().take(12).enumerate() {
-                                tr { key: "{k}", td { "{k}" } td { "{c}" } td { style: "width:50%", div { style: "height:8px;background:var(--accent);border-radius:4px;width:{bars[i]}%" } } }
+                                tr { key: "{k}", td { title: "{k}", "{model::kind_label(k)}" } td { "{c}" } td { style: "width:50%", div { style: "height:8px;background:var(--accent);border-radius:4px;width:{bars[i]}%" } } }
                             }
                         }
                         h3 { style: "padding:0 14px", "Latest alerts" }

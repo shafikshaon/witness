@@ -9,6 +9,22 @@ rewrite the files; what Witness gives you is evidence of that, through a SHA-256
 forward-secure sealing and anchors you keep elsewhere. Read [Threat model](#threat-model)
 before relying on it.
 
+## Quick start
+
+```sh
+witness status     # is it running? is the evidence intact? anything to review?
+witness alerts     # what the rules flagged, newest last
+witness-gui        # the same, with search, live feed and timelines
+```
+
+`witness status` is the one command to remember. If Witness is not running it says so and
+tells you how to start it; if your user may not read it, it says that too. Everything below
+is detail.
+
+**Where to look when something happens:** *Alerts* (the rules' verdicts) → *Search* (find the
+command, file or address) → *Sessions* (who was logged in). *Integrity* proves the evidence
+was not changed afterwards.
+
 ## What it records
 
 | Area | Events | Source |
@@ -19,7 +35,7 @@ before relying on it.
 | DNS | queries and answers over UDP/53 and TCP/53, parsed | eBPF kprobes |
 | UDP | per-process flow summaries (packets and bytes each way), every 10 s | eBPF kprobes |
 | Auth | sshd logins and failures, sudo/su decisions, logind session open/close | journald |
-| System | account and `authorized_keys` changes, package installs (dpkg; dnf untested), USB and block devices, kernel module load/unload, clock steps, service start/stop | passwd/shadow diffs, package logs, uevent netlink, eBPF, journald |
+| System | account and `authorized_keys` changes, package installs and removals (dpkg, dnf5; dnf 4 unverified), USB and block devices, kernel module load/unload, clock steps, service start/stop | passwd/shadow diffs, package logs, uevent netlink, eBPF, journald |
 | Daemon | start/stop, capture gaps and drops, source health, rule changes, API access, triage | the daemon |
 
 ## Install (Debian/Ubuntu)
@@ -27,8 +43,11 @@ before relying on it.
 ```sh
 sudo apt install ./witness_0.1.0_arm64.deb          # daemon, CLI, rule pack
 sudo apt install ./witness-gui_0.1.0_arm64.deb      # optional desktop viewer
-sudo usermod -aG witness "$USER"                    # allow reading activity data
+sudo usermod -aG witness "$USER"                    # allow reading activity data (log in again)
+witness status                                      # confirm it works
 ```
+
+Fedora: `sudo dnf install ./witness-0.1.0-1.*.rpm` (the GUI package is Debian/Ubuntu only for now).
 
 The service starts at boot, before networking and SSH. Evidence lives in
 `/var/lib/witness` and is **never deleted automatically**, not even by `apt purge`.
@@ -36,6 +55,8 @@ The service starts at boot, before networking and SSH. Evidence lives in
 ## Use
 
 ```sh
+witness status                               # overview: running? intact? alerts?
+witness alerts [--all]                       # what needs review
 witness show --last 20                       # recent records
 witness show --type alert --last 10
 sudo witness verify --dir /var/lib/witness   # check the hash chain

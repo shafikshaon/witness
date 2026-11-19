@@ -180,7 +180,7 @@ pub fn render_alerts(alerts: &Value, all: bool, now_ns: u64) -> String {
         ));
     }
     o.push_str(&format!(
-        "\n{} shown. See the evidence behind one:  witness log --dir /var/lib/witness --raw | grep '\"seq\":<number>'\n",
+        "\n{} shown. Full detail and the records that triggered each: `witness alerts --json`, or the Alerts page of witness-gui.\n",
         list.len()
     ));
     o

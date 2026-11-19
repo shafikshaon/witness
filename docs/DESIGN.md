@@ -942,23 +942,33 @@ Live view (`/stream`), Timeline (`/timeline`), Process tree (`/processes/*`), Se
 
 ## 14. What is verified
 
-I develop on macOS and cannot load eBPF there, so every claim below says where it was run. "Real kernel" means Ubuntu 22.04.5 under Lima, **aarch64**, kernel 5.15.0-198 (and 5.15.0-203 after the final reboot), BTF on.
+I develop on macOS and cannot load eBPF there, so every claim says where it was run. "Real kernel" means a Lima VM on Apple silicon; **all platforms below are aarch64**.
+
+**Final code (2026-11-20), fresh Ubuntu 22.04.5 VM, kernel 5.15.0-198, BTF on:** the full privileged suite passes (**40/40**, ~17 min), 236 non-privileged tests pass, `cargo fmt` is clean on macOS and Linux and `clippy -D warnings` has no errors on Linux (which compiles the Linux-only code). The arm64 `.deb` packages were built from this code, installed with `apt`, and the README quick start was run against them (`witness status`/`alerts` as a user in group `witness`, `witness verify` = chain verified). Checksums are in `dist/SHA256SUMS`.
+
+**Other platforms, run on the daemon code of commit `2572daf` (identical to final except the CLI, GUI and docs, which do not affect capture or storage); those VMs were then deleted to free disk and not rerun:**
+
+| Platform | Result |
+|---|---|
+| Ubuntu 24.04, kernel 6.8, aarch64 | 40/40 on the last run. One test (`shell-on-socket`) failed in **two earlier full-suite runs** and passed in the third and in every partial run; **the cause was never captured**. Treat it as an unexplained intermittent failure. |
+| Fedora 45, kernel 7.2.11, aarch64, SELinux enforcing, btrfs, dnf5 | 40/40. Daemon runs as `unconfined_service_t` with no denials; no SELinux policy module was written. |
+| Ubuntu 22.04, x86_64 under QEMU emulation | **Not rerun.** The last run (33 tests) was on code from before argv chunks, exec records, the mount-root fix and most fixes in §2.12-2.12a. The amd64 `.deb` in `dist/outdated/` is that old build. Emulated, never native Intel/AMD. |
 
 | Area | State |
 |---|---|
-| Storage, hash chain, seals, anchors, disk-full policy, verify, index | unit + real-kernel tests (including real ENOSPC on a 1 MiB tmpfs) |
-| Process, file, network, DNS eBPF capture | real kernel, 24 programs verified by the kernel verifier, privileged suite passes |
-| Auth/system sources | real kernel, except USB hardware (see §2.12) |
-| Rule engine and pack | unit, benchmark, real-kernel alert + hot reload |
-| API | real-kernel end-to-end test; tiers checked with real group membership |
-| GUI | compiled on macOS and Linux; Dashboard viewed on both; other pages not visually checked |
-| .deb install, upgrade, reboot persistence | real VM |
-| x86_64 | cross-built from the arm64 VM and run under QEMU emulation (Ubuntu 22.04, kernel 5.15.0-198). **All 33 privileged tests pass** on the final code, including UDP flows, DNS over TCP, tamper detection, service/session events and the rule engine, and the amd64 `.deb` installs and runs under the hardened unit. **Emulated, not native Intel/AMD hardware** (so timing-sensitive behaviour and performance figures are not representative; the first emulated run also showed that a clock step's measured size can be lost when the daemon is scheduled late). No amd64 GUI package. |
-| Kernels other than 5.15 (incl. 6.x `ITER_UBUF` DNS path, fentry) | **not run** |
-| RPM, other distros, SELinux/AppArmor interaction | **not done** |
-| Load: sustained high event rates, many-user hosts, `authorized_keys` at scale | **not measured** beyond the rule benchmark and the file/open overhead measured earlier |
+| Storage, hash chain, seals, anchors, disk-full policy, verify, index, signed bundles | unit + real-kernel tests (real ENOSPC on a 1 MiB tmpfs; bundles re-derived with system `tar`) |
+| Process, file, network, DNS, UDP, module eBPF capture | real kernels 5.15, 6.8, 7.2; **28 hooks**, all pass the verifier on those three (kernel API drift handled: `*_recvmsg` and `inet_csk_accept` parameter counts, `security_file_truncate` on 6.2+) |
+| Path capture limits | 24 levels (20 for open, 16 per path for rename/link); deeper paths are flagged `path_truncated` with the leaf kept. Fewer than the earlier 40 (see §2.12a) |
+| Auth, accounts, packages, USB, units, boot | real kernels. dpkg and **dnf5** verified (Fedora 45); **dnf 4 parser unverified**. USB verified via real kernel uevents re-triggered through sysfs, **not physical hot-plug**. Shutdown record parsed from a real journal line but **never triggered live** |
+| Rule engine and pack (21 rules) | unit, benchmark, real-kernel alerts and hot reload |
+| API | real-kernel end-to-end; tiers checked with real group membership |
+| CLI `status`/`alerts` | unit tests plus runs against a live daemon on 5.15 (a down daemon, read-only vs admin, capped counts, closed pipe) |
+| GUI | Dashboard and the daemon-offline card viewed in headless screenshots on the final code; other pages were seen in earlier screenshots. **No interactive click-through was done** (I will not send input events to the user's Mac). Fedora GUI RPM and amd64 GUI package not built |
+| Load | release build, 4 CPUs: about 6,000 execs/s sustained, **81-85% captured**; every lost exec is covered by a reported `capture_drop` (asserted by the test). A debug build captured about 25%: use release |
 
-Known gaps are listed in each as-built section above; the largest are: no systemd D-Bus/logind source, `same_tree` approximated by session, GUI pages other than the Dashboard not visually checked, argv longer than 3 KiB not chunked, exit events only for thread-group leaders, file events are "attempted" not confirmed.
+**Not verified / not possible here:** native x86_64 hardware; DoT/DoH content (only visible as TCP flows); physical USB hot-plug; a GitHub CI run (the workflow exists; nothing was pushed); AppArmor profile (none written); LDAP/SSSD name lookup (tested with local users only); live host shutdown.
+
+**By design:** file events record *attempted* operations, not confirmed results; exit events are for thread-group leaders only; tamper *detection*, not prevention.
 
 ---
 

@@ -109,8 +109,7 @@ measurements.
 
 ## Status
 
-See "What is verified" in [docs/DESIGN.md](docs/DESIGN.md) §14. In short: verified on Ubuntu
-22.04, kernel 5.15.0-198, **aarch64** only. **x86_64 is not verified.**
+The full privileged test suite passes on Ubuntu 22.04 (kernel 5.15, final code); Ubuntu 24.04 (6.8) and Fedora 45 (7.2, SELinux enforcing) passed on code that differs only in the CLI/GUI. **All of this ran on aarch64 virtual machines.** x86_64 was last run under emulation on older code and is not current; native Intel/AMD hardware was never tested. What was and was not verified is itemised in "What is verified" in [docs/DESIGN.md](docs/DESIGN.md) §14.
 
 ## License
 

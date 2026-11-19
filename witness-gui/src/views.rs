@@ -206,7 +206,7 @@ pub fn App() -> Element {
 
 #[component]
 fn EventRow(e: Value, selected: bool, onpick: EventHandler<Value>) -> Element {
-    let wall = e["wall_ns"].as_u64().unwrap_or(0);
+    let wall = model::wall(&e);
     let tone = model::tone(&e);
     let desc = model::describe(&e);
     let t = model::fmt_time(wall);
@@ -250,7 +250,7 @@ fn Detail(e: Option<Value>) -> Element {
     let exe = text(a, &["exe"]).to_string();
     let user = text(a, &["user"]).to_string();
     let comm = text(a, &["comm"]).to_string();
-    let when = model::fmt_time(e["wall_ns"].as_u64().unwrap_or(0));
+    let when = model::fmt_time(model::wall(&e));
     let kind = text(&e, &["type"]).to_string();
     let hash = text(&e, &["h"]).to_string();
     let pid = a["pid"].to_string();
@@ -581,7 +581,7 @@ fn AlertsPage() -> Element {
                                     let st = text(&a, &["triage", "status"]).to_string();
                                     let tone = if sev == "critical" || sev == "high" { "bad" } else if sev == "medium" { "warn" } else { "note" };
                                     let a2 = a.clone();
-                                    let when = model::fmt_time(a["wall_ns"].as_u64().unwrap_or(0));
+                                    let when = model::fmt_time(model::wall(&a));
                                     let title = text(&a, &["data", "title"]).to_string();
                                     rsx! {
                                         div { key: "{a[\"seq\"]}", class: "row", onclick: move |_| { picked.set(Some(a2.clone())); note.set(String::new()); },
@@ -637,7 +637,7 @@ fn TriggerEvent(seq: u64) -> Element {
     match &*state {
         Some(Ok(e)) => {
             let d = model::describe(e);
-            let t = model::fmt_time(e["wall_ns"].as_u64().unwrap_or(0));
+            let t = model::fmt_time(model::wall(e));
             rsx! { div { class: "muted", "#{seq} {t} " span { style: "color:var(--text)", "{d}" } } }
         }
         Some(Err(e)) => rsx! { div { class: "muted", "#{seq}: {e}" } },

@@ -36,7 +36,7 @@ button.btn.primary { background: var(--accent); color: #fff; border-color: var(-
 .split { display: grid; grid-template-columns: 1fr minmax(320px, 38%); flex: 1; min-height: 0; }
 .list { overflow: auto; min-width: 0; }
 .detail { overflow: auto; border-left: 1px solid var(--line); background: var(--panel); padding: 12px 14px; }
-.row { display: grid; grid-template-columns: 158px 118px 1fr; gap: 10px; padding: 3px 14px; border-bottom: 1px solid var(--line); cursor: pointer; align-items: baseline; }
+.row { display: grid; grid-template-columns: 176px 150px 1fr; gap: 14px; padding: 3px 14px; border-bottom: 1px solid var(--line); cursor: pointer; align-items: baseline; }
 .row:hover { background: var(--accent-bg); } .row.sel { background: var(--accent-bg); box-shadow: inset 3px 0 var(--accent); }
 .row .t { color: var(--muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
 .row .k { font-family: var(--mono); font-size: 12px; color: var(--note); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

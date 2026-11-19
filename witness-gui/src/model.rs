@@ -72,13 +72,43 @@ fn join_argv(v: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Bytes with a unit: `90 B`, `1.5 KiB`, `2.0 MiB`.
+pub fn fmt_bytes(n: u64) -> String {
+    const U: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let (mut v, mut i) = (n as f64, 0);
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+/// When an event happened: `wall_ns`, or `ts_wall_ns` on anchor records.
+pub fn wall(e: &Value) -> u64 {
+    e["wall_ns"]
+        .as_u64()
+        .or_else(|| e["ts_wall_ns"].as_u64())
+        .unwrap_or(0)
+}
+
 /// A short human description of a stored event.
 pub fn describe(e: &Value) -> String {
     let d = &e["data"];
     let a = &e["actor"];
     match s(&e["type"]) {
         "proc_exec" => format!("exec {}", join_argv(&d["argv"]).trim()),
-        "proc_exit" => format!("exit code={} {}", d["code"], s(&a["comm"])),
+        "proc_exit" => {
+            let how = match (d["exit_code"].as_i64(), d["signal"].as_i64()) {
+                (_, Some(sig)) => format!("killed by signal {sig}"),
+                (Some(c), _) => format!("exit {c}"),
+                _ => "exit".to_string(),
+            };
+            format!("{how} {}", s(&a["comm"]))
+        }
         "proc_fork" => format!("fork child={}", d["child_pid"]),
         "file_create" | "file_open_write" | "file_open_read" | "file_delete" | "file_truncate"
         | "file_close_write" => format!("{} {}", s(&a["comm"]), s(&d["path"])),
@@ -165,6 +195,46 @@ pub fn describe(e: &Value) -> String {
             s(&d["fingerprint"])
         ),
         "package_change" => format!("{} {} {}", s(&d["action"]), s(&d["name"]), s(&d["version"])),
+        "udp_flow" => format!(
+            "{}:{} ↔ {}:{}  sent {} ({} pkts)  received {} ({} pkts)",
+            s(&d["laddr"]),
+            d["lport"],
+            s(&d["raddr"]),
+            d["rport"],
+            fmt_bytes(d["bytes_tx"].as_u64().unwrap_or(0)),
+            d["packets_tx"],
+            fmt_bytes(d["bytes_rx"].as_u64().unwrap_or(0)),
+            d["packets_rx"]
+        ),
+        "integrity_check" => format!(
+            "chain {} ({} records, {} ms, {})",
+            s(&d["state"]),
+            d["records"],
+            d["duration_ms"],
+            s(&d["trigger"])
+        ),
+        "file_activity_summary" => format!(
+            "{}: {} writes, {} created, {} deleted",
+            s(&d["dir"]),
+            d["opens_for_write"],
+            d["creates"],
+            d["deletes"]
+        ),
+        "api_access" => format!("uid {} ({}) {}", d["uid"], s(&d["tier"]), s(&d["endpoint"])),
+        "daemon_start" => format!(
+            "witnessd {} started on kernel {}",
+            s(&d["version"]),
+            s(&d["kernel"])
+        ),
+        "daemon_stop" => format!("witnessd stopped ({})", s(&d["reason"])),
+        "anchor" => format!(
+            "chain head #{} {}",
+            e["head_seq"],
+            e["head_hash"]
+                .as_str()
+                .map(|h| &h[..12.min(h.len())])
+                .unwrap_or("")
+        ),
         "service_change" => format!(
             "{} {} ({})",
             s(&d["action"]),
@@ -198,7 +268,6 @@ pub fn tone(e: &Value) -> &'static str {
         "capture_gap" | "capture_drop" => "warn",
         "auth_fail" => "warn",
         _ => match e["prio"].as_u64() {
-            Some(0) => "strong",
             Some(3) => "faint",
             _ => "",
         },
@@ -471,6 +540,27 @@ mod tests {
         // Unknown kinds still show something rather than nothing.
         let u = json!({"type":"future_kind","data":{"x":1},"actor":{}});
         assert!(describe(&u).starts_with("future_kind"));
+    }
+
+    #[test]
+    fn newly_described_kinds_read_naturally_and_anchors_have_a_time() {
+        let exit = json!({"type":"proc_exit","data":{"exit_code":0},"actor":{"comm":"ls"}});
+        assert_eq!(describe(&exit), "exit 0 ls");
+        let killed = json!({"type":"proc_exit","data":{"signal":9},"actor":{"comm":"x"}});
+        assert_eq!(describe(&killed), "killed by signal 9 x");
+        let udp = json!({"type":"udp_flow","data":{"laddr":"1.1.1.1","lport":5,"raddr":"2.2.2.2","rport":9,"bytes_tx":1536,"packets_tx":3,"bytes_rx":90,"packets_rx":2},"actor":{}});
+        assert_eq!(
+            describe(&udp),
+            "1.1.1.1:5 ↔ 2.2.2.2:9  sent 1.5 KiB (3 pkts)  received 90 B (2 pkts)"
+        );
+        let ic = json!({"type":"integrity_check","data":{"state":"ok","records":884,"duration_ms":49,"trigger":"schedule"},"actor":{}});
+        assert_eq!(describe(&ic), "chain ok (884 records, 49 ms, schedule)");
+        let anchor = json!({"type":"anchor","head_seq":883,"head_hash":"cac8dc6da6cc2629","ts_wall_ns":1_795_101_623_087_195_911u64});
+        assert_eq!(describe(&anchor), "chain head #883 cac8dc6da6cc");
+        assert_eq!(wall(&anchor), 1_795_101_623_087_195_911);
+        assert_eq!(wall(&json!({"wall_ns": 5})), 5);
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(2_097_152), "2.0 MiB");
     }
 
     #[test]

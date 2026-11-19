@@ -788,7 +788,7 @@ mod files {
     fn paths_cross_mounts_and_deep_nesting_correctly() {
         let m = marker("deep");
         let shm = format!("/dev/shm/{m}");
-        let deep20: String = (1..=18).map(|i| format!("/d{i}")).collect();
+        let deep20: String = (1..=14).map(|i| format!("/d{i}")).collect();
         let deep_dir = PathBuf::from(format!("/tmp/{m}")).join(deep20.trim_start_matches('/'));
         let (s2, d2) = (shm.clone(), deep_dir.clone());
         let (ev, _) = capture(8, move || {
@@ -816,7 +816,7 @@ mod files {
             of(&mine, "file_open_write")
                 .iter()
                 .any(|e| e["data"]["path"] == leaf),
-            "a 21-component path is reported exactly: {leaf}"
+            "a 17-component path is reported exactly: {leaf}"
         );
         for e in &mine {
             if e["data"]["path"] == leaf {

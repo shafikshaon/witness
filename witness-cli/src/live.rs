@@ -8,6 +8,15 @@ use std::path::Path;
 use serde_json::Value;
 use witness_client::{Client, ClientError};
 
+/// How many alerts `status` looks at. A count that reaches it is shown as `N+`.
+pub const STATUS_ALERT_LIMIT: usize = 500;
+
+/// Writes to stdout and stops quietly if the reader went away (`witness alerts | head`).
+fn out(s: &str) {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(s.as_bytes());
+}
+
 /// `2026-11-20 09:15:02 UTC` for nanoseconds since the epoch.
 pub fn fmt_utc(wall_ns: u64) -> String {
     let secs = (wall_ns / 1_000_000_000) as i64;
@@ -129,8 +138,13 @@ pub fn render_status(status: &Value, integrity: &Value, alerts: &Value) -> Strin
         }
         let parts: Vec<String> = by.iter().map(|(s, n)| format!("{n} {s}")).collect();
         o.push_str(&format!(
-            "  Alerts to review:    {} ({}). Run `witness alerts`.\n",
+            "  Alerts to review:    {}{} ({}). Run `witness alerts`.\n",
             open.len(),
+            if alerts["events"].as_array().map_or(0, Vec::len) >= STATUS_ALERT_LIMIT {
+                "+"
+            } else {
+                ""
+            },
             parts.join(", ")
         ));
     }
@@ -147,12 +161,14 @@ pub fn render_status(status: &Value, integrity: &Value, alerts: &Value) -> Strin
 
 /// One line per alert, newest last, with what to do next.
 pub fn render_alerts(alerts: &Value, all: bool, now_ns: u64) -> String {
-    let list: Vec<&Value> = alerts["events"]
+    let mut list: Vec<&Value> = alerts["events"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|a| all || a["triage"]["status"].as_str().unwrap_or("new") == "new")
         .collect();
+    // The API returns newest first; read oldest to newest so the latest is at the bottom.
+    list.sort_by_key(|a| a["seq"].as_u64().unwrap_or(0));
     if list.is_empty() {
         return if all {
             "No alerts have been raised.\n".into()
@@ -195,15 +211,15 @@ pub fn status(socket: &Path, json: bool) -> anyhow::Result<()> {
     let st = c.get("/v1/status").map_err(explain)?;
     let integ = c.get("/v1/integrity").unwrap_or(Value::Null);
     let alerts = c
-        .get("/v1/alerts?limit=500")
+        .get(&format!("/v1/alerts?limit={STATUS_ALERT_LIMIT}"))
         .unwrap_or_else(|_| serde_json::json!({"events": []}));
     if json {
-        println!(
-            "{}",
+        out(&format!(
+            "{}\n",
             serde_json::json!({"status": st, "integrity": integ, "alerts": alerts})
-        );
+        ));
     } else {
-        print!("{}", render_status(&st, &integ, &alerts));
+        out(&render_status(&st, &integ, &alerts));
     }
     Ok(())
 }
@@ -215,12 +231,9 @@ pub fn alerts(socket: &Path, all: bool, limit: usize, json: bool) -> anyhow::Res
         .get(&format!("/v1/alerts?limit={limit}"))
         .map_err(explain)?;
     if json {
-        println!("{a}");
+        out(&format!("{a}\n"));
     } else {
-        print!(
-            "{}",
-            render_alerts(&a, all, st["wall_ns"].as_u64().unwrap_or(0))
-        );
+        out(&render_alerts(&a, all, st["wall_ns"].as_u64().unwrap_or(0)));
     }
     Ok(())
 }
@@ -315,5 +328,24 @@ mod tests {
             "{all}"
         );
         assert!(render_alerts(&json!({"events":[]}), false, now).contains("No alerts to review"));
+        // Oldest first, so the newest ends up next to the prompt.
+        let two = json!({"events":[
+            {"seq":9,"wall_ns":1,"data":{"severity":"low","title":"newer","rule_id":"r"}},
+            {"seq":3,"wall_ns":1,"data":{"severity":"low","title":"older","rule_id":"r"}}]});
+        let t = render_alerts(&two, false, now);
+        assert!(t.find("older").unwrap() < t.find("newer").unwrap(), "{t}");
+    }
+
+    #[test]
+    fn a_count_that_hit_the_query_limit_says_so() {
+        let events: Vec<Value> = (0..STATUS_ALERT_LIMIT)
+            .map(|i| json!({"seq":i,"data":{"severity":"medium"},"triage":{"status":"new"}}))
+            .collect();
+        let t = render_status(
+            &status_json(),
+            &json!({"state":"ok"}),
+            &json!({ "events": events }),
+        );
+        assert!(t.contains("500+ (500 medium)"), "{t}");
     }
 }

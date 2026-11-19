@@ -131,6 +131,13 @@ pub fn describe(e: &Value) -> String {
             s(&d["fingerprint"])
         ),
         "package_change" => format!("{} {} {}", s(&d["action"]), s(&d["name"]), s(&d["version"])),
+        "service_change" => format!(
+            "{} {} ({})",
+            s(&d["action"]),
+            s(&d["unit"]),
+            s(&d["result"])
+        ),
+        "logout" => format!("{} session {}", s(&d["user"]), d["session_id"]),
         "clock_change" => format!("{} {} ns", s(&d["kind"]), d["delta_ns"]),
         "source_health" => format!(
             "{} {} {}",

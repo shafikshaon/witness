@@ -5,7 +5,87 @@
 
 use std::net::IpAddr;
 
-use witness_common::schema::{AuthFail, Body, Login, Sudo};
+use serde_json::Value;
+use witness_common::schema::{AuthFail, Body, Login, Logout, ServiceAction, ServiceChange, Sudo};
+
+/// Structured journal records from systemd and logind (their fields are more reliable than
+/// their text): service start/stop with the job result, and session open/close.
+pub fn parse_fields(v: &Value) -> Option<Body> {
+    let field = |k: &str| v.get(k).and_then(Value::as_str);
+    let ident = field("SYSLOG_IDENTIFIER").or_else(|| field("_COMM"))?;
+    match ident {
+        "systemd-logind" => {
+            let session_id: u32 = field("SESSION_ID")?.parse().ok()?;
+            let user = field("USER_ID")?.to_string();
+            let msg = journal_text(v)?;
+            if msg.starts_with("New session ") {
+                Some(Body::Login(Login {
+                    user,
+                    service: "logind".into(),
+                    method: None,
+                    remote_addr: None,
+                    remote_port: None,
+                    tty: None,
+                    session_id,
+                }))
+            } else if msg.starts_with("Removed session ") {
+                Some(Body::Logout(Logout { user, session_id }))
+            } else {
+                None
+            }
+        }
+        "systemd" => {
+            // Only job-completion records carry both fields: "Started X.", "Stopped X.", etc.
+            let (job, result, unit) = (field("JOB_TYPE")?, field("JOB_RESULT")?, field("UNIT")?);
+            if !["service", "timer", "socket", "path", "target"]
+                .iter()
+                .any(|k| unit.ends_with(&format!(".{k}")))
+            {
+                return None;
+            }
+            // A restart is reported as a stop and a start; use what each record says happened.
+            let msg = journal_text(v).unwrap_or_default();
+            let action = match job {
+                "reload" | "reload-or-restart" if msg.starts_with("Reloaded") => {
+                    ServiceAction::Reload
+                }
+                _ if msg.starts_with("Started") || msg.starts_with("Starting") => {
+                    ServiceAction::Start
+                }
+                _ if msg.starts_with("Stopped") || msg.starts_with("Stopping") => {
+                    ServiceAction::Stop
+                }
+                "start" => ServiceAction::Start,
+                "stop" => ServiceAction::Stop,
+                "restart" | "try-restart" => ServiceAction::Restart,
+                "reload" => ServiceAction::Reload,
+                _ => return None,
+            };
+            Some(Body::ServiceChange(ServiceChange {
+                unit: unit.to_string(),
+                action,
+                result: Some(result.to_string()),
+                job_id: field("JOB_ID").and_then(|j| j.parse().ok()),
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// `MESSAGE` as text; journald encodes non-UTF-8 messages as a byte array.
+pub fn journal_text(v: &Value) -> Option<String> {
+    match v.get("MESSAGE")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(a) => {
+            let bytes: Vec<u8> = a
+                .iter()
+                .filter_map(|x| x.as_u64().map(|n| n as u8))
+                .collect();
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        _ => None,
+    }
+}
 
 /// `ident` is the syslog identifier of the emitter (`sshd`, `sudo`, `su`, `login`).
 pub fn parse(ident: &str, msg: &str) -> Option<Body> {
@@ -131,6 +211,66 @@ fn su(msg: &str) -> Option<Body> {
         allowed: !failed,
         raw: msg.into(),
     }))
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    // Records copied from journald on Ubuntu 22.04 (fields trimmed to the relevant ones).
+    #[test]
+    fn logind_sessions_open_and_close_with_the_user() {
+        let open = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"New session 3 of user shafikshaon.","SESSION_ID":"3","USER_ID":"shafikshaon"});
+        let Some(Body::Login(l)) = parse_fields(&open) else {
+            panic!()
+        };
+        assert_eq!(
+            (l.user.as_str(), l.session_id, l.service.as_str()),
+            ("shafikshaon", 3, "logind")
+        );
+        let close = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Removed session 3.","SESSION_ID":"3","USER_ID":"shafikshaon"});
+        let Some(Body::Logout(o)) = parse_fields(&close) else {
+            panic!()
+        };
+        assert_eq!((o.user.as_str(), o.session_id), ("shafikshaon", 3));
+        // "logged out" is a precursor, not the end of the session: not reported twice.
+        let pre = json!({"SYSLOG_IDENTIFIER":"systemd-logind","MESSAGE":"Session 3 logged out. Waiting for processes to exit.","SESSION_ID":"3","USER_ID":"shafikshaon"});
+        assert!(parse_fields(&pre).is_none());
+    }
+
+    #[test]
+    fn systemd_job_results_become_service_changes() {
+        let started = json!({"_COMM":"systemd","SYSLOG_IDENTIFIER":"systemd","MESSAGE":"Started Regular background program processing daemon.","UNIT":"cron.service","JOB_TYPE":"start","JOB_RESULT":"done"});
+        let Some(Body::ServiceChange(c)) = parse_fields(&started) else {
+            panic!()
+        };
+        assert_eq!(
+            (c.unit.as_str(), c.action, c.result.as_deref()),
+            ("cron.service", ServiceAction::Start, Some("done"))
+        );
+        // The stop half of a restart is a Stop, not a Restart.
+        let stopped = json!({"SYSLOG_IDENTIFIER":"systemd","MESSAGE":"Stopped Regular background program processing daemon.","UNIT":"cron.service","JOB_TYPE":"restart","JOB_RESULT":"done"});
+        let Some(Body::ServiceChange(c)) = parse_fields(&stopped) else {
+            panic!()
+        };
+        assert_eq!(c.action, ServiceAction::Stop);
+        // A failed start keeps its result.
+        let failed = json!({"SYSLOG_IDENTIFIER":"systemd","MESSAGE":"Failed to start X.","UNIT":"x.service","JOB_TYPE":"start","JOB_RESULT":"failed"});
+        let Some(Body::ServiceChange(c)) = parse_fields(&failed) else {
+            panic!()
+        };
+        assert_eq!(
+            (c.action, c.result.as_deref()),
+            (ServiceAction::Start, Some("failed"))
+        );
+        // Not job completions, or not services: ignored.
+        let deact = json!({"SYSLOG_IDENTIFIER":"systemd","MESSAGE":"cron.service: Deactivated successfully.","UNIT":"cron.service"});
+        assert!(parse_fields(&deact).is_none());
+        let mount = json!({"SYSLOG_IDENTIFIER":"systemd","MESSAGE":"Mounted /x.","UNIT":"x.mount","JOB_TYPE":"start","JOB_RESULT":"done"});
+        assert!(parse_fields(&mount).is_none());
+    }
 }
 
 #[cfg(test)]

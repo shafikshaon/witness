@@ -171,26 +171,12 @@ fn sleep_unless_stopped(stop: &AtomicBool, d: Duration) {
 
 // ---- journal --------------------------------------------------------------------------
 
-fn journal_message(v: &Value) -> Option<String> {
-    match v.get("MESSAGE")? {
-        Value::String(s) => Some(s.clone()),
-        // journald encodes non-UTF-8 messages as an array of byte values.
-        Value::Array(a) => {
-            let bytes: Vec<u8> = a
-                .iter()
-                .filter_map(|x| x.as_u64().map(|n| n as u8))
-                .collect();
-            Some(String::from_utf8_lossy(&bytes).into_owned())
-        }
-        _ => None,
-    }
-}
-
 /// One `journalctl -o json` line → a pending event, if it is an auth message we understand.
 pub fn journal_line(line: &str) -> Option<Pending> {
     let v: Value = serde_json::from_str(line).ok()?;
     let ident = v.get("SYSLOG_IDENTIFIER")?.as_str()?;
-    let body = crate::authlog::parse(ident, &journal_message(&v)?)?;
+    let body = crate::authlog::parse_fields(&v)
+        .or_else(|| crate::authlog::parse(ident, &crate::authlog::journal_text(&v)?))?;
     let wall_ns = v
         .get("__REALTIME_TIMESTAMP")
         .and_then(Value::as_str)
@@ -208,6 +194,7 @@ fn journal_loop(tx: Sender<Pending>, stop: Arc<AtomicBool>, pid: Arc<AtomicU32>)
         let child = Command::new("journalctl")
             .args(["-f", "-n", "0", "-o", "json", "--no-pager"])
             .args(["_COMM=sshd", "_COMM=sudo", "_COMM=su", "_COMM=sshd-session"])
+            .args(["_COMM=systemd-logind", "_COMM=systemd"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn();

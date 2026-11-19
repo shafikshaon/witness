@@ -1,0 +1,16 @@
+id: witness.self.service-stopped
+title: Witness service was stopped or failed
+description: >
+  witnessd stopped (or failed to start) while the machine was running. Package upgrades and
+  restarts you did yourself also trigger this; an unexpected stop is the case to investigate.
+severity: critical
+tags: [attack.defense-evasion, attack.t1562.001]
+event: service_change
+match:
+  all:
+    - { field: data.unit, op: eq, value: witnessd.service }
+    - any:
+        - { field: data.action, op: eq, value: stop }
+        - { field: data.result, op: ne, value: done }
+alert:
+  fields: [data.unit, data.action, data.result]

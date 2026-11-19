@@ -197,7 +197,7 @@ pub fn App() -> Element {
                             br {}
                             "head #{s[\"head_seq\"]} · {s[\"tier\"].as_str().unwrap_or(\"\")}"
                         },
-                        Some(Err(e)) => rsx! { b { class: "down", "● offline" } br {} "{e}" },
+                        Some(Err(_)) => rsx! { b { class: "down", "● offline" } br {} "see the message" },
                     }
                 }
             }
@@ -211,6 +211,9 @@ pub fn App() -> Element {
                 } else {
                     p { class: "lead", "{lead(page())}" }
                 }
+                // Hidden, not unmounted, while offline: a failed poll must not wipe the Live buffer
+                // or a search in progress. `display: contents` keeps the layout unchanged.
+                div { style: if matches!(&*up.read(), Some(Err(_))) { "display: none" } else { "display: contents" },
                 match page() {
                     Page::Live => rsx! { LivePage {} },
                     Page::Search => rsx! { SearchPage {} },
@@ -221,6 +224,7 @@ pub fn App() -> Element {
                     Page::Dashboard => rsx! { DashboardPage {} },
                     Page::Integrity => rsx! { IntegrityPage {} },
                     Page::Rules => rsx! { RulesPage {} },
+                }
                 }
             }
         }

@@ -46,7 +46,7 @@ impl ClientError {
                 PermissionDenied => format!(
                     "Witness is running, but this user may not open {}.\n\
                      Run the command with sudo, or ask an administrator to add you to the \
-                     `witness-admin` group (then log in again).",
+                     `witness` group (then log in again).",
                     path.display()
                 ),
                 _ => self.to_string(),
@@ -287,7 +287,7 @@ mod hint_tests {
         let refused = connect(std::io::ErrorKind::ConnectionRefused).hint();
         assert!(refused.contains("not running"));
         let denied = connect(std::io::ErrorKind::PermissionDenied).hint();
-        assert!(denied.contains("witness-admin") && denied.contains("sudo"));
+        assert!(denied.contains("`witness` group") && denied.contains("sudo"));
         let forbidden = ClientError::Api {
             status: 403,
             title: "forbidden".into(),

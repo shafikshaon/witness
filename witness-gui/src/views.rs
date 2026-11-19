@@ -836,7 +836,7 @@ fn SessionsPage() -> Element {
                         tr { th { "session" } th { "user" } th { "first seen" } th { "last seen" } th { "events" } th { "commands" } }
                         for r in rows.iter().cloned() {
                             tr { class: "click", key: "{r.ses}", onclick: move |_| { search.set(Query { ses: r.ses.to_string(), ..Query::default() }); page.set(Page::Search); },
-                                td { "{r.ses}" } td { "{r.user}" } td { "{model::fmt_time(r.first)}" } td { "{model::fmt_time(r.last)}" }
+                                td { "{r.ses}" } td { if r.user.is_empty() { span { class: "muted", title: "no user name for this session (system processes)", "—" } } else { "{r.user}" } } td { "{model::fmt_time(r.first)}" } td { "{model::fmt_time(r.last)}" }
                                 td { "{r.events}" } td { "{r.commands}" } }
                         }
                     }

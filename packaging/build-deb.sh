@@ -1,6 +1,7 @@
 #!/bin/sh
 # Builds witness_<version>_<arch>.deb from already-built binaries (dpkg-deb only).
 #   packaging/build-deb.sh [bin_dir] [out_dir]
+# Cross-packaging: ARCH=amd64 WITNESS_HOST_BIN=<native witness binary> packaging/build-deb.sh <cross bin dir> <out>
 # Build first on the target machine: cargo build --release -p witnessd -p witness-cli
 # (add -p witness-gui for the desktop viewer package).
 set -eu
@@ -9,7 +10,8 @@ ROOT=$(cd "$HERE/.." && pwd)
 BIN=${1:-$ROOT/target/release}
 OUT=${2:-$ROOT/dist}
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)
-ARCH=$(dpkg --print-architecture)
+# ARCH may be set to package cross-built binaries (e.g. ARCH=amd64 on an arm64 host).
+ARCH=${ARCH:-$(dpkg --print-architecture)}
 mkdir -p "$OUT"
 
 stage() { # stage <dir> : fresh DEBIAN tree (0755 root dir, as dpkg expects)
@@ -28,7 +30,7 @@ for r in "$ROOT"/rules/*.yml; do
     install -m 0644 "$r" "$S/etc/witness/rules.d/"
     install -m 0644 "$r" "$S/usr/share/witness/rules/"
 done
-"$BIN/witness" config show --file /nonexistent/none.toml > "$S/etc/witness/config.toml"
+"${WITNESS_HOST_BIN:-$BIN/witness}" config show --file /nonexistent/none.toml > "$S/etc/witness/config.toml"
 chmod 0644 "$S/etc/witness/config.toml"
 install -m 0644 "$ROOT/README.md" "$S/usr/share/doc/witness/README.md"
 install -m 0644 "$ROOT/docs/DESIGN.md" "$S/usr/share/doc/witness/DESIGN.md"

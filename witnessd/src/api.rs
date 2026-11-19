@@ -22,7 +22,6 @@ use witness_common::schema::{ApiAccess, TriageStatus};
 use witness_store::chain;
 use witness_store::index::{Filter, Index};
 use witness_store::store::read_head;
-use witness_store::verify::{verify_dirs, Options};
 
 const MAX_HEADER: usize = 16 * 1024;
 const MAX_BODY: usize = 256 * 1024;
@@ -38,6 +37,7 @@ pub enum ApiCmd {
         uid: u32,
     },
     Access(ApiAccess),
+    Integrity(witness_common::schema::IntegrityCheck),
 }
 
 #[derive(Clone)]
@@ -826,33 +826,20 @@ fn start_verify(sh: &Shared) -> Res {
     }
     let dir = segs(sh);
     let slot = sh.verify.clone();
+    let tx = sh.tx.lock().ok().map(|t| t.clone());
     std::thread::spawn(move || {
-        let result = match verify_dirs(
-            &[dir],
-            &Options {
-                allow_partial: true,
-                ..Options::default()
-            },
-        ) {
-            Ok(rep) => json!({
-                "state": if rep.is_ok() { "ok" } else { "broken" },
-                "segments": rep.segments,
-                "records": rep.records,
-                "head_seq": rep.head_seq,
-                "head_hash": chain::to_hex(&rep.head_hash),
-                "seals": rep.seals,
-                "anchors_checked": rep.anchors_checked,
-                "partial_start": rep.partial_start,
-                "macs_checked": rep.macs_checked,
-                "broken": rep.broken.map(|b| format!("{b:?}")),
-                "finished_wall_ns": now_ns(),
-            }),
-            Err(e) => {
-                json!({"state": "error", "detail": e.to_string(), "finished_wall_ns": now_ns()})
-            }
-        };
+        let c = crate::integrity::check(&dir, "api");
+        let result = json!({
+            "state": c.state, "segments": c.segments, "records": c.records,
+            "head_seq": c.head_seq, "head_hash": c.head_hash, "broken": c.problem,
+            "detail": c.problem, "duration_ms": c.duration_ms, "finished_wall_ns": now_ns(),
+        });
         if let Ok(mut v) = slot.lock() {
             *v = result;
+        }
+        // The result is evidence too: record it in the chain (and let rules see it).
+        if let Some(tx) = tx {
+            let _ = tx.send(ApiCmd::Integrity(c));
         }
     });
     Ok(Reply::Json(202, json!({"state": "running"})))

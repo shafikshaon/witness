@@ -10,6 +10,7 @@ pub mod decode;
 pub mod dns;
 pub mod filepolicy;
 pub mod hasher;
+pub mod integrity;
 #[cfg(target_os = "linux")]
 pub mod loader;
 pub mod pipeline;

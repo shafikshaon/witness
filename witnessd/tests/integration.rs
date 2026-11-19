@@ -1756,3 +1756,88 @@ mod system {
         );
     }
 }
+
+mod integrity {
+    use std::fs;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use super::store_mode::{records, spawn};
+
+    #[test]
+    #[ignore = "needs root and a kernel with BTF"]
+    fn a_modified_store_is_detected_by_the_scheduled_check_and_alerts() {
+        let t = tempfile::tempdir().unwrap();
+        let data = t.path().join("data");
+        // Run 1: create some evidence, stop cleanly.
+        let (mut c1, _e) = spawn(&data, 7);
+        Command::new("/bin/true").status().unwrap();
+        let _ = c1.wait();
+
+        // Tamper with a record in the middle of a stored segment (any plain one).
+        let seg = data.join("segments");
+        let mut target = None;
+        for e in fs::read_dir(&seg).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_some_and(|x| x == "ndjson") {
+                target = Some(p);
+            }
+        }
+        let p = target.expect("a plain segment to modify");
+        let mut b = fs::read(&p).unwrap();
+        let at = b
+            .windows(7)
+            .position(|w| w == b"\"type\":")
+            .expect("a record");
+        b[at + 8] ^= 0x01; // flip a bit inside a record body
+        fs::write(&p, b).unwrap();
+
+        // Run 2: the scheduled check runs every 3 s and must notice.
+        let rules = t.path().join("rules.d");
+        fs::create_dir(&rules).unwrap();
+        let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rules");
+        fs::copy(
+            pack.join("integrity-failed.yml"),
+            rules.join("integrity-failed.yml"),
+        )
+        .unwrap();
+        let cfg = t.path().join("c.toml");
+        fs::write(
+            &cfg,
+            format!(
+                "[rules]\ndir = \"{}\"\n[api]\nsocket = \"{}\"\n",
+                rules.display(),
+                t.path().join("s/witness.sock").display()
+            ),
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_witnessd"))
+            .args(["run", "--config"])
+            .arg(&cfg)
+            .arg("--data-dir")
+            .arg(&data)
+            .args(["--seconds", "16"])
+            .env("WITNESS_VERIFY_EVERY_SECS", "3")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        let _ = child.wait();
+        let ev = records(&data);
+        let checks: Vec<_> = ev
+            .iter()
+            .filter(|e| e["type"] == "integrity_check")
+            .collect();
+        assert!(
+            checks.iter().any(|e| e["data"]["state"] == "broken"),
+            "no broken integrity_check: {checks:?}"
+        );
+        assert!(
+            ev.iter()
+                .any(|e| e["type"] == "alert"
+                    && e["data"]["rule_id"] == "witness.self.integrity-failed"),
+            "no alert for the failed check"
+        );
+    }
+}

@@ -1,0 +1,14 @@
+id: witness.self.integrity-failed
+title: Evidence chain verification failed
+description: >
+  The daemon re-verified the whole hash chain and it did not verify: a record was modified,
+  removed, reordered or truncated, or the store could not be read. Treat everything after the
+  last good check as suspect and compare the head against an off-host anchor.
+severity: critical
+tags: [attack.defense-evasion, attack.t1070]
+event: integrity_check
+match:
+  all:
+    - { field: data.state, op: ne, value: ok }
+alert:
+  fields: [data.state, data.trigger, data.problem, data.head_seq]

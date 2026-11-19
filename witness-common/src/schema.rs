@@ -858,6 +858,23 @@ pub struct ApiAccess {
     pub endpoint: String,
 }
 
+/// The result of verifying the whole chain, run by the daemon on a schedule or on request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityCheck {
+    /// `ok`, `broken` or `error`.
+    pub state: String,
+    /// `schedule`, `api` or `startup`.
+    pub trigger: String,
+    pub records: u64,
+    pub segments: u64,
+    pub head_seq: u64,
+    pub head_hash: String,
+    /// What the verifier found, when it is not `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+    pub duration_ms: u64,
+}
+
 /// Declares the body enum once; `KnownBody` mirrors it for deserialization so that an
 /// unrecognized `type` can fall back to [`Body::Other`] instead of failing the reader.
 macro_rules! bodies {
@@ -941,6 +958,7 @@ bodies! {
     Baseline(BaselineItem),
     ClockSync(ClockSync),
     ApiAccess(ApiAccess),
+    IntegrityCheck(IntegrityCheck),
 }
 
 impl<'de> Deserialize<'de> for Body {

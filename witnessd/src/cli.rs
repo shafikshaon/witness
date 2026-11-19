@@ -311,6 +311,10 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
         Ok(n) => tracing::info!(rules = n, dir = %cfg.rules.dir.display(), "rule engine active"),
         Err(e) => tracing::warn!(error = %e, "rule engine not started"),
     }
+    let integrity = {
+        let (first, every) = crate::integrity::intervals_from_env();
+        crate::integrity::Scheduler::start(data_dir.join("segments"), first, every)
+    };
     let api = match crate::api::Api::start(crate::api::ApiConfig {
         socket: cfg.api.socket.clone(),
         group: cfg.api.group.clone(),
@@ -503,6 +507,15 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                 }
             }
         }
+        for c in integrity.drain() {
+            if c.state != "ok" {
+                tracing::error!(state = %c.state, problem = ?c.problem, "INTEGRITY CHECK FAILED");
+            }
+            if let Err(e) = pipeline.record(witness_common::schema::Body::IntegrityCheck(c)) {
+                failure = Some(e);
+                break 'main;
+            }
+        }
         if let Some(a) = &api {
             for cmd in a.drain() {
                 let body = match cmd {
@@ -520,6 +533,9 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
                         },
                     ),
                     crate::api::ApiCmd::Access(a) => witness_common::schema::Body::ApiAccess(a),
+                    crate::api::ApiCmd::Integrity(c) => {
+                        witness_common::schema::Body::IntegrityCheck(c)
+                    }
                 };
                 if let Err(e) = pipeline.record(body) {
                     failure = Some(e);
@@ -573,6 +589,7 @@ pub fn run(config: &Path, data_dir: Option<PathBuf>, seconds: Option<u64>) -> Re
     if let Some(a) = api {
         a.stop();
     }
+    integrity.stop();
     let reason = match (&failure, signalled) {
         (Some(_), _) => "error",
         (None, Some(_)) => "signal",

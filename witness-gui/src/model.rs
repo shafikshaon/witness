@@ -5,9 +5,43 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-/// `2026-11-18 14:03:22.417` in UTC from nanoseconds since the Unix epoch.
+/// Seconds east of UTC added to every displayed time (0 = UTC).
+static TZ_OFFSET_SECS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn set_tz_offset(secs: i64) {
+    TZ_OFFSET_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The machine's current UTC offset in seconds, from `date +%z` (`+0600` → 21600).
+pub fn local_offset_secs() -> i64 {
+    std::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()
+        .and_then(|o| parse_zone(String::from_utf8_lossy(&o.stdout).trim()))
+        .unwrap_or(0)
+}
+
+/// `+0530` / `-0800` → seconds east of UTC.
+pub fn parse_zone(z: &str) -> Option<i64> {
+    let sign = match z.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let d = z.get(1..)?;
+    if d.len() != 4 || !d.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (h, m): (i64, i64) = (d[..2].parse().ok()?, d[2..].parse().ok()?);
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// `2026-11-18 14:03:22.417` from nanoseconds since the Unix epoch, in UTC unless a local
+/// offset has been set with [`set_tz_offset`].
 pub fn fmt_time(wall_ns: u64) -> String {
-    let secs = (wall_ns / 1_000_000_000) as i64;
+    let secs = (wall_ns / 1_000_000_000) as i64
+        + TZ_OFFSET_SECS.load(std::sync::atomic::Ordering::Relaxed);
     let ms = (wall_ns / 1_000_000) % 1000;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // Howard Hinnant's civil-from-days.
@@ -294,14 +328,125 @@ pub fn scale_bars(series: &[u64]) -> Vec<u32> {
     series.iter().map(|v| (v * 100 / max) as u32).collect()
 }
 
+/// The event after (`delta` = 1) or before (`-1`) `current` in `list`, by `seq`; the first
+/// event when nothing is selected. Stays on the end of the list rather than wrapping.
+pub fn step(list: &[Value], current: Option<&Value>, delta: i32) -> Option<Value> {
+    if list.is_empty() {
+        return None;
+    }
+    let at = current
+        .and_then(|c| list.iter().position(|e| e["seq"] == c["seq"]))
+        .map(|i| i as i64);
+    let next = match at {
+        Some(i) => (i + delta as i64).clamp(0, list.len() as i64 - 1),
+        None => 0,
+    };
+    list.get(next as usize).cloned()
+}
+
+/// Event kinds the daemon produces, for the Search kind picker.
+pub const KINDS: &[&str] = &[
+    "proc_exec",
+    "proc_exit",
+    "proc_fork",
+    "file_create",
+    "file_open_write",
+    "file_open_read",
+    "file_delete",
+    "file_truncate",
+    "file_rename",
+    "file_attr",
+    "file_link",
+    "file_hash",
+    "file_activity_summary",
+    "net_connect",
+    "net_accept",
+    "net_close",
+    "net_listen",
+    "net_listen_close",
+    "udp_flow",
+    "dns",
+    "login",
+    "logout",
+    "auth_fail",
+    "sudo",
+    "su",
+    "usb_device",
+    "block_device",
+    "module_load",
+    "module_unload",
+    "service_change",
+    "package_change",
+    "account_change",
+    "authorized_key_change",
+    "clock_change",
+    "alert",
+    "triage_action",
+    "rule_set_change",
+    "integrity_check",
+    "api_access",
+    "capture_gap",
+    "capture_drop",
+    "source_health",
+    "daemon_start",
+    "daemon_stop",
+    "baseline",
+];
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
 
+    /// The displayed time zone is global; tests that read or change it take this lock.
+    static TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn stepping_moves_by_seq_and_stops_at_the_ends() {
+        let l: Vec<Value> = (1..=3).map(|n| json!({"seq": n})).collect();
+        assert_eq!(
+            step(&l, None, 1).unwrap()["seq"],
+            1,
+            "nothing selected: start at the top"
+        );
+        assert_eq!(step(&l, Some(&l[0]), 1).unwrap()["seq"], 2);
+        assert_eq!(
+            step(&l, Some(&l[2]), 1).unwrap()["seq"],
+            3,
+            "no wrap past the end"
+        );
+        assert_eq!(
+            step(&l, Some(&l[0]), -1).unwrap()["seq"],
+            1,
+            "no wrap past the start"
+        );
+        // A selection that is no longer in the list restarts from the top.
+        assert_eq!(step(&l, Some(&json!({"seq": 99})), 1).unwrap()["seq"], 1);
+        assert!(step(&[], None, 1).is_none());
+    }
+
+    #[test]
+    fn zones_parse_and_shift_displayed_times() {
+        let _guard = TZ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(parse_zone("+0600"), Some(21_600));
+        assert_eq!(parse_zone("-0830"), Some(-30_600));
+        assert_eq!(parse_zone("+0000"), Some(0));
+        assert_eq!(parse_zone("UTC"), None);
+        assert_eq!(parse_zone("+06"), None);
+        set_tz_offset(21_600);
+        let shifted = fmt_time(1_795_010_975_165_861_169);
+        set_tz_offset(0);
+        assert_eq!(shifted, "2026-11-18 20:09:35.165");
+        assert_eq!(
+            fmt_time(1_795_010_975_165_861_169),
+            "2026-11-18 14:09:35.165"
+        );
+    }
+
     #[test]
     fn times_format_in_utc() {
+        let _guard = TZ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(fmt_time(0), "1970-01-01 00:00:00.000");
         assert_eq!(
             fmt_time(1_795_010_975_165_861_169),

@@ -102,13 +102,47 @@ fn text<'a>(v: &'a Value, path: &[&str]) -> &'a str {
     x.as_str().unwrap_or("")
 }
 
+/// Down/up (arrow keys or j/k) as +1/-1.
+fn key_delta(e: &KeyboardEvent) -> Option<i32> {
+    match e.key() {
+        Key::ArrowDown => Some(1),
+        Key::ArrowUp => Some(-1),
+        Key::Character(c) if c == "j" => Some(1),
+        Key::Character(c) if c == "k" => Some(-1),
+        _ => None,
+    }
+}
+
+/// `--page <name>` opens that page first (used for screenshots and bookmarks).
+fn initial_page() -> Page {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        let name = if a == "--page" {
+            args.next().unwrap_or_default()
+        } else if let Some(n) = a.strip_prefix("--page=") {
+            n.to_string()
+        } else {
+            continue;
+        };
+        if let Some((p, _)) = PAGES
+            .iter()
+            .find(|(_, label)| label.eq_ignore_ascii_case(&name))
+        {
+            return *p;
+        }
+    }
+    Page::Dashboard
+}
+
 // ---- shell ----------------------------------------------------------------------------
 
 #[component]
 pub fn App() -> Element {
     let client = use_context::<Client>();
-    let mut page = use_signal(|| Page::Dashboard);
+    let mut page = use_signal(initial_page);
     let search = use_signal(Query::default);
+    // `false` = UTC. Toggling remounts the page so every time is redrawn.
+    let mut local = use_signal(|| false);
     use_context_provider(|| page);
     use_context_provider(|| search);
 
@@ -134,6 +168,11 @@ pub fn App() -> Element {
                     button { class: if page() == p { "on" } else { "" }, onclick: move |_| page.set(p), "{name}" }
                 }
                 div { class: "spacer" }
+                button { title: "Show times in your local time zone", onclick: move |_| {
+                    let on = !local();
+                    model::set_tz_offset(if on { model::local_offset_secs() } else { 0 });
+                    local.set(on);
+                }, if local() { "Times: local" } else { "Times: UTC" } }
                 div { class: "conn",
                     match &*up.read() {
                         None => rsx! { "connecting…" },
@@ -146,7 +185,7 @@ pub fn App() -> Element {
                     }
                 }
             }
-            main { class: "main",
+            main { class: "main", key: "{local()}",
                 match page() {
                     Page::Live => rsx! { LivePage {} },
                     Page::Search => rsx! { SearchPage {} },
@@ -275,6 +314,7 @@ fn LivePage() -> Element {
     let mut filter = use_signal(String::new);
     let mut picked = use_signal(|| None::<Value>);
     let mut err = use_signal(|| None::<String>);
+    let mut wrap = use_signal(|| false);
 
     let feed = use_hook(|| {
         let feed = Arc::new(Mutex::new(Feed::default()));
@@ -341,17 +381,20 @@ fn LivePage() -> Element {
         .cloned()
         .collect();
     let n = rows.read().len();
+    let nav = shown.clone();
     rsx! {
         div { class: "bar",
             h2 { "Live" }
             input { placeholder: "filter what is shown…", value: "{filter}", oninput: move |e| filter.set(e.value()) }
             button { class: "btn", onclick: move |_| paused.set(!paused()), if paused() { "▶ Resume" } else { "⏸ Pause" } }
             button { class: "btn", onclick: move |_| rows.write().clear(), "Clear" }
+            label { class: "muted", input { r#type: "checkbox", checked: wrap(), onchange: move |e| wrap.set(e.checked()) } " wrap long lines" }
             span { class: "muted", "{n} received" }
         }
         if let Some(e) = err() { Failure { msg: format!("stream interrupted, retrying: {e}") } }
         div { class: "split",
-            div { class: "list",
+            div { class: if wrap() { "list wrap" } else { "list" }, tabindex: "0",
+                onkeydown: move |e| if let Some(d) = key_delta(&e) { e.prevent_default(); picked.set(model::step(&nav, picked().as_ref(), d)); },
                 if shown.is_empty() { div { class: "empty", "Waiting for activity…" } }
                 for e in shown {
                     EventRow { key: "{e[\"seq\"]}", e: e.clone(), selected: picked().as_ref().is_some_and(|p| p["seq"] == e["seq"]), onpick: move |v| picked.set(Some(v)) }
@@ -373,6 +416,7 @@ fn SearchPage() -> Element {
     let mut extra = use_signal(Vec::<Value>::new);
     let mut cursor = use_signal(|| None::<u64>);
     let mut exported = use_signal(|| None::<String>);
+    let mut wrap = use_signal(|| false);
     let mut fmt = use_signal(|| "ndjson".to_string());
 
     let c = client.clone();
@@ -440,7 +484,8 @@ fn SearchPage() -> Element {
             input { placeholder: "text: command, path, name…", value: "{draft().q}", style: "min-width:260px",
                 oninput: move |e| draft.write().q = e.value(),
                 onkeydown: move |e| if e.key() == Key::Enter { applied.set(draft()) } }
-            input { placeholder: "kind (e.g. proc_exec)", value: "{draft().kind}", oninput: move |e| draft.write().kind = e.value(),
+            datalist { id: "kinds", for k in model::KINDS { option { value: "{k}" } } }
+            input { list: "kinds", placeholder: "kind: start typing…", value: "{draft().kind}", oninput: move |e| draft.write().kind = e.value(),
                 onkeydown: move |e| if e.key() == Key::Enter { applied.set(draft()) } }
             select { onchange: move |e| { let s = e.value().parse::<u64>().ok(); let mut d = draft.write(); d.last_secs = s; d.from = None; d.to = None; },
                 option { value: "", "any time" }
@@ -450,6 +495,7 @@ fn SearchPage() -> Element {
             button { class: "btn primary", onclick: move |_| applied.set(draft()), "Search" }
             select { onchange: move |e| fmt.set(e.value()), option { value: "ndjson", "ndjson" } option { value: "json", "json" } option { value: "csv", "csv" } option { value: "bundle", "incident bundle (tar)" } }
             button { class: "btn", onclick: export, "Export results" }
+            label { class: "muted", input { r#type: "checkbox", checked: wrap(), onchange: move |e| wrap.set(e.checked()) } " wrap long lines" }
         }
         if let Some(m) = exported() { div { class: "conn", "{m}" } }
         {
@@ -465,9 +511,11 @@ fn SearchPage() -> Element {
             Some(Ok(v)) => {
                 let mut all = events_of(v);
                 all.extend(extra.read().iter().cloned());
+                let nav = all.clone();
                 rsx! {
                     div { class: "split",
-                        div { class: "list",
+                        div { class: if wrap() { "list wrap" } else { "list" }, tabindex: "0",
+                            onkeydown: move |e| if let Some(d) = key_delta(&e) { e.prevent_default(); picked.set(model::step(&nav, picked().as_ref(), d)); },
                             if all.is_empty() { div { class: "empty", "Nothing matches." } }
                             for e in all {
                                 EventRow { key: "{e[\"seq\"]}", e: e.clone(), selected: picked().as_ref().is_some_and(|p| p["seq"] == e["seq"]), onpick: move |v| picked.set(Some(v)) }

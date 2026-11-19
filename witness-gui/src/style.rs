@@ -43,6 +43,9 @@ button.btn.primary { background: var(--accent); color: #fff; border-color: var(-
 .row .d { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row.bad .d { color: var(--bad); font-weight: 600; } .row.warn .d { color: var(--warn); } .row.faint .d { color: var(--muted); }
 .row.strong .d { font-weight: 600; } .row.note .d { color: var(--note); }
+.list:focus { outline: none; }
+.wrap .row { align-items: start; }
+.wrap .row .d, .wrap .row .k { white-space: normal; overflow: visible; word-break: break-word; }
 .empty { padding: 40px; text-align: center; color: var(--muted); }
 .error { margin: 14px; padding: 10px 12px; background: var(--bad-bg); color: var(--bad); border-radius: 6px; }
 .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }

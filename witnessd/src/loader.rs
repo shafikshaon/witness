@@ -86,9 +86,10 @@ struct Hook {
     /// signature degrades the hook instead of letting the program read the wrong argument.
     /// `None` for tracepoints (their arguments are typed by BTF).
     params: Option<usize>,
-    /// A second accepted count, for functions whose signature changed between kernel versions
-    /// without moving the arguments the program reads (`*_recvmsg` lost `nonblock` in 5.19).
-    params_alt: Option<usize>,
+    /// Highest accepted count (with `params` as the lowest). Functions whose signature grew or
+    /// shrank at the end between kernel versions (`*_recvmsg` lost `nonblock` in 5.19 and
+    /// `addr_len` later) still have the arguments the program reads in the same places.
+    params_max: Option<usize>,
     attach: Attach,
     group: Group,
 }
@@ -104,26 +105,27 @@ const fn hook(
         prog,
         target,
         params,
-        params_alt: None,
+        params_max: None,
         attach,
         group,
     }
 }
 
-/// Like [`hook`], also accepting `alt` parameters.
-const fn hook_alt(
+/// Like [`hook`], accepting any parameter count from `min` to `max`: for functions whose
+/// trailing parameters changed across kernels while the leading ones this program reads did not.
+const fn hook_range(
     prog: &'static str,
     target: &'static str,
-    params: usize,
-    alt: usize,
+    min: usize,
+    max: usize,
     attach: Attach,
     group: Group,
 ) -> Hook {
     Hook {
         prog,
         target,
-        params: Some(params),
-        params_alt: Some(alt),
+        params: Some(min),
+        params_max: Some(max),
         attach,
         group,
     }
@@ -224,10 +226,13 @@ const HOOKS: [Hook; 27] = [
         Attach::KProbe,
         Group::Net,
     ),
-    hook(
+    // Only the return value is read, so the parameter count (4 before 6.10, 2 after) is
+    // immaterial.
+    hook_range(
         "tcp_accept",
         "inet_csk_accept",
-        Some(4),
+        2,
+        4,
         Attach::KProbe,
         Group::Net,
     ),
@@ -273,19 +278,19 @@ const HOOKS: [Hook; 27] = [
         Attach::KProbe,
         Group::Dns,
     ),
-    hook_alt(
+    hook_range(
         "udp_recv4_enter",
         "udp_recvmsg",
+        4,
         6,
-        5,
         Attach::KProbe,
         Group::Dns,
     ),
-    hook_alt(
+    hook_range(
         "udp_recv6_enter",
         "udpv6_recvmsg",
+        4,
         6,
-        5,
         Attach::KProbe,
         Group::Dns,
     ),
@@ -312,11 +317,11 @@ const HOOKS: [Hook; 27] = [
         Attach::KProbe,
         Group::Dns,
     ),
-    hook_alt(
+    hook_range(
         "tcp_dns_recv_enter",
         "tcp_recvmsg",
+        4,
         6,
-        5,
         Attach::KProbe,
         Group::Dns,
     ),
@@ -569,8 +574,15 @@ impl Collector {
                 match (h.params, btf.func_param_count(h.target)) {
                     (None, _) => Ok(()),
                     (Some(_), None) => Err(format!("{} is not in the kernel's BTF", h.target)),
-                    (Some(want), Some(n)) if n != want && Some(n) != h.params_alt => {
-                        Err(format!("{} has {n} parameters, expected {want}", h.target))
+                    (Some(want), Some(n)) if n < want || n > h.params_max.unwrap_or(want) => {
+                        Err(format!(
+                            "{} has {n} parameters, expected {}",
+                            h.target,
+                            match h.params_max {
+                                Some(max) if max != want => format!("{want} to {max}"),
+                                _ => want.to_string(),
+                            }
+                        ))
                     }
                     (Some(_), Some(_)) => Ok(()),
                 }

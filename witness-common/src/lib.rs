@@ -242,10 +242,10 @@ pub const PATH_CAP: usize = 1024;
 /// Longest single path component copied.
 pub const COMP_CAP: usize = 255;
 /// Deepest nesting (directories plus mount crossings) walked before the path is cut.
-pub const MAX_COMPONENTS: usize = 28;
+pub const MAX_COMPONENTS: usize = 24;
 /// Levels walked per path by hooks that report one path; two-path hooks (rename, link) walk two
 /// paths in one program and get fewer each so the verifier accepts them.
-pub const PATH_LEVELS: usize = 28;
+pub const PATH_LEVELS: usize = 24;
 pub const PATH_LEVELS_TWO: usize = 16;
 /// The per-CPU buffer the kernel walks paths into, right to left. Large enough that
 /// `MAX_COMPONENTS` components of `COMP_CAP + 1` bytes can never wrap it, which is what lets

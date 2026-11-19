@@ -290,7 +290,35 @@ impl Pipeline {
 
     /// Records a daemon-originated body (triage actions, API access) in the chain.
     pub fn record(&mut self, body: Body) -> Result<()> {
-        self.write(body)
+        let ev = self.envelope(body);
+        let fields = ev.to_fields()?;
+        let seq = match self.store.append(fields) {
+            Ok(a) => {
+                self.dirty = true;
+                a.seq
+            }
+            Err(StoreError::DiskFull) => return Ok(()),
+            Err(e) => return Err(e).context("writing a daemon record"),
+        };
+        // Daemon records (integrity checks, API access, triage) are evaluated like captured
+        // events, so a rule can alert on them. Alerts themselves are never re-evaluated.
+        if !matches!(ev.body, Body::Alert(_)) {
+            self.evaluate(seq, &ev)?;
+        }
+        Ok(())
+    }
+
+    /// Runs the rules over a stored event and records any alerts.
+    fn evaluate(&mut self, seq: u64, ev: &Event) -> Result<()> {
+        let alerts = match &mut self.rules {
+            Some(r) => r.process(seq, ev),
+            None => Vec::new(),
+        };
+        for al in alerts {
+            tracing::warn!(rule = %al.rule_id, severity = ?al.severity, "ALERT: {}", al.title);
+            self.write(Body::Alert(al))?;
+        }
+        Ok(())
     }
 
     /// Stores one captured event, subject to the disk-full policy, then evaluates the rules
@@ -304,14 +332,7 @@ impl Pipeline {
         {
             Append::Written(a) => {
                 self.dirty = true;
-                let alerts = match &mut self.rules {
-                    Some(r) => r.process(a.seq, ev),
-                    None => Vec::new(),
-                };
-                for al in alerts {
-                    tracing::warn!(rule = %al.rule_id, severity = ?al.severity, "ALERT: {}", al.title);
-                    self.write(Body::Alert(al))?;
-                }
+                self.evaluate(a.seq, ev)?;
             }
             Append::Dropped => self.stats.shed += 1,
         }

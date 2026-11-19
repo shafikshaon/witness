@@ -576,44 +576,44 @@ unsafe fn build_path(
     while i < max {
         i += 1;
         let head = read_dentry_head(dentry.add(o.dentry_d_parent as usize));
-        // The path ends here, and continues at the mount point in the parent mount, when this
-        // dentry is the root of its *mount* (`mnt_root`, see above) or of its filesystem. Bitwise
-        // `|` keeps it one branch: three short-circuit tests triple the verifier's state space.
+        // This dentry is the root of its *mount* (`mnt_root`) or of its filesystem: the path
+        // continues at the mount point in the parent mount instead of with this name.
         let is_root = (dentry as u64 == mnt_root) | (head.parent == dentry as u64) | (head.parent == 0);
-        if is_root {
-            // Root of this mount: continue at its mount point in the parent mount.
-            if mnt.is_null() || EXP == 4 {
-                at_root = true;
-                break;
-            }
-            let mount = mnt.sub(o.mount_mnt as usize);
-            let m = read_mount_head(mount.add(o.mount_mnt_parent as usize));
-            if m.parent == 0 || m.parent == mount as u64 {
-                at_root = true; // the namespace root
-                break;
-            }
-            dentry = m.mountpoint as *const u8;
-            mnt = (m.parent as *const u8).add(o.mount_mnt as usize);
-            mnt_root = rd_or(mnt, 0, 0);
-            continue;
-        }
-        if head.len == 0 || head.name == 0 {
+        // The mount's parent and mount point, read every iteration and used only when crossing.
+        // Nothing below branches on `is_root`: both candidate next steps are computed and one is
+        // selected with a mask, so the verifier sees one path per level instead of two.
+        let mount = mnt.wrapping_sub(o.mount_mnt as usize);
+        let m = read_mount_head(mount.add(o.mount_mnt_parent as usize));
+        // Only a crossing can end the walk at the namespace root (a rare, terminal exit).
+        if is_root & ((m.parent == 0) | (m.parent == mount as u64) | mnt.is_null() | (EXP == 4)) {
+            at_root = true;
             break;
         }
+        // An unreadable name ends the walk (also terminal); crossing iterations have no name.
+        if !is_root & ((head.len == 0) | (head.name == 0)) {
+            break;
+        }
+        let keep = (!is_root) as usize; // 1 when this iteration adds a name, else 0
         // NAME_MAX is 255, so masking changes nothing for any real name; it replaces a
-        // clamp branch whose two outcomes would both stay live through every later level.
-        // Oversized-name evidence is OR-ed into `wide` and tested once after the loop.
-        wide |= head.len >> 8;
-        let len = (head.len & 0xff) as usize;
-        // Never actually wraps (see above); the mask is for the verifier.
-        off = off.wrapping_sub(len + 1) & (SCRATCH_LEN - 1);
+        // clamp branch. Oversized-name evidence is OR-ed into `wide`, tested after the loop.
+        wide |= (head.len >> 8) * keep as u32;
+        let len = ((head.len & 0xff) as usize) * keep;
+        // Never wraps (see above); the masks are for the verifier. A crossing leaves `off`
+        // alone and rewrites the '/' already there (or a harmless byte on the first level).
+        off = off.wrapping_sub((len + 1) * keep) & (SCRATCH_LEN - 1);
         *scratch.add(off) = b'/';
         let _ = generated::bpf_probe_read_kernel(
             scratch.add(off + 1).cast(),
             len as u32,
             (head.name as *const u8).cast(),
         );
-        dentry = head.parent as *const u8;
+        // Next dentry and mount: the mount point in the parent mount when crossing, else the
+        // parent directory.
+        let cross = (is_root as u64).wrapping_neg(); // all ones when crossing
+        dentry = ((m.mountpoint & cross) | (head.parent & !cross)) as *const u8;
+        let parent_mnt = (m.parent as *const u8).wrapping_add(o.mount_mnt as usize) as u64;
+        mnt = ((parent_mnt & cross) | (mnt as u64 & !cross)) as *const u8;
+        mnt_root = rd_or(mnt, 0, 0);
     }
     let mut trunc = (wide != 0) as u32;
     if !at_root {

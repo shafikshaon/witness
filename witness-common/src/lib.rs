@@ -25,6 +25,8 @@ pub mod kind {
     pub const DNS: u16 = 21;
     /// A kernel module load or free ([`super::ModuleEvent`]).
     pub const MODULE: u16 = 22;
+    /// A UDP flow summary ([`super::UdpBody`]), assembled in userspace from the flow table.
+    pub const NET_UDP: u16 = 23;
 }
 
 /// File operations carried in [`FileBody::op`] / [`FileTwoBody::op`].
@@ -470,124 +472,19 @@ impl NetBody {
             u64::from_ne_bytes(a)
         };
         let mut laddr = [0u8; 16];
-        laddr.copy_from_slice(&b[16..32]);
+        laddr.copy_from_slice(&b[24..40]);
         let mut raddr = [0u8; 16];
-        raddr.copy_from_slice(&b[32..48]);
-        let mut comm = [0u8; COMM_LEN];
-        comm.copy_from_slice(&b[80..96]);
-        Some(Self {
-            op: u32_at(0),
-            family: u32_at(4),
-            lport: u16_at(8),
-            rport: u16_at(10),
-            flags: u32_at(12),
-            laddr,
-            raddr,
-            bytes_sent: u64_at(48),
-            bytes_recv: u64_at(56),
-            duration_ns: u64_at(64),
-            old_state: u32_at(72),
-            new_state: u32_at(76),
-            comm,
-        })
-    }
-}
-
-/// [`ModuleBody::op`] values.
-pub mod modop {
-    pub const LOAD: u32 = 1;
-    pub const FREE: u32 = 2;
-}
-
-/// `MODULE_NAME_LEN` in the kernel.
-pub const MODULE_NAME_LEN: usize = 56;
-
-/// Body of a [`kind::MODULE`] record.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ModuleBody {
-    pub op: u32,
-    pub _pad: u32,
-    /// `struct module::taints` bit mask.
-    pub taints: u64,
-    pub name: [u8; MODULE_NAME_LEN],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ModuleEvent {
-    pub hdr: RawHdr,
-    pub body: ModuleBody,
-}
-
-impl ModuleBody {
-    pub const SIZE: usize = 16 + MODULE_NAME_LEN;
-
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        let b = buf.get(..Self::SIZE)?;
-        let mut t = [0u8; 8];
-        t.copy_from_slice(&b[8..16]);
-        let mut name = [0u8; MODULE_NAME_LEN];
-        name.copy_from_slice(&b[16..]);
-        Some(Self {
-            op: u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-            _pad: 0,
-            taints: u64::from_ne_bytes(t),
-            name,
-        })
-    }
-}
-
-const _: () = assert!(core::mem::size_of::<ModuleBody>() == ModuleBody::SIZE);
-
-/// DNS packet direction carried in [`DnsBody::dir`].
-pub const DNS_QUERY: u32 = 1;
-pub const DNS_RESPONSE: u32 = 2;
-/// Bytes of each DNS packet copied out of the kernel (a typical response fits; larger ones are
-/// flagged truncated).
-pub const DNS_CAP: usize = 512;
-
-/// Body of a [`kind::DNS`] record: the raw packet; parsing happens in userspace.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct DnsBody {
-    pub dir: u32,
-    pub family: u32,
-    pub lport: u16,
-    pub rport: u16,
-    /// Bytes of `payload` that are valid.
-    pub len: u32,
-    pub laddr: [u8; 16],
-    pub raddr: [u8; 16],
-    pub payload: [u8; DNS_CAP],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct DnsEvent {
-    pub hdr: RawHdr,
-    pub body: DnsBody,
-}
-
-impl DnsBody {
-    pub const SIZE: usize = 48 + DNS_CAP;
-
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        let b = buf.get(..Self::SIZE)?;
-        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-        let u16_at = |o: usize| u16::from_ne_bytes([b[o], b[o + 1]]);
-        let mut laddr = [0u8; 16];
-        laddr.copy_from_slice(&b[16..32]);
-        let mut raddr = [0u8; 16];
-        raddr.copy_from_slice(&b[32..48]);
+        raddr.copy_from_slice(&b[40..56]);
         let mut payload = [0u8; DNS_CAP];
-        payload.copy_from_slice(&b[48..Self::SIZE]);
+        payload.copy_from_slice(&b[56..Self::SIZE]);
         Some(Self {
             dir: u32_at(0),
             family: u32_at(4),
             lport: u16_at(8),
             rport: u16_at(10),
             len: u32_at(12),
+            proto: u32_at(16),
+            _pad: 0,
             laddr,
             raddr,
             payload,

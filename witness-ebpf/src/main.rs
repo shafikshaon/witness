@@ -19,7 +19,7 @@ use aya_ebpf::{
     programs::{BtfTracePointContext, ProbeContext, RetProbeContext},
 };
 use witness_common::{
-    nop, modop, ConnInfo, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
+    nop, modop, ConnInfo, FlowKey, FlowVal, FLOWS_MAX, UdpBody, DnsEvent, InodeKey, NetAddrs, NetEvent, RecvCtx, DNS_CAP, DNS_QUERY,
     DNS_RESPONSE, RECV_MAX, AF_INET, CONNS_MAX, RESULT_UNKNOWN, SENSITIVE_MAX, fop, kind, ExecEvent, ExitEvent, FileEvent, FileTwoEvent, ForkEvent, ModuleEvent, Offsets, RawHdr,
     ARGV_CAP, DROP_CLASS_CRITICAL, DROP_CLASS_VOLUME, FILENAME_CAP, FORK_THREAD,
     MAX_COMPONENTS, PATH_CAP, SCRATCH_BUF, SCRATCH_LEN, TTY_LEN, UNAVAILABLE,
@@ -44,6 +44,14 @@ static SENSITIVE: HashMap<InodeKey, u8> = HashMap::with_max_entries(SENSITIVE_MA
 /// process" is arbitrary, so they are attributed from here. LRU keeps it bounded.
 #[map]
 static CONNS: LruHashMap<u64, ConnInfo> = LruHashMap::with_max_entries(CONNS_MAX, 0);
+
+/// UDP flow counters per process and socket pair; userspace reads and clears it periodically.
+#[map]
+static FLOWS: HashMap<FlowKey, FlowVal> = HashMap::with_max_entries(FLOWS_MAX, 0);
+
+/// Scratch space for building a new flow entry off the 512-byte BPF stack.
+#[map]
+static FLOW_TMP: PerCpuArray<FlowVal> = PerCpuArray::with_max_entries(1, 0);
 
 /// What an in-flight `udp_recvmsg` was asked to fill, keyed by `pid_tgid`, saved at entry because
 /// the kernel advances the iterator past the data before returning.
@@ -1182,7 +1190,21 @@ unsafe fn first_buffer(msg: *const u8, o: &Offsets) -> (u64, u64) {
 
 /// Emits one DNS packet record. `buf`/`buf_len` is where the packet is in the process's memory.
 #[inline(always)]
-unsafe fn emit_dns(dir: u32, addrs: &NetAddrs, buf: u64, buf_len: u64, o: &Offsets) {
+unsafe fn emit_dns(
+    dir: u32,
+    proto: u32,
+    addrs: &NetAddrs,
+    buf: u64,
+    buf_len: u64,
+    skip: u64,
+    o: &Offsets,
+) {
+    // `skip` drops the 2-byte length prefix of DNS over TCP.
+    if buf_len <= skip {
+        return;
+    }
+    let buf = buf + skip;
+    let buf_len = buf_len - skip;
     let Some(mut entry) = VOLUME.reserve::<DnsEvent>(0) else {
         count_drop(DROP_CLASS_VOLUME);
         return;
@@ -1204,6 +1226,8 @@ unsafe fn emit_dns(dir: u32, addrs: &NetAddrs, buf: u64, buf_len: u64, o: &Offse
     (*b).laddr = addrs.laddr;
     (*b).raddr = addrs.raddr;
     (*b).len = 0;
+    (*b).proto = proto;
+    (*b)._pad = 0;
     let mut n = buf_len;
     if n > DNS_CAP as u64 {
         n = DNS_CAP as u64;
@@ -1244,11 +1268,56 @@ unsafe fn on_udp_send(ctx: &ProbeContext) {
     let name: u64 = rd_or(msg, o.msghdr_msg_name, 0);
     let mut a = NetAddrs::ZERO;
     udp_addrs(&mut a, sk, name, &o);
-    if a.rport != DNS_PORT {
+    if a.rport == DNS_PORT {
+        let (buf, len) = first_buffer(msg, &o);
+        emit_dns(DNS_QUERY, 0, &a, buf, len, 0, &o);
+    } else {
+        // udp_sendmsg(sk, msg, len): len is the payload size.
+        let len: u64 = ctx.arg(2).unwrap_or(0);
+        account_flow(&a, 1, len, 0, 0, &o);
+    }
+}
+
+/// Adds to a UDP flow's counters, creating the entry (with the owner's header) on first sight.
+/// Concurrent updates from several CPUs are not atomic, so counts are approximate under load.
+#[inline(always)]
+unsafe fn account_flow(a: &NetAddrs, ptx: u64, btx: u64, prx: u64, brx: u64, o: &Offsets) {
+    let key = FlowKey {
+        family: a.family,
+        lport: a.lport,
+        rport: a.rport,
+        laddr: a.laddr,
+        raddr: a.raddr,
+        tgid: (bpf_get_current_pid_tgid() >> 32) as u32,
+        _pad: 0,
+    };
+    if let Some(v) = FLOWS.get_ptr_mut(&key) {
+        (*v).pkts_tx = (*v).pkts_tx.wrapping_add(ptx);
+        (*v).bytes_tx = (*v).bytes_tx.wrapping_add(btx);
+        (*v).pkts_rx = (*v).pkts_rx.wrapping_add(prx);
+        (*v).bytes_rx = (*v).bytes_rx.wrapping_add(brx);
         return;
     }
-    let (buf, len) = first_buffer(msg, &o);
-    emit_dns(DNS_QUERY, &a, buf, len, &o);
+    let Some(t) = FLOW_TMP.get_ptr_mut(0) else {
+        return;
+    };
+    let task = generated::bpf_get_current_task() as *const u8;
+    fill_hdr(
+        addr_of_mut!((*t).hdr),
+        kind::NET_UDP,
+        RawHdr::SIZE + UdpBody::SIZE,
+        task,
+        o,
+    );
+    (*t).pkts_tx = ptx;
+    (*t).bytes_tx = btx;
+    (*t).pkts_rx = prx;
+    (*t).bytes_rx = brx;
+    (*t).first_boot_ns = bpf_ktime_get_boot_ns();
+    (*t).comm = comm_or_zero();
+    if FLOWS.insert(&key, &*t, 0).is_err() {
+        count_drop(DROP_CLASS_VOLUME);
+    }
 }
 
 #[kprobe(function = "udp_sendmsg")]
@@ -1271,12 +1340,6 @@ unsafe fn on_udp_recv_enter(ctx: &ProbeContext) {
     let sk: u64 = ctx.arg(0).unwrap_or(0);
     let msg: *const u8 = ctx.arg(1).unwrap_or(null());
     let o = offsets();
-    // A socket connected to something other than a resolver cannot be receiving DNS answers;
-    // an unconnected one (port 0) might.
-    let dport = u16::from_be(rd_or::<u16>(sk as *const u8, o.sock_skc_dport, 0));
-    if dport != DNS_PORT && dport != 0 {
-        return;
-    }
     let (buf, buf_len) = first_buffer(msg, &o);
     let saved = RecvCtx {
         sk,
@@ -1305,7 +1368,9 @@ unsafe fn on_udp_recv_return(ctx: &RetProbeContext) {
             if n > (*saved).buf_len {
                 n = (*saved).buf_len;
             }
-            emit_dns(DNS_RESPONSE, &a, (*saved).buf, n, &o);
+            emit_dns(DNS_RESPONSE, 0, &a, (*saved).buf, n, 0, &o);
+        } else {
+            account_flow(&a, 0, 0, 1, got as u64, &o);
         }
     }
     let _ = RECV.remove(&key);
@@ -1336,6 +1401,80 @@ pub fn udp_recv4_ret(ctx: RetProbeContext) -> u32 {
 pub fn udp_recv6_ret(ctx: RetProbeContext) -> u32 {
     // SAFETY: as above.
     unsafe { on_udp_recv_return(&ctx) };
+    0
+}
+
+// ---- DNS over TCP (port 53) -----------------------------------------------------------
+
+/// tcp_sendmsg(sk, msg, size): a query to a resolver on TCP/53. The first two bytes are the
+/// DNS-over-TCP length prefix.
+#[inline(always)]
+unsafe fn on_tcp_dns_send(ctx: &ProbeContext) {
+    let sk: *const u8 = ctx.arg(0).unwrap_or(null());
+    let o = offsets();
+    let dport = u16::from_be(rd_or::<u16>(sk, o.sock_skc_dport, 0));
+    if dport != DNS_PORT || is_self() {
+        return;
+    }
+    let msg: *const u8 = ctx.arg(1).unwrap_or(null());
+    let mut a = NetAddrs::ZERO;
+    read_addrs_into(&mut a, sk, &o);
+    let (buf, len) = first_buffer(msg, &o);
+    emit_dns(DNS_QUERY, 1, &a, buf, len, 2, &o);
+}
+
+#[kprobe(function = "tcp_sendmsg")]
+pub fn tcp_dns_send(ctx: ProbeContext) -> u32 {
+    // SAFETY: kernel memory is only read through the probe-read helper.
+    unsafe { on_tcp_dns_send(&ctx) };
+    0
+}
+
+#[kprobe(function = "tcp_recvmsg")]
+pub fn tcp_dns_recv_enter(ctx: ProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe {
+        let sk: u64 = ctx.arg(0).unwrap_or(0);
+        let o = offsets();
+        let dport = u16::from_be(rd_or::<u16>(sk as *const u8, o.sock_skc_dport, 0));
+        if dport != DNS_PORT {
+            return 0;
+        }
+        let msg: *const u8 = ctx.arg(1).unwrap_or(null());
+        let (buf, buf_len) = first_buffer(msg, &o);
+        let saved = RecvCtx {
+            sk,
+            msg_name: 0,
+            buf,
+            buf_len,
+        };
+        let key = bpf_get_current_pid_tgid();
+        let _ = RECV.insert(&key, &saved, 0);
+    }
+    0
+}
+
+#[kretprobe(function = "tcp_recvmsg")]
+pub fn tcp_dns_recv_ret(ctx: RetProbeContext) -> u32 {
+    // SAFETY: as above.
+    unsafe {
+        let key = bpf_get_current_pid_tgid();
+        let Some(saved) = RECV.get_ptr(&key) else {
+            return 0;
+        };
+        let got: i64 = ctx.ret();
+        if got > 2 && !is_self() {
+            let o = offsets();
+            let mut a = NetAddrs::ZERO;
+            read_addrs_into(&mut a, (*saved).sk as *const u8, &o);
+            let mut n = got as u64;
+            if n > (*saved).buf_len {
+                n = (*saved).buf_len;
+            }
+            emit_dns(DNS_RESPONSE, 1, &a, (*saved).buf, n, 2, &o);
+        }
+        let _ = RECV.remove(&key);
+    }
     0
 }
 

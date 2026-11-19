@@ -37,6 +37,10 @@ tar xzf %{SOURCE0}
 # Nothing to build: the binaries were produced by cargo.
 
 %install
+mkdir -p %{buildroot}%{_sbindir}
+# %{_sbindir} is /usr/bin on merged-/usr systems (Fedora) and /usr/sbin elsewhere.
+mv usr/sbin/witnessd %{buildroot}%{_sbindir}/witnessd
+rmdir usr/sbin
 mkdir -p %{buildroot}
 cp -a . %{buildroot}/
 rm -f %{buildroot}/witness-stage.tar.gz
@@ -77,3 +81,8 @@ fi
 %files gui
 %{_bindir}/witness-gui
 %{_datadir}/applications/witness.desktop
+
+%changelog
+* Thu Nov 19 2026 Witness contributors <noreply@example.invalid> - %{version}-1
+- Binary package built from release binaries.
+

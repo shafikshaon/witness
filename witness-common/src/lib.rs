@@ -472,6 +472,116 @@ impl NetBody {
             u64::from_ne_bytes(a)
         };
         let mut laddr = [0u8; 16];
+        laddr.copy_from_slice(&b[16..32]);
+        let mut raddr = [0u8; 16];
+        raddr.copy_from_slice(&b[32..48]);
+        let mut comm = [0u8; COMM_LEN];
+        comm.copy_from_slice(&b[80..96]);
+        Some(Self {
+            op: u32_at(0),
+            family: u32_at(4),
+            lport: u16_at(8),
+            rport: u16_at(10),
+            flags: u32_at(12),
+            laddr,
+            raddr,
+            bytes_sent: u64_at(48),
+            bytes_recv: u64_at(56),
+            duration_ns: u64_at(64),
+            old_state: u32_at(72),
+            new_state: u32_at(76),
+            comm,
+        })
+    }
+}
+
+/// [`ModuleBody::op`] values.
+pub mod modop {
+    pub const LOAD: u32 = 1;
+    pub const FREE: u32 = 2;
+}
+
+/// `MODULE_NAME_LEN` in the kernel.
+pub const MODULE_NAME_LEN: usize = 56;
+
+/// Body of a [`kind::MODULE`] record.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ModuleBody {
+    pub op: u32,
+    pub _pad: u32,
+    /// `struct module::taints` bit mask.
+    pub taints: u64,
+    pub name: [u8; MODULE_NAME_LEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ModuleEvent {
+    pub hdr: RawHdr,
+    pub body: ModuleBody,
+}
+
+impl ModuleBody {
+    pub const SIZE: usize = 16 + MODULE_NAME_LEN;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let mut t = [0u8; 8];
+        t.copy_from_slice(&b[8..16]);
+        let mut name = [0u8; MODULE_NAME_LEN];
+        name.copy_from_slice(&b[16..]);
+        Some(Self {
+            op: u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+            _pad: 0,
+            taints: u64::from_ne_bytes(t),
+            name,
+        })
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ModuleBody>() == ModuleBody::SIZE);
+
+/// DNS packet direction carried in [`DnsBody::dir`].
+pub const DNS_QUERY: u32 = 1;
+pub const DNS_RESPONSE: u32 = 2;
+/// Bytes of each DNS packet copied out of the kernel (a typical response fits; larger ones are
+/// flagged truncated).
+pub const DNS_CAP: usize = 512;
+
+/// Body of a [`kind::DNS`] record: the raw packet; parsing happens in userspace.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsBody {
+    pub dir: u32,
+    pub family: u32,
+    pub lport: u16,
+    pub rport: u16,
+    /// Bytes of `payload` that are valid.
+    pub len: u32,
+    /// 0 = UDP, 1 = TCP (the 2-byte length prefix is already removed).
+    pub proto: u32,
+    pub _pad: u32,
+    pub laddr: [u8; 16],
+    pub raddr: [u8; 16],
+    pub payload: [u8; DNS_CAP],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsEvent {
+    pub hdr: RawHdr,
+    pub body: DnsBody,
+}
+
+impl DnsBody {
+    pub const SIZE: usize = 56 + DNS_CAP;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u16_at = |o: usize| u16::from_ne_bytes([b[o], b[o + 1]]);
+        let mut laddr = [0u8; 16];
         laddr.copy_from_slice(&b[24..40]);
         let mut raddr = [0u8; 16];
         raddr.copy_from_slice(&b[40..56]);
@@ -495,6 +605,115 @@ impl NetBody {
         &self.payload[..(self.len as usize).min(DNS_CAP)]
     }
 }
+
+/// Flows tracked at once in the kernel (per process and socket pair).
+pub const FLOWS_MAX: u32 = 8192;
+
+/// Key of a UDP flow: one process talking between two socket addresses.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FlowKey {
+    pub family: u32,
+    pub lport: u16,
+    pub rport: u16,
+    pub laddr: [u8; 16],
+    pub raddr: [u8; 16],
+    pub tgid: u32,
+    pub _pad: u32,
+}
+
+/// Counters for a flow, with the owning process's header taken when the flow was first seen.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FlowVal {
+    pub hdr: RawHdr,
+    pub pkts_tx: u64,
+    pub bytes_tx: u64,
+    pub pkts_rx: u64,
+    pub bytes_rx: u64,
+    pub first_boot_ns: u64,
+    pub comm: [u8; COMM_LEN],
+}
+
+/// Body of a [`kind::NET_UDP`] record.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UdpBody {
+    pub family: u32,
+    pub lport: u16,
+    pub rport: u16,
+    pub laddr: [u8; 16],
+    pub raddr: [u8; 16],
+    pub pkts_tx: u64,
+    pub bytes_tx: u64,
+    pub pkts_rx: u64,
+    pub bytes_rx: u64,
+    pub first_boot_ns: u64,
+    pub comm: [u8; COMM_LEN],
+}
+
+impl UdpBody {
+    pub const SIZE: usize = 96;
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        let b = buf.get(..Self::SIZE)?;
+        let u64_at = |o: usize| {
+            let mut x = [0u8; 8];
+            x.copy_from_slice(&b[o..o + 8]);
+            u64::from_ne_bytes(x)
+        };
+        let mut laddr = [0u8; 16];
+        laddr.copy_from_slice(&b[8..24]);
+        let mut raddr = [0u8; 16];
+        raddr.copy_from_slice(&b[24..40]);
+        let mut comm = [0u8; COMM_LEN];
+        comm.copy_from_slice(&b[80..80 + COMM_LEN]);
+        Some(Self {
+            family: u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+            lport: u16::from_ne_bytes([b[4], b[5]]),
+            rport: u16::from_ne_bytes([b[6], b[7]]),
+            laddr,
+            raddr,
+            pkts_tx: u64_at(40),
+            bytes_tx: u64_at(48),
+            pkts_rx: u64_at(56),
+            bytes_rx: u64_at(64),
+            first_boot_ns: u64_at(72),
+            comm,
+        })
+    }
+
+    /// The record the decoder reads: `hdr` (the flow owner's) followed by this body.
+    #[cfg(feature = "std")]
+    pub fn to_record(&self, hdr: &RawHdr, now_boot_ns: u64) -> Vec<u8> {
+        let mut h = *hdr;
+        h.kind = kind::NET_UDP;
+        h.len = (RawHdr::SIZE + Self::SIZE) as u32;
+        h.boot_ns = now_boot_ns;
+        let mut out = Vec::with_capacity(RawHdr::SIZE + Self::SIZE);
+        out.extend_from_slice(&h.to_bytes());
+        out.extend_from_slice(&self.family.to_ne_bytes());
+        out.extend_from_slice(&self.lport.to_ne_bytes());
+        out.extend_from_slice(&self.rport.to_ne_bytes());
+        out.extend_from_slice(&self.laddr);
+        out.extend_from_slice(&self.raddr);
+        for v in [
+            self.pkts_tx,
+            self.bytes_tx,
+            self.pkts_rx,
+            self.bytes_rx,
+            self.first_boot_ns,
+        ] {
+            out.extend_from_slice(&v.to_ne_bytes());
+        }
+        out.extend_from_slice(&self.comm);
+        out
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<UdpBody>() == UdpBody::SIZE);
+const _: () = assert!(core::mem::size_of::<FlowKey>() == 48);
+const _: () = assert!(core::mem::size_of::<FlowVal>() == RawHdr::SIZE + 40 + COMM_LEN);
 
 /// What `udp_recvmsg` was asked to fill, remembered at entry: by the time it returns the
 /// kernel has advanced the iterator past the data, so the buffer must be saved up front.

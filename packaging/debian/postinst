@@ -4,11 +4,12 @@ case "$1" in
 configure)
     getent group witness >/dev/null || groupadd --system witness
     getent group witness-admin >/dev/null || groupadd --system witness-admin
-    # Fresh install only (an upgrade must not re-add someone who was removed on purpose):
+    # Fresh install, or an upgrade from before 0.1.1 (which never did this). Later upgrades
+    # must not re-add someone who was removed from the group on purpose:
     # let the person who ran the install read the data, so nothing is left to do by hand.
     # sudo sets SUDO_USER, pkexec sets PKEXEC_UID; a software centre sets neither, so fall
     # back to the user logged in at the seat.
-    if [ -z "$2" ]; then
+    if [ -z "$2" ] || dpkg --compare-versions "$2" lt 0.1.1; then
         who=${SUDO_USER:-}
         if [ -z "$who" ] && [ -n "${PKEXEC_UID:-}" ]; then
             who=$(getent passwd "$PKEXEC_UID" | cut -d: -f1)

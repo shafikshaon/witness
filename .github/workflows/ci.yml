@@ -4,7 +4,6 @@ name: ci
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
 
 env:
@@ -62,21 +61,30 @@ jobs:
             dist/*.deb
             dist/SHA256SUMS
 
-  # Runs only for a pushed version tag (git tag v0.1.0 && git push origin v0.1.0).
+  # Publishes a GitHub Release only when `version` in Cargo.toml has no release yet, i.e. after
+  # a version bump lands on main. Any other push to main skips this job's work.
   release:
     runs-on: ubuntu-22.04
     needs: package
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: debs
           path: dist
-      - name: Publish release
+      - name: Publish release if this version is new
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --title "Witness $GITHUB_REF_NAME" --generate-notes
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          TAG="v$VERSION"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to publish (bump version in Cargo.toml to release)."
+            exit 0
+          fi
+          gh release create "$TAG" dist/*.deb dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Witness $TAG" --generate-notes

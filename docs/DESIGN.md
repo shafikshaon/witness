@@ -950,7 +950,7 @@ I develop on macOS and cannot load eBPF there, so every claim says where it was 
 
 | Platform | Result |
 |---|---|
-| Ubuntu 24.04, kernel 6.8, aarch64 | 40/40 on the last run. One test (`shell-on-socket`) failed in **two earlier full-suite runs** and passed in the third and in every partial run; **the cause was never captured**. Treat it as an unexplained intermittent failure. |
+| Ubuntu 24.04, kernel 6.8.0-147, aarch64 | 40/40 on the final code in two consecutive full runs on a fresh VM, and 8/8 for `shell-on-socket` alone. On earlier code one test (`shell-on-socket`) failed in two full-suite runs and then passed; **the cause was never captured and has not been reproduced**, so it is not known to be fixed. |
 | Fedora 45, kernel 7.2.11, aarch64, SELinux enforcing, btrfs, dnf5 | 40/40. Daemon runs as `unconfined_service_t` with no denials; no SELinux policy module was written. |
 | Ubuntu 22.04, x86_64 under QEMU emulation | **Not rerun.** The last run (33 tests) was on code from before argv chunks, exec records, the mount-root fix and most fixes in §2.12-2.12a. The amd64 `.deb` in `dist/outdated/` is that old build. Emulated, never native Intel/AMD. |
 

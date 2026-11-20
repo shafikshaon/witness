@@ -9,6 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   EBPF_NIGHTLY: nightly-2026-11-17
+  # Prebuilt release (cargo install needs llvm-config); hash is of the file as downloaded.
+  BPF_LINKER_SHA256: 0e9b2b30f68898177f1cb6f0ecbfa909a82479473a49a0ef66529fd088e3e410
 
 jobs:
   userspace:
@@ -21,7 +23,11 @@ jobs:
       - name: Install eBPF toolchain
         run: |
           rustup toolchain install "$EBPF_NIGHTLY" --component rust-src
-          cargo install bpf-linker --locked
+          BL=bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          curl -fsSLO "https://github.com/aya-rs/bpf-linker/releases/download/v0.13.0/$BL"
+          echo "$BPF_LINKER_SHA256  $BL" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin" && tar --zstd -xf "$BL" -C "$HOME/.local/bin" bpf-linker
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: GUI system libraries
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev
       - run: cargo fmt --all --check
@@ -38,7 +44,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: |
           rustup toolchain install "$EBPF_NIGHTLY" --component rust-src
-          cargo install bpf-linker --locked
+          BL=bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          curl -fsSLO "https://github.com/aya-rs/bpf-linker/releases/download/v0.13.0/$BL"
+          echo "$BPF_LINKER_SHA256  $BL" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin" && tar --zstd -xf "$BL" -C "$HOME/.local/bin" bpf-linker
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev
       - run: cargo build --release -p witnessd -p witness-cli -p witness-gui
       - run: packaging/build-deb.sh

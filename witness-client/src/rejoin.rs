@@ -92,6 +92,75 @@ pub fn grant_access(socket: &Path) -> String {
     }
 }
 
+/// Plain-text facts about why this process cannot open the API socket: who it is, which
+/// groups it carries, who is in `witness`, and the owner/mode of the socket and its folder.
+/// Shown under the "permission denied" hint so a failed fix can be diagnosed from the message.
+pub fn access_diagnosis(socket: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let group_db = std::fs::read_to_string("/etc/group").unwrap_or_default();
+    let uid = real_uid(&status).map_or("?".into(), |u| u.to_string());
+    let carried: Vec<String> = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Groups:"))
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|g| group_label(&group_db, g))
+        .collect();
+    let (wgid, members) = group_db
+        .lines()
+        .find_map(|l| {
+            let mut f = l.split(':');
+            (f.next()? == GROUP).then_some(())?;
+            let gid = f.nth(1)?;
+            Some((gid.to_string(), f.next().unwrap_or("").to_string()))
+        })
+        .unwrap_or_else(|| ("none".into(), String::new()));
+    let describe = |p: &Path| match std::fs::metadata(p) {
+        Ok(m) => format!(
+            "{} {}:{} {:o}",
+            p.display(),
+            group_label_u(&group_db, m.uid(), true),
+            group_label_u(&group_db, m.gid(), false),
+            m.mode() & 0o7777
+        ),
+        Err(e) => format!("{} ({e})", p.display()),
+    };
+    let dir = socket.parent().map(describe).unwrap_or_default();
+    format!(
+        "Details: uid {uid}; groups [{}]; group `witness` gid {wgid} members [{members}]\n\
+         \x20        folder {dir}\n\
+         \x20        socket {}\n\
+         \x20        retried through sg: {}",
+        carried.join(" "),
+        describe(socket),
+        if std::env::var_os(GUARD).is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    )
+}
+
+fn group_label(group_db: &str, gid: &str) -> String {
+    group_db
+        .lines()
+        .find_map(|l| {
+            let mut f = l.split(':');
+            let name = f.next()?;
+            (f.nth(1)? == gid).then(|| format!("{name}({gid})"))
+        })
+        .unwrap_or_else(|| gid.to_string())
+}
+
+fn group_label_u(group_db: &str, id: u32, is_user: bool) -> String {
+    if is_user {
+        id.to_string()
+    } else {
+        group_label(group_db, &id.to_string())
+    }
+}
+
 /// Single-quote one argument for `sh -c`.
 fn quote(a: &str) -> String {
     format!("'{}'", a.replace('\'', r"'\''"))

@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 mod rejoin;
-pub use rejoin::{current_user, grant_access, rejoin_group_if_needed};
+pub use rejoin::{access_diagnosis, current_user, grant_access, rejoin_group_if_needed};
 
 /// Marks the "not allowed to open the socket" hint, so a UI can offer to fix it.
 pub const ACCESS_DENIED_MARK: &str = "may not open";
@@ -53,9 +53,10 @@ impl ClientError {
                     "Witness is running, but this user {ACCESS_DENIED_MARK} {}.\n\
                      To allow this user, put it in the `witness` group:\n\
                      \x20   sudo usermod -aG witness {}\n\
-                     Then run this again (no logout needed). Or run the command with sudo.",
+                     Then run this again (no logout needed). Or run the command with sudo.\n{}",
                     path.display(),
-                    current_user().unwrap_or_else(|| "YOUR_USER".into())
+                    current_user().unwrap_or_else(|| "YOUR_USER".into()),
+                    access_diagnosis(path)
                 ),
                 _ => self.to_string(),
             },

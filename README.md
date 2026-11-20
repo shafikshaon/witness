@@ -41,13 +41,14 @@ was not changed afterwards.
 ## Install (Debian/Ubuntu)
 
 ```sh
-sudo apt install ./witness_0.1.0_arm64.deb          # daemon, CLI, rule pack
-sudo apt install ./witness-gui_0.1.0_arm64.deb      # optional desktop viewer
-sudo usermod -aG witness "$USER"                    # allow reading activity data (log in again)
+sudo apt install ./witness_0.1.1_arm64.deb          # daemon, CLI, rule pack
+sudo apt install ./witness-gui_0.1.1_arm64.deb      # optional desktop viewer
 witness status                                      # confirm it works
 ```
 
 Fedora: no prebuilt RPM is shipped with this build. `packaging/build-rpm.sh` builds one (the daemon was verified on Fedora 45; the GUI package is Debian/Ubuntu only for now).
+
+The installer adds the user who ran it to the `witness` group, and `witness`/`witness-gui` use it right away (no logout). Other users: `sudo usermod -aG witness NAME`. Installing a newer `.deb` over an old one upgrades it in place: same service, evidence and settings kept.
 
 The service starts at boot, before networking and SSH. Evidence lives in
 `/var/lib/witness` and is **never deleted automatically**, not even by `apt purge`.

@@ -248,6 +248,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// Exit code for a live-daemon command: its message is already user-facing, so print it bare.
+fn live_exit<E: std::fmt::Display>(r: Result<(), E>) -> Result<ExitCode> {
+    Ok(match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    })
+}
+
 fn run() -> Result<ExitCode> {
     match Cli::parse().cmd {
         Cmd::Verify {
@@ -370,33 +381,21 @@ fn run() -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Status { socket, json } => match {
+        Cmd::Status { socket, json } => {
             let socket = socket_of(socket);
             witness_client::rejoin_group_if_needed(&socket);
-            live::status(&socket, json)
-        } {
-            Ok(()) => Ok(ExitCode::SUCCESS),
-            Err(e) => {
-                eprintln!("{e}");
-                Ok(ExitCode::from(1))
-            }
-        },
+            live_exit(live::status(&socket, json))
+        }
         Cmd::Alerts {
             socket,
             all,
             limit,
             json,
-        } => match {
+        } => {
             let socket = socket_of(socket);
             witness_client::rejoin_group_if_needed(&socket);
-            live::alerts(&socket, all, limit, json)
-        } {
-            Ok(()) => Ok(ExitCode::SUCCESS),
-            Err(e) => {
-                eprintln!("{e}");
-                Ok(ExitCode::from(1))
-            }
-        },
+            live_exit(live::alerts(&socket, all, limit, json))
+        }
         Cmd::Rules { cmd } => cmd_rules(cmd),
         Cmd::Anchor { dir } => {
             let (seq, head) = read_head(&dir.join("segments"))

@@ -5643,7 +5643,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "witness-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5657,7 +5657,7 @@ dependencies = [
 
 [[package]]
 name = "witness-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "thiserror 2.0.21",
@@ -5665,7 +5665,7 @@ dependencies = [
 
 [[package]]
 name = "witness-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5673,7 +5673,7 @@ dependencies = [
 
 [[package]]
 name = "witness-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5686,7 +5686,7 @@ dependencies = [
 
 [[package]]
 name = "witness-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dioxus",
  "png 0.17.16",
@@ -5698,7 +5698,7 @@ dependencies = [
 
 [[package]]
 name = "witness-rules"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "globset",
  "regex",
@@ -5713,7 +5713,7 @@ dependencies = [
 
 [[package]]
 name = "witness-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -5733,7 +5733,7 @@ dependencies = [
 
 [[package]]
 name = "witnessd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "aya",

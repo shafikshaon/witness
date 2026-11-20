@@ -53,6 +53,15 @@ witness status                                       # confirm it works
 
 Replace `VERSION` and the architecture with the file names you downloaded.
 
+If apt prints `Download is performed unsandboxed as root ... couldn't be accessed by user '_apt'
+(13: Permission denied)`, that is only a notice: apt cannot read files inside your home folder,
+so it reads the package as root instead, and the install still completes. To avoid it, install
+from a folder it can read:
+
+```sh
+cp ~/Downloads/witness*.deb /tmp/ && sudo apt install /tmp/witness_VERSION_amd64.deb /tmp/witness-gui_VERSION_amd64.deb
+```
+
 ## Update
 
 Install the newer files the same way. There is no need to uninstall first.

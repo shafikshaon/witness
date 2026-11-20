@@ -3,7 +3,7 @@ set -e
 # BEGIN witness_installers
 # Who ran the install: SUDO_USER (sudo), the user behind pkexec, else every person with an
 # active local graphical/text login (a software centre sets neither variable, and the first
-# user on the seat can be the login screen's own account). Only real people: uid >= 1000.
+# user on the seat can be the login screen's own account). Only accounts that can log in.
 witness_installers() {
     if [ -n "${SUDO_USER:-}" ]; then
         names=$SUDO_USER
@@ -17,8 +17,10 @@ witness_installers() {
         done)
     fi
     for u in $names; do
-        id=$(id -u "$u" 2>/dev/null) || continue
-        [ "$id" -ge 1000 ] && [ "$id" -ne 65534 ] && echo "$u"
+        entry=$(getent passwd "$u") || continue
+        id=$(echo "$entry" | cut -d: -f3)
+        case "$(echo "$entry" | cut -d: -f7)" in */nologin|*/false) continue ;; esac
+        [ "$id" -ne 0 ] && [ "$id" -ne 65534 ] && echo "$u"
     done | sort -u
 }
 # END witness_installers

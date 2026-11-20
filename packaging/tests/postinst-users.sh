@@ -6,7 +6,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 sed -n '/^# BEGIN witness_installers/,/^# END witness_installers/p' "$HERE/../debian/postinst" > "$T/fn.sh"
 
-# Real accounts to play the parts: uid 0 (root), and the current user if uid >= 1000.
+# Real accounts to play the parts: root, and the current user.
 ME=$(id -un); MYID=$(id -u)
 mkdir -p "$T/bin"
 cat > "$T/bin/loginctl" <<'F'
@@ -32,10 +32,10 @@ check() { # name expected actual
 check "sudo user is used as given" "$ME" "$(SUDO_USER=$ME witness_installers 2>/dev/null || true)"
 check "root is never added" "" "$(SUDO_USER=root witness_installers)"
 check "unknown user is ignored" "" "$(SUDO_USER=no-such-user-xyz witness_installers)"
-if [ "$MYID" -ge 1000 ]; then
+if [ "$MYID" -ne 0 ]; then
     check "software centre: the seat's login, not the greeter, root or a remote session" "$ME" "$(env -u SUDO_USER -u PKEXEC_UID witness_installers)"
     check "pkexec user is used" "$ME" "$(PKEXEC_UID=$MYID witness_installers)"
 else
-    echo "skip: run as a normal user (uid >= 1000) for the seat and pkexec checks"
+    echo "skip: run as a normal user (not root) for the seat and pkexec checks"
 fi
 exit $fail

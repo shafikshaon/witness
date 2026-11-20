@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+mod rejoin;
+pub use rejoin::rejoin_group_if_needed;
+
 pub const DEFAULT_SOCKET: &str = "/run/witness/witness.sock";
 
 #[derive(Debug, thiserror::Error)]

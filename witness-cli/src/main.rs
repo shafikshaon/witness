@@ -370,7 +370,11 @@ fn run() -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Status { socket, json } => match live::status(&socket_of(socket), json) {
+        Cmd::Status { socket, json } => match {
+            let socket = socket_of(socket);
+            witness_client::rejoin_group_if_needed(&socket);
+            live::status(&socket, json)
+        } {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");
@@ -382,7 +386,11 @@ fn run() -> Result<ExitCode> {
             all,
             limit,
             json,
-        } => match live::alerts(&socket_of(socket), all, limit, json) {
+        } => match {
+            let socket = socket_of(socket);
+            witness_client::rejoin_group_if_needed(&socket);
+            live::alerts(&socket, all, limit, json)
+        } {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");

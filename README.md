@@ -40,10 +40,39 @@ was not changed afterwards.
 
 ## Install (Debian/Ubuntu)
 
+Download the packages for your CPU from the [Releases](https://github.com/shafikshaon/witness/releases)
+page (`amd64` for Intel/AMD PCs, `arm64` for ARM) and install them from the terminal. Do not
+double-click the `.deb`: the software app may just say "installed" and not upgrade.
+
 ```sh
-sudo apt install ./witness_0.1.1_arm64.deb          # daemon, CLI, rule pack
-sudo apt install ./witness-gui_0.1.1_arm64.deb      # optional desktop viewer
-witness status                                      # confirm it works
+cd ~/Downloads
+sudo apt install ./witness_VERSION_amd64.deb         # daemon, CLI, rule pack
+sudo apt install ./witness-gui_VERSION_amd64.deb     # optional desktop viewer
+witness status                                       # confirm it works
+```
+
+Replace `VERSION` and the architecture with the file names you downloaded.
+
+## Update
+
+Install the newer files the same way. There is no need to uninstall first.
+
+```sh
+dpkg -l witness witness-gui | grep ^ii               # version installed now
+sudo apt install ./witness_NEWVERSION_amd64.deb ./witness-gui_NEWVERSION_amd64.deb
+witness status                                       # should show the new version
+```
+
+The upgrade replaces the old version in place: same service, and your evidence and settings are
+kept. The service restarts, which leaves a short, recorded gap in capture.
+
+## Uninstall
+
+```sh
+sudo apt remove witness-gui witness      # removes the programs; keeps settings and evidence
+sudo apt purge witness-gui witness       # also removes the settings in /etc/witness
+sudo gpasswd -d "$USER" witness          # optional: leave the witness group
+sudo rm -rf /var/lib/witness             # optional and permanent: deletes the recorded evidence
 ```
 
 Fedora: no prebuilt RPM is shipped with this build. `packaging/build-rpm.sh` builds one (the daemon was verified on Fedora 45; the GUI package is Debian/Ubuntu only for now).

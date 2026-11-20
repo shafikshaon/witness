@@ -4,6 +4,22 @@ case "$1" in
 configure)
     getent group witness >/dev/null || groupadd --system witness
     getent group witness-admin >/dev/null || groupadd --system witness-admin
+    # Fresh install only (an upgrade must not re-add someone who was removed on purpose):
+    # let the person who ran the install read the data, so nothing is left to do by hand.
+    # sudo sets SUDO_USER, pkexec sets PKEXEC_UID; a software centre sets neither, so fall
+    # back to the user logged in at the seat.
+    if [ -z "$2" ]; then
+        who=${SUDO_USER:-}
+        if [ -z "$who" ] && [ -n "${PKEXEC_UID:-}" ]; then
+            who=$(getent passwd "$PKEXEC_UID" | cut -d: -f1)
+        fi
+        if [ -z "$who" ] && command -v loginctl >/dev/null 2>&1; then
+            who=$(loginctl list-sessions --no-legend 2>/dev/null | awk '$4=="seat0"{print $3; exit}')
+        fi
+        if [ -n "$who" ] && [ "$who" != root ] && id "$who" >/dev/null 2>&1; then
+            usermod -aG witness "$who" && ADDED=$who
+        fi
+    fi
     # Evidence directory: root only. Never removed by this package.
     install -d -m 0700 /var/lib/witness
     install -d -m 0755 /etc/witness/rules.d
@@ -18,11 +34,15 @@ configure)
     fi
     cat <<MSG
 Witness is installed and capturing.
-  Status:   witness show --last 5
+  Status:   witness status
   Verify:   sudo witness verify --dir /var/lib/witness
-  Access:   add a user to the 'witness' group to let them read activity data.
-            Members can read every user's command lines: treat the group as sensitive.
 MSG
+    if [ -n "${ADDED:-}" ]; then
+        echo "  Access:   '$ADDED' was added to the 'witness' group and can use witness now."
+    else
+        echo "  Access:   add a user to the 'witness' group to let them read activity data."
+    fi
+    echo "            Members can read every user's command lines: treat the group as sensitive."
     ;;
 esac
 exit 0

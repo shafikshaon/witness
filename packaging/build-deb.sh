@@ -59,7 +59,10 @@ dpkg-deb --root-owner-group --build "$S" "$OUT/witness_${VERSION}_${ARCH}.deb"
 if [ -x "$BIN/witness-gui" ]; then
     G="$OUT/stage-gui"
     stage "$G"
-    install -d "$G/usr/bin" "$G/usr/share/applications"
+    install -d "$G/usr/bin" "$G/usr/share/applications" \
+        "$G/usr/share/icons/hicolor/scalable/apps" "$G/usr/share/icons/hicolor/256x256/apps"
+    install -m 0644 "$HERE/icons/witness.svg" "$G/usr/share/icons/hicolor/scalable/apps/witness.svg"
+    install -m 0644 "$HERE/icons/witness-256.png" "$G/usr/share/icons/hicolor/256x256/apps/witness.png"
     install -m 0755 "$BIN/witness-gui" "$G/usr/bin/witness-gui"
     cat > "$G/usr/share/applications/witness.desktop" <<DSK
 [Desktop Entry]
@@ -67,6 +70,10 @@ Type=Application
 Name=Witness
 Comment=Forensic activity viewer
 Exec=witness-gui
+Icon=witness
+Terminal=false
+StartupWMClass=witness-gui
+Keywords=forensics;audit;security;monitor;
 Categories=System;Security;
 DSK
     cat > "$G/DEBIAN/control" <<CTL
@@ -74,7 +81,7 @@ Package: witness-gui
 Version: $VERSION
 Architecture: $ARCH
 Maintainer: Witness contributors <noreply@example.invalid>
-Depends: witness (= $VERSION), libwebkit2gtk-4.1-0, libgtk-3-0
+Depends: witness (>= $VERSION), libwebkit2gtk-4.1-0, libgtk-3-0, libxdo3, libssl3 | libssl3t64
 Section: admin
 Priority: optional
 Description: Desktop viewer for Witness

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f3a5f"/>
+      <stop offset="1" stop-color="#0d1b2e"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <!-- eye: the witness -->
+  <path d="M28 128 Q128 36 228 128 Q128 220 28 128 Z" fill="#f4f7fb"/>
+  <circle cx="128" cy="128" r="46" fill="#2f80ed"/>
+  <circle cx="128" cy="128" r="22" fill="#0d1b2e"/>
+  <circle cx="141" cy="115" r="9" fill="#f4f7fb"/>
+</svg>

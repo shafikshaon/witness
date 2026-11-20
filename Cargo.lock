@@ -5689,6 +5689,7 @@ name = "witness-gui"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "png 0.17.16",
  "serde_json",
  "tempfile",
  "tokio",

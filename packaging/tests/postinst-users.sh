@@ -33,7 +33,7 @@ check "sudo user is used as given" "$ME" "$(SUDO_USER=$ME witness_installers 2>/
 check "root is never added" "" "$(SUDO_USER=root witness_installers)"
 check "unknown user is ignored" "" "$(SUDO_USER=no-such-user-xyz witness_installers)"
 if [ "$MYID" -ne 0 ]; then
-    check "software centre: the seat's login, not the greeter, root or a remote session" "$ME" "$(env -u SUDO_USER -u PKEXEC_UID witness_installers)"
+    check "software centre: the seat's login, not the greeter, root or a remote session" "$ME" "$( (unset SUDO_USER PKEXEC_UID; witness_installers) )"
     check "pkexec user is used" "$ME" "$(PKEXEC_UID=$MYID witness_installers)"
 else
     echo "skip: run as a normal user (not root) for the seat and pkexec checks"

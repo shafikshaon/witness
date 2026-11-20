@@ -8,7 +8,10 @@ use std::time::Duration;
 use serde_json::Value;
 
 mod rejoin;
-pub use rejoin::rejoin_group_if_needed;
+pub use rejoin::{current_user, grant_access, rejoin_group_if_needed};
+
+/// Marks the "not allowed to open the socket" hint, so a UI can offer to fix it.
+pub const ACCESS_DENIED_MARK: &str = "may not open";
 
 pub const DEFAULT_SOCKET: &str = "/run/witness/witness.sock";
 
@@ -47,10 +50,12 @@ impl ClientError {
                     path.display()
                 ),
                 PermissionDenied => format!(
-                    "Witness is running, but this user may not open {}.\n\
-                     Run the command with sudo, or ask an administrator to add you to the \
-                     `witness` group (then log in again).",
-                    path.display()
+                    "Witness is running, but this user {ACCESS_DENIED_MARK} {}.\n\
+                     To allow this user, put it in the `witness` group:\n\
+                     \x20   sudo usermod -aG witness {}\n\
+                     Then run this again (no logout needed). Or run the command with sudo.",
+                    path.display(),
+                    current_user().unwrap_or_else(|| "YOUR_USER".into())
                 ),
                 _ => self.to_string(),
             },
@@ -290,7 +295,8 @@ mod hint_tests {
         let refused = connect(std::io::ErrorKind::ConnectionRefused).hint();
         assert!(refused.contains("not running"));
         let denied = connect(std::io::ErrorKind::PermissionDenied).hint();
-        assert!(denied.contains("`witness` group") && denied.contains("sudo"));
+        assert!(denied.contains("`witness` group") && denied.contains("sudo usermod -aG witness "));
+        assert!(denied.contains(ACCESS_DENIED_MARK));
         let forbidden = ClientError::Api {
             status: 403,
             title: "forbidden".into(),

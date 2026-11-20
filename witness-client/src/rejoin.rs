@@ -17,12 +17,7 @@ const GUARD: &str = "WITNESS_REEXEC";
 /// True when `uid`'s user is listed in group `witness` in `/etc/group` but the process
 /// (`status` = `/proc/self/status`) does not carry that group yet.
 fn needs_rejoin(group_db: &str, passwd_db: &str, status: &str, uid: u32) -> bool {
-    let Some(user) = passwd_db.lines().find_map(|l| {
-        let mut f = l.split(':');
-        let name = f.next()?;
-        let id: u32 = f.nth(1)?.parse().ok()?;
-        (id == uid).then_some(name)
-    }) else {
+    let Some(user) = user_name(passwd_db, uid) else {
         return false;
     };
     let Some((gid, members)) = group_db.lines().find_map(|l| {
@@ -47,6 +42,15 @@ fn needs_rejoin(group_db: &str, passwd_db: &str, status: &str, uid: u32) -> bool
     carried == Some(false)
 }
 
+fn user_name(passwd_db: &str, uid: u32) -> Option<&str> {
+    passwd_db.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        let id: u32 = f.nth(1)?.parse().ok()?;
+        (id == uid).then_some(name)
+    })
+}
+
 fn real_uid(status: &str) -> Option<u32> {
     status
         .lines()
@@ -55,6 +59,37 @@ fn real_uid(status: &str) -> Option<u32> {
         .next()?
         .parse()
         .ok()
+}
+
+/// Name of the user running this process (real uid looked up in `/etc/passwd`).
+pub fn current_user() -> Option<String> {
+    let uid = real_uid(&std::fs::read_to_string("/proc/self/status").ok()?)?;
+    user_name(&std::fs::read_to_string("/etc/passwd").ok()?, uid).map(str::to_owned)
+}
+
+/// Ask the desktop for an administrator's password (polkit) to put this user in the
+/// `witness` group, then re-run through `sg` so it takes effect at once. Returns only on
+/// failure, with a message to show; on success the process is replaced.
+pub fn grant_access(socket: &Path) -> String {
+    let Some(user) = current_user() else {
+        return "could not tell which user this is".into();
+    };
+    match Command::new("pkexec")
+        .args(["/usr/sbin/usermod", "-aG", GROUP, &user])
+        .status()
+    {
+        Ok(s) if s.success() => {
+            rejoin_group_if_needed(socket);
+            "Access was granted, but the window could not restart itself: close it and open Witness again.".into()
+        }
+        Ok(s) if s.code() == Some(126) || s.code() == Some(127) => {
+            "The password prompt was cancelled or not allowed.".into()
+        }
+        Ok(s) => format!("Granting access failed ({s})."),
+        Err(e) => {
+            format!("Could not ask for permission ({e}). Run:  sudo usermod -aG {GROUP} {user}")
+        }
+    }
 }
 
 /// Single-quote one argument for `sh -c`.

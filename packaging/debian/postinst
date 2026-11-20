@@ -1,25 +1,39 @@
 #!/bin/sh
 set -e
+# BEGIN witness_installers
+# Who ran the install: SUDO_USER (sudo), the user behind pkexec, else every person with an
+# active local graphical/text login (a software centre sets neither variable, and the first
+# user on the seat can be the login screen's own account). Only real people: uid >= 1000.
+witness_installers() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        names=$SUDO_USER
+    elif [ -n "${PKEXEC_UID:-}" ]; then
+        names=$(getent passwd "$PKEXEC_UID" | cut -d: -f1)
+    elif command -v loginctl >/dev/null 2>&1; then
+        names=$(for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+            loginctl show-session "$s" -p Name -p Class -p Active -p Remote 2>/dev/null |
+                awk -F= '$1=="Name"{n=$2} $1=="Class"{c=$2} $1=="Active"{a=$2} $1=="Remote"{r=$2}
+                         END{if (c=="user" && a=="yes" && r!="yes") print n}'
+        done)
+    fi
+    for u in $names; do
+        id=$(id -u "$u" 2>/dev/null) || continue
+        [ "$id" -ge 1000 ] && [ "$id" -ne 65534 ] && echo "$u"
+    done | sort -u
+}
+# END witness_installers
+
 case "$1" in
 configure)
     getent group witness >/dev/null || groupadd --system witness
     getent group witness-admin >/dev/null || groupadd --system witness-admin
-    # Fresh install, or an upgrade from before 0.1.1 (which never did this). Later upgrades
-    # must not re-add someone who was removed from the group on purpose:
-    # let the person who ran the install read the data, so nothing is left to do by hand.
-    # sudo sets SUDO_USER, pkexec sets PKEXEC_UID; a software centre sets neither, so fall
-    # back to the user logged in at the seat.
-    if [ -z "$2" ] || dpkg --compare-versions "$2" lt 0.1.1; then
-        who=${SUDO_USER:-}
-        if [ -z "$who" ] && [ -n "${PKEXEC_UID:-}" ]; then
-            who=$(getent passwd "$PKEXEC_UID" | cut -d: -f1)
-        fi
-        if [ -z "$who" ] && command -v loginctl >/dev/null 2>&1; then
-            who=$(loginctl list-sessions --no-legend 2>/dev/null | awk '$4=="seat0"{print $3; exit}')
-        fi
-        if [ -n "$who" ] && [ "$who" != root ] && id "$who" >/dev/null 2>&1; then
-            usermod -aG witness "$who" && ADDED=$who
-        fi
+    # Give the person who installed this access, so nothing is left to do by hand. Runs on a
+    # fresh install and on an upgrade from before 0.1.2 (earlier versions missed some
+    # installs); later upgrades must not re-add someone who was removed on purpose.
+    if [ -z "$2" ] || dpkg --compare-versions "$2" lt 0.1.2; then
+        for who in $(witness_installers); do
+            usermod -aG witness "$who" && ADDED="${ADDED:+$ADDED }$who"
+        done
     fi
     # Evidence directory: root only. Never removed by this package.
     install -d -m 0700 /var/lib/witness

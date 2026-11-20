@@ -154,6 +154,8 @@ fn initial_page() -> Page {
 #[component]
 pub fn App() -> Element {
     let client = use_context::<Client>();
+    let client_for_fix = client.clone();
+    let mut fix_note = use_signal(|| None::<String>);
     let mut page = use_signal(initial_page);
     let search = use_signal(Query::default);
     // `false` = UTC. Toggling remounts the page so every time is redrawn.
@@ -206,6 +208,19 @@ pub fn App() -> Element {
                     div { class: "offline",
                         h3 { "Witness is not reachable" }
                         pre { "{why}" }
+                        if why.contains(witness_client::ACCESS_DENIED_MARK) {
+                            p {
+                                button { class: "btn", onclick: move |_| {
+                                    let socket = client_for_fix.socket().to_path_buf();
+                                    spawn(async move {
+                                        // On success this replaces the process and never returns.
+                                        let msg = off(move || witness_client::grant_access(&socket)).await;
+                                        fix_note.set(msg);
+                                    });
+                                }, "Grant access (asks for your password)" }
+                            }
+                            if let Some(n) = fix_note() { p { class: "muted", "{n}" } }
+                        }
                         p { class: "muted", "This window reconnects by itself every few seconds; there is nothing to refresh." }
                     }
                 } else {

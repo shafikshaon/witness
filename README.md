@@ -77,7 +77,7 @@ sudo rm -rf /var/lib/witness             # optional and permanent: deletes the r
 
 Fedora: no prebuilt RPM is shipped with this build. `packaging/build-rpm.sh` builds one (the daemon was verified on Fedora 45; the GUI package is Debian/Ubuntu only for now).
 
-The installer adds the user who ran it to the `witness` group, and `witness`/`witness-gui` use it right away (no logout). Other users: `sudo usermod -aG witness NAME`. Installing a newer `.deb` over an old one upgrades it in place: same service, evidence and settings kept.
+The installer adds the user who ran it to the `witness` group, and `witness`/`witness-gui` use it right away (no logout). Other users: `sudo usermod -aG witness NAME`. If the app still says it may not open the socket, its **Grant access** button (or `sudo usermod -aG witness $USER`) fixes that. Installing a newer `.deb` over an old one upgrades it in place: same service, evidence and settings kept.
 
 The service starts at boot, before networking and SSH. Evidence lives in
 `/var/lib/witness` and is **never deleted automatically**, not even by `apt purge`.
